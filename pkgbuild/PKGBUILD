@@ -1,12 +1,21 @@
 pkgname=sprawl
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc='An infinite canvas for the Omarchy desktop: notes, shapes, connectors, pen strokes and pictures'
 arch=('x86_64' 'aarch64')
 url='https://github.com/willykev/sprawl'
 license=('MIT')
 options=('!debug')
-depends=('qt6-base' 'qt6-declarative' 'qt6-svg' 'qt6-wayland' 'xdg-desktop-portal')
+# Qt reads WebP pictures with a plugin from qt6-imageformats. Nothing links
+# to it, so this list is all that says it is needed.
+depends=('qt6-base' 'qt6-declarative' 'qt6-imageformats' 'qt6-svg' 'qt6-wayland' 'xdg-desktop-portal')
+# AVIF, HEIC and JPEG XL pictures take two packages each: kimageformats has
+# the plugins, and each reads only where its library is installed, which
+# kimageformats leaves optional.
+optdepends=('kimageformats: AVIF, HEIC and JPEG XL pictures, with the library for each'
+            'libavif: AVIF pictures, with kimageformats'
+            'libheif: HEIC pictures, with kimageformats'
+            'libjxl: JPEG XL pictures, with kimageformats')
 makedepends=('gcc' 'make')
 # This recipe builds a checkout. bin/release also produces a standalone
 # download recipe with a versioned source URL and SHA-256 checksum.
