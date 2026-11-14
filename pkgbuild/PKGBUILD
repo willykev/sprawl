@@ -1,0 +1,23 @@
+pkgname=sprawl
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='An infinite canvas for the Omarchy desktop: notes, shapes, connectors, pen strokes and pictures'
+arch=('x86_64' 'aarch64')
+license=('MIT')
+depends=('qt6-base' 'qt6-declarative' 'qt6-svg' 'qt6-wayland' 'xdg-desktop-portal')
+makedepends=('gcc' 'make')
+source=()
+sha256sums=()
+
+build() {
+  cd "$startdir/.."
+  ./bin/build
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 build/sprawl "$pkgdir/usr/bin/sprawl"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$startdir/sprawl.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/sprawl.svg"
+  install -Dm644 "$startdir/sprawl.desktop" "$pkgdir/usr/share/applications/sprawl.desktop"
+}

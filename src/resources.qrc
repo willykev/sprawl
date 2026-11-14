@@ -1,0 +1,30 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="Main.qml">Main.qml</file>
+        <file alias="Rail.qml">Rail.qml</file>
+        <file alias="RailButton.qml">RailButton.qml</file>
+        <file alias="StatusLine.qml">StatusLine.qml</file>
+        <file alias="SelectionBar.qml">SelectionBar.qml</file>
+        <file alias="PenBar.qml">PenBar.qml</file>
+        <file alias="Picker.qml">Picker.qml</file>
+        <file alias="LineOptions.qml">LineOptions.qml</file>
+        <file alias="ConnectorBar.qml">ConnectorBar.qml</file>
+        <file alias="Card.qml">Card.qml</file>
+        <file alias="KeysOverlay.qml">KeysOverlay.qml</file>
+        <file alias="BoardSwitcher.qml">BoardSwitcher.qml</file>
+        <file alias="ExportDialog.qml">ExportDialog.qml</file>
+        <file alias="ConfirmDialog.qml">ConfirmDialog.qml</file>
+        <file alias="KeyCap.qml">KeyCap.qml</file>
+        <file alias="Icon.qml">Icon.qml</file>
+        <file alias="icons.js">icons.js</file>
+        <file alias="shaders/grid.vert.qsb">shaders/grid.vert.qsb</file>
+        <file alias="shaders/grid.frag.qsb">shaders/grid.frag.qsb</file>
+        <file alias="shaders/shape.vert.qsb">shaders/shape.vert.qsb</file>
+        <file alias="shaders/shape.frag.qsb">shaders/shape.frag.qsb</file>
+        <file alias="shaders/stroke.vert.qsb">shaders/stroke.vert.qsb</file>
+        <file alias="shaders/stroke.frag.qsb">shaders/stroke.frag.qsb</file>
+        <file alias="welcome.json">welcome.json</file>
+        <file alias="skill.md">skill.md</file>
+        <file alias="i18n/en.json">i18n/en.json</file>
+    </qresource>
+</RCC>

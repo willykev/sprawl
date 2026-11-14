@@ -1,0 +1,23 @@
+import QtQuick
+
+// A key as the shortcuts overlay shows one.
+Rectangle {
+    id: cap
+
+    property string label
+
+    implicitWidth: Math.max(20, text.implicitWidth + 14)
+    implicitHeight: 20
+    color: "transparent"
+    border.color: theme.controlBorder
+    border.width: theme.controlBorderWidth
+    radius: Math.min(4, theme.radius)
+
+    Text {
+        id: text
+        anchors.centerIn: parent
+        text: cap.label
+        color: theme.foreground
+        font.pixelSize: theme.size("small")
+    }
+}

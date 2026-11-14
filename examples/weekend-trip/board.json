@@ -1,0 +1,206 @@
+{
+  "sprawl": 1,
+  "items": [
+    {
+      "id": 1,
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "size": 28,
+      "bold": true,
+      "text": "Weekend escape"
+    },
+    {
+      "id": 2,
+      "type": "text",
+      "x": 0,
+      "y": 48,
+      "size": 12,
+      "text": "Two days by the lake. A little planning, plenty of room to wander."
+    },
+    {
+      "id": 3,
+      "type": "frame",
+      "x": 0,
+      "y": 100,
+      "w": 520,
+      "h": 230,
+      "text": "Before Friday"
+    },
+    {
+      "id": 4,
+      "type": "note",
+      "x": 16,
+      "y": 126,
+      "w": 152,
+      "h": 180,
+      "color": "yellow",
+      "text": "Book a cabin\nTwo nights by the lake\nCheck-in after 3 pm"
+    },
+    {
+      "id": 5,
+      "type": "note",
+      "x": 184,
+      "y": 126,
+      "w": 152,
+      "h": 180,
+      "color": "green",
+      "text": "Plan the drive\nLeave Friday at 4\nFuel + snacks"
+    },
+    {
+      "id": 6,
+      "type": "note",
+      "x": 352,
+      "y": 126,
+      "w": 152,
+      "h": 180,
+      "color": "blue",
+      "text": "Pick a trail\nLakeside loop\nEasy, 6 km"
+    },
+    {
+      "id": 7,
+      "type": "frame",
+      "x": 560,
+      "y": 100,
+      "w": 560,
+      "h": 230,
+      "text": "Saturday: follow the weather"
+    },
+    {
+      "id": 8,
+      "type": "shape",
+      "shape": "rect",
+      "x": 580,
+      "y": 154,
+      "w": 144,
+      "h": 60,
+      "color": "yellow",
+      "text": "Check\nforecast"
+    },
+    {
+      "id": 9,
+      "type": "shape",
+      "shape": "diamond",
+      "x": 758,
+      "y": 140,
+      "w": 144,
+      "h": 88,
+      "color": "magenta",
+      "text": "Clear?"
+    },
+    {
+      "id": 10,
+      "type": "shape",
+      "shape": "ellipse",
+      "x": 936,
+      "y": 154,
+      "w": 160,
+      "h": 60,
+      "color": "green",
+      "text": "Lakeside\nhike"
+    },
+    {
+      "id": 11,
+      "type": "shape",
+      "shape": "rect",
+      "x": 748,
+      "y": 266,
+      "w": 164,
+      "h": 42,
+      "color": "cyan",
+      "text": "Museum + coffee"
+    },
+    {
+      "id": 12,
+      "type": "connector",
+      "from": 8,
+      "to": 9
+    },
+    {
+      "id": 13,
+      "type": "connector",
+      "from": 9,
+      "to": 10,
+      "text": "yes"
+    },
+    {
+      "id": 14,
+      "type": "connector",
+      "from": 9,
+      "to": 11,
+      "text": "rain",
+      "route": "elbow"
+    },
+    {
+      "id": 15,
+      "type": "note",
+      "x": 0,
+      "y": 370,
+      "w": 248,
+      "h": 210,
+      "color": "cyan",
+      "text": "Pack the essentials\nBoots\nRain jacket\nWater + snacks\nCamera"
+    },
+    {
+      "id": 16,
+      "type": "note",
+      "x": 272,
+      "y": 370,
+      "w": 248,
+      "h": 210,
+      "color": "orange",
+      "text": "Budget\nCabin  $180\nFood    $60\nFuel    $40\nTotal  $280"
+    },
+    {
+      "id": 17,
+      "type": "text",
+      "x": 580,
+      "y": 386,
+      "size": 20,
+      "bold": true,
+      "text": "Keep Sunday open."
+    },
+    {
+      "id": 18,
+      "type": "text",
+      "x": 580,
+      "y": 444,
+      "size": 13,
+      "text": "A slow breakfast, a good book,\nand the long way home."
+    },
+    {
+      "id": 19,
+      "type": "stroke",
+      "x": 580,
+      "y": 422,
+      "width": 2,
+      "color": "yellow",
+      "points": [
+        0,
+        5,
+        20,
+        7,
+        40,
+        3,
+        60,
+        1,
+        80,
+        4,
+        100,
+        7,
+        120,
+        5,
+        140,
+        2,
+        160,
+        3,
+        180,
+        6,
+        200,
+        5,
+        220,
+        2
+      ]
+    }
+  ]
+}

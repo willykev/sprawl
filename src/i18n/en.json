@@ -1,0 +1,10 @@
+{
+  "%n notes": { "one": "%n note", "other": "%n notes" },
+  "%n texts": { "one": "%n text", "other": "%n texts" },
+  "%n shapes": { "one": "%n shape", "other": "%n shapes" },
+  "%n strokes": { "one": "%n stroke", "other": "%n strokes" },
+  "%n connectors": { "one": "%n connector", "other": "%n connectors" },
+  "%n pictures": { "one": "%n picture", "other": "%n pictures" },
+  "%n frames": { "one": "%n frame", "other": "%n frames" },
+  "%n selected": { "one": "%n selected", "other": "%n selected" }
+}

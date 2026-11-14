@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sprawl
+Comment=An infinite canvas for notes, sketches and diagrams
+Exec=sprawl open %f
+Icon=sprawl
+Terminal=false
+Categories=Office;FlowChart;
+Keywords=whiteboard;canvas;board;freeform;notes;sticky;diagram;flowchart;sketch;draw;
+StartupWMClass=sprawl

@@ -1,0 +1,27 @@
+#!/bin/sh
+# Compiles the canvas shaders in src/shaders to the .qsb files Qt loads.
+#
+# qmake has no shader step, so the compiled files are kept beside their
+# sources and bin/build never needs this. Run it after editing a shader; it
+# needs qsb, from the qt6-shadertools package (or point QSB at one).
+set -eu
+
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+QSB="${QSB:-$(command -v qsb || true)}"
+[ -n "$QSB" ] || QSB=/usr/lib/qt6/bin/qsb
+if [ ! -x "$QSB" ]; then
+  echo "bin/shaders needs qsb: install it with omarchy-pkg-add qt6-shadertools" >&2
+  exit 1
+fi
+
+cd "$ROOT/src/shaders"
+for shader in *.vert *.frag; do
+  # Vertex shaders are rewritten for the scene graph's batching (-b), so
+  # thousands of items draw in a handful of calls.
+  case "$shader" in
+    *.vert) batch=-b ;;
+    *) batch= ;;
+  esac
+  "$QSB" $batch --glsl "100 es,120,150" --hlsl 50 --msl 12 -o "$shader.qsb" "$shader"
+  echo "Compiled src/shaders/$shader.qsb"
+done
