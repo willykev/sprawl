@@ -7,4 +7,4 @@ cd "$ROOT/build/tests"
 
 qmake6 "$ROOT/tests/sprawl_tests.pro"
 make -j"$(nproc)"
-QT_QPA_PLATFORM=offscreen ./sprawl_tests "$@"
+QT_QPA_PLATFORMTHEME=generic QT_QUICK_BACKEND=software QT_QPA_PLATFORM=offscreen ./sprawl_tests "$@"

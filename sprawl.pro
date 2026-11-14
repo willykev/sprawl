@@ -4,7 +4,8 @@ CONFIG += c++20 release
 TARGET = sprawl
 TEMPLATE = app
 
-DEFINES += SPRAWL_VERSION=\\\"0.1.0\\\"
+VERSION = $$cat($$PWD/VERSION)
+DEFINES += SPRAWL_VERSION=\\\"$$VERSION\\\"
 
 HEADERS += \
     src/backend.h \

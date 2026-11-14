@@ -1,0 +1,53 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Arch Linux / x86_64
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed git python qt6-base qt6-declarative qt6-svg qt6-wayland xdg-desktop-portal ttf-dejavu
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Create build user
+        run: |
+          useradd --create-home builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+      - name: Build and test
+        run: |
+          runuser -u builder -- bin/build
+          runuser -u builder -- bin/test
+          test "$(build/sprawl --version)" = "sprawl $(cat VERSION)"
+          test "$(bash -c 'source pkgbuild/PKGBUILD; echo "$pkgver"')" = "$(cat VERSION)"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
+          fi
+      - name: Build Arch package
+        working-directory: pkgbuild
+        run: runuser -u builder -- makepkg --cleanbuild --force --nodeps --noconfirm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sprawl-x86_64
+          path: pkgbuild/*.pkg.tar.*
+          if-no-files-found: error
+          retention-days: 14
