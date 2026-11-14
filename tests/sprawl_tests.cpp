@@ -7,12 +7,17 @@
 #include <QJsonDocument>
 #include <QMimeData>
 #include <QQmlApplicationEngine>
+#include <QQmlComponent>
 #include <QQmlContext>
+#include <QQuickItem>
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QSignalSpy>
+#include <QTcpServer>
 #include <QTemporaryDir>
 #include <QtTest>
+#include <memory>
+#include <sys/stat.h>
 
 #include "backend.h"
 #include "board.h"
@@ -22,6 +27,7 @@
 #include "filepicker.h"
 #include "geometry.h"
 #include "library.h"
+#include "offline.h"
 #include "spatialgrid.h"
 #include "textlayout.h"
 #include "theme.h"
@@ -134,6 +140,8 @@ struct Desk {
     Theme theme;
     Translator translator;
     Backend backend;
+    // Before the engine, which it has to outlast: as main() has it.
+    Offline offline;
     QQmlApplicationEngine engine;
     QStringList warnings;
     QQuickWindow *window = nullptr;
@@ -144,6 +152,7 @@ struct Desk {
         : prepared(run(before, home.path())), library(home.path()), theme(home.path()),
           translator(home.filePath("language"), ":/i18n"), backend(&library, &picker, &theme) {
         backend.openInitial(board);
+        engine.setNetworkAccessManagerFactory(&offline);
         QObject::connect(&engine, &QQmlEngine::warnings, &engine, [this](const QList<QQmlError> &errors) {
             for (const QQmlError &error : errors)
                 warnings << error.toString();
@@ -229,6 +238,14 @@ struct Desk {
         return nullptr;
     }
     QQuickItem *item(const QString &name) const { return find(window->contentItem(), name); }
+    // Every piece of text the window has in it right now.
+    static void texts(QQuickItem *root, QVector<QQuickItem *> &found) {
+        if (root->inherits("QQuickText"))
+            found.append(root);
+        const auto children = root->childItems();
+        for (QQuickItem *child : children)
+            texts(child, found);
+    }
     bool shows(const QString &name) const {
         const QQuickItem *found = item(name);
         return found && found->isVisible();
@@ -1822,6 +1839,89 @@ private slots:
         QCOMPARE(desk.warnings, QStringList());
     }
 
+    void connectorsAreCopiedWithOrWithoutWhatTheyJoin() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        const quint32 a = desk.add(shape(Item::Shape::Rect, 100, 100));
+        const quint32 b = desk.add(shape(Item::Shape::Rect, 400, 100));
+        const quint32 line = desk.add(connector(a, b));
+        const QSizeF reach = desk.board().item(line)->rect.size();
+
+        // Copied on its own, it is a line on nothing, where it is pasted.
+        desk.canvas->select({line});
+        desk.key(Qt::Key_C, Qt::ControlModifier);
+        desk.hover(QPointF(300, 400));
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        QCOMPARE(desk.all(Item::Kind::Connector).size(), 2);
+        QCOMPARE(desk.last()->from, quint32(0));
+        QCOMPARE(desk.last()->to, quint32(0));
+        QCOMPARE(desk.last()->rect.size(), reach);
+        QVERIFY(QLineF(desk.last()->rect.center(), QPointF(300, 400)).length() < 2);
+        QCOMPARE(desk.canvas->selection(), QVector<quint32>{desk.last()->id});
+
+        // Duplicated on its own, the same: a step aside from the one it was.
+        desk.canvas->select({line});
+        desk.key(Qt::Key_D, Qt::ControlModifier);
+        QCOMPARE(desk.all(Item::Kind::Connector).size(), 3);
+        QCOMPARE(desk.last()->from, quint32(0));
+        QCOMPARE(desk.last()->to, quint32(0));
+        QCOMPARE(desk.last()->rect.topLeft(), desk.board().item(line)->rect.topLeft() + QPointF(16, 16));
+
+        // Duplicated with one of the things it joins, it joins the copy to
+        // what the original is joined to.
+        desk.canvas->select({a, line});
+        desk.key(Qt::Key_D, Qt::ControlModifier);
+        QCOMPARE(desk.all(Item::Kind::Shape).size(), 3);
+        const quint32 copyOfA = desk.all(Item::Kind::Shape).last()->id;
+        QCOMPARE(desk.last()->kind, Item::Kind::Connector);
+        QCOMPARE(desk.last()->from, copyOfA);
+        QCOMPARE(desk.last()->to, b);
+
+        // Copied with both, it joins the copies, and nothing it was not
+        // copied with.
+        desk.canvas->select({a, b, line});
+        desk.key(Qt::Key_C, Qt::ControlModifier);
+        desk.hover(QPointF(500, 500));
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        const auto shapes = desk.all(Item::Kind::Shape);
+        QCOMPARE(shapes.size(), 5);
+        QCOMPARE(desk.last()->kind, Item::Kind::Connector);
+        QCOMPARE(desk.last()->from, shapes[3]->id);
+        QCOMPARE(desk.last()->to, shapes[4]->id);
+
+        // Copied with one of the two, it is pasted with that one, its other
+        // end where it was and on nothing.
+        desk.canvas->select({b, line});
+        desk.key(Qt::Key_C, Qt::ControlModifier);
+        desk.hover(QPointF(700, 300));
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        QCOMPARE(desk.all(Item::Kind::Shape).size(), 6);
+        QCOMPARE(desk.last()->kind, Item::Kind::Connector);
+        QCOMPARE(desk.last()->from, quint32(0));
+        QCOMPARE(desk.last()->to, desk.all(Item::Kind::Shape).last()->id);
+
+        // Cut and pasted back, the things it joined being gone by then, it
+        // still joins what it came back with.
+        const int connectors = int(desk.all(Item::Kind::Connector).size());
+        desk.canvas->select({a, b, line});
+        desk.key(Qt::Key_X, Qt::ControlModifier);
+        QVERIFY(!desk.board().item(a) && !desk.board().item(line));
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        const auto back = desk.all(Item::Kind::Shape);
+        QCOMPARE(desk.last()->kind, Item::Kind::Connector);
+        QCOMPARE(desk.last()->from, back[back.size() - 2]->id);
+        QCOMPARE(desk.last()->to, back[back.size() - 1]->id);
+        QVERIFY(desk.all(Item::Kind::Connector).size() <= connectors);
+        // And follows them, as the first one did.
+        const QPointF before = desk.last()->p1;
+        Item moved = *back[back.size() - 2];
+        moved.rect.translate(0, 120);
+        desk.board().set(moved);
+        QVERIFY(desk.last()->p1 != before);
+        QVERIFY(moved.rect.adjusted(-1, -1, 1, 1).contains(desk.last()->p1));
+        QCOMPARE(desk.warnings, QStringList());
+    }
+
     void groupsMoveAsOne() {
         Desk desk;
         QVERIFY(desk.ready());
@@ -2704,6 +2804,282 @@ private slots:
         QCOMPARE(run({"remove", "weekend-trip", "42"}), 1);
         QCOMPARE(run({"list", "--json"}), 0);
         qunsetenv("SPRAWL_HOME");
+    }
+
+    // --- What comes from outside ---------------------------------------------
+
+    void anItemHoldsOnlySoMuchText() {
+        Board board;
+        const QString pages(25'000, 'a');
+        const quint32 id = board.add(note(0, 0, pages));
+        QCOMPARE(board.item(id)->text.size(), Item::longestText);
+        Item more = *board.item(id);
+        more.text = pages + "b";
+        board.set(more);
+        QCOMPARE(board.item(id)->text.size(), Item::longestText);
+        // Never half of a character that takes two.
+        const QString face = QString(Item::longestText - 1, 'a') + QString::fromUtf8("\xF0\x9F\x99\x82") + "b";
+        QCOMPARE(Item::fitted(face).size(), Item::longestText - 1);
+        QCOMPARE(Item::fitted("short"), QString("short"));
+
+        // A file with more in it is not a board, and says how much is too much.
+        auto problems = [&board](const QString &text) {
+            const QJsonObject item{{"type", "note"}, {"x", 0}, {"y", 0}, {"text", text}};
+            return board.fromJson(QJsonObject{{"sprawl", 1}, {"items", QJsonArray{item}}}).join(" ");
+        };
+        QVERIFY(problems(QString(Item::longestText + 1, 'a')).contains("holds 10000"));
+        QCOMPARE(board.item(id)->text.size(), Item::longestText);
+        QCOMPARE(problems(QString(Item::longestText, 'a')), QString());
+    }
+
+    void whatAFileSaysIsQuotedBriefly() {
+        Board board;
+        auto problems = [&board](const QJsonObject &item) {
+            return board.fromJson(QJsonObject{{"sprawl", 1}, {"items", QJsonArray{item}}}).join(" ");
+        };
+        // However much a file says where a word was wanted, a few words of
+        // it are said back, and nothing in them that a terminal would obey.
+        const QString wrong = problems({{"type", QString(5000, 'x')}, {"x", 0}, {"y", 0}});
+        QVERIFY(wrong.contains("no item type"));
+        QVERIFY2(wrong.size() < 120, qPrintable(QString::number(wrong.size())));
+        const QString loud = problems({{"type", "note"}, {"x", 0}, {"y", 0}, {"color", "\x1b[31mred\x07"}});
+        QVERIFY(loud.contains("no color"));
+        QVERIFY(!loud.contains(QChar(0x1b)) && !loud.contains(QChar(0x07)));
+        QVERIFY(problems({{"type", "shape"}, {"x", 0}, {"y", 0}, {"shape", QString(5000, 'x')}}).size() < 400);
+        QVERIFY(problems({{"type", "connector"}, {"x1", 0}, {"y1", 0}, {"x2", 9}, {"y2", 9}, {"route", QString(5000, 'x')}})
+                    .size() < 200);
+    }
+
+    void whatIsPrintedCannotDriveATerminal() {
+        const QString text =
+            QString::fromUtf8("plain \x1b[2Jcleared\rover\x07 del\x7f \xC2\x9B" "31m tab\tline\nnext");
+        const QString printed = printableText(text);
+        for (const QChar c : printed)
+            QVERIFY2(c.category() != QChar::Other_Control || c == '\n' || c == '\t',
+                     qPrintable(QString::number(c.unicode(), 16)));
+        QVERIFY(printed.contains("cleared") && printed.contains("tab\tline\nnext"));
+        QCOMPARE(printed.size(), text.size());
+        // In JSON nothing is lost: what a terminal would obey is written as
+        // an escape, and reads back as what it was.
+        const QByteArray json = printableJson(QJsonDocument(QJsonObject{{"text", text}}).toJson());
+        for (const QChar c : QString::fromUtf8(json))
+            QVERIFY2(c.category() != QChar::Other_Control || c == '\n', qPrintable(QString::number(c.unicode(), 16)));
+        QCOMPARE(QJsonDocument::fromJson(json).object().value("text").toString(), text);
+    }
+
+    void aBoardsNameIsNotAPath() {
+        QTemporaryDir dir;
+        Library library(dir.path());
+        QCOMPARE(library.create("plans"), QString());
+        QVERIFY(library.exists("plans"));
+        QVERIFY(!library.exists("../boards/plans"));
+        QVERIFY(!library.exists("plans/../plans"));
+        QVERIFY(!library.exists(".."));
+        QVERIFY(library.remove("../boards/plans").contains("no board"));
+        QVERIFY(library.exists("plans"));
+    }
+
+    void onlyPicturesAreKeptAsPictures() {
+        QTemporaryDir dir;
+        const QString assets = dir.filePath("board/assets");
+        QString problem;
+        // What is not a picture is not taken, whatever it is called...
+        write(dir.filePath("notes.png"), "not a picture at all");
+        QCOMPARE(Library::importFile(assets, dir.filePath("notes.png"), &problem), QString());
+        QVERIFY2(problem.contains("not a picture"), qPrintable(problem));
+        // ...and what is not a file is not so much as opened: a pipe that
+        // nothing writes to would never answer.
+        QVERIFY(QDir(dir.path()).mkdir("folder.png"));
+        QCOMPARE(Library::importFile(assets, dir.filePath("folder.png"), &problem), QString());
+        QVERIFY2(problem.contains("not a file"), qPrintable(problem));
+        QCOMPARE(mkfifo(QFile::encodeName(dir.filePath("pipe.png")).constData(), 0600), 0);
+        QCOMPARE(Library::importFile(assets, dir.filePath("pipe.png"), &problem), QString());
+        QVERIFY2(problem.contains("not a file"), qPrintable(problem));
+        QVERIFY(QDir(assets).entryList(QDir::Files).isEmpty());
+    }
+
+    void pastedPicturesComeAlongAndNothingElseDoes() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        // Somewhere that is no board: a picture, and something private.
+        QTemporaryDir elsewhere;
+        picture(elsewhere.filePath("photo.png"), QSize(40, 30));
+        write(elsewhere.filePath("id_rsa"), "-----BEGIN OPENSSH PRIVATE KEY-----");
+        auto image = [](const QString &asset, qreal x) {
+            return QJsonObject{{"type", "image"}, {"x", x}, {"y", 0}, {"w", 40}, {"h", 30}, {"asset", asset}};
+        };
+        // What anything running could have put on the clipboard.
+        auto *data = new QMimeData;
+        data->setData("application/x-sprawl-items",
+                      QJsonDocument(QJsonObject{{"sprawl", 1},
+                                                {"items", QJsonArray{image("photo.png", 0), image("id_rsa", 60)}},
+                                                {"assets", elsewhere.path()}})
+                          .toJson());
+        QGuiApplication::clipboard()->setMimeData(data);
+        desk.hover(QPointF(400, 300));
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        const auto pictures = desk.all(Item::Kind::Image);
+        QCOMPARE(pictures.size(), 2);
+        // The picture came along, kept as any picture is. The other thing
+        // stayed where it was, and its item says its picture is missing.
+        const QDir assets(desk.backend.assetFolder());
+        QCOMPARE(assets.entryList(QDir::Files).size(), 1);
+        QCOMPARE(read(assets.filePath(pictures[0]->asset)), read(elsewhere.filePath("photo.png")));
+        QVERIFY(!assets.exists("id_rsa"));
+        QCOMPARE(pictures[1]->asset, QString("id_rsa"));
+
+        // A pipe handed over as a picture is not opened to find out.
+        const QString pipe = elsewhere.filePath("pipe.png");
+        QCOMPARE(mkfifo(QFile::encodeName(pipe).constData(), 0600), 0);
+        desk.backend.addFiles({QUrl::fromLocalFile(pipe)});
+        QVERIFY2(desk.backend.problem().contains("not a picture"), qPrintable(desk.backend.problem()));
+        QCOMPARE(desk.all(Item::Kind::Image).size(), 2);
+        QCOMPARE(desk.warnings, QStringList());
+    }
+
+    void exportsOnlyGoToFiles() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        desk.add(note(0, 0, "One"));
+        desk.picker.target = QUrl("https://example.com/board.png");
+        desk.backend.exportBoard("png", {});
+        QCOMPARE(desk.picker.asked, 1);
+        QVERIFY2(desk.backend.problem().contains("files on this computer"), qPrintable(desk.backend.problem()));
+        QVERIFY(!QFile::exists(".png"));
+    }
+
+    void theEditorHoldsNoMoreThanAnItem() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        const quint32 id = desk.add(note(224, 124, "Call"));
+        desk.doubleClick(QPointF(300, 200));
+        QVERIFY(desk.canvas->editing());
+        // Far more than an item holds, pasted in where the cursor is.
+        QGuiApplication::clipboard()->setText(QString(30'000, 'x'));
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        QQuickItem *editor = desk.item("editor");
+        QVERIFY(editor);
+        QCOMPARE(editor->property("length").toInt(), Item::longestText);
+        QCOMPARE(desk.board().item(id)->text.size(), Item::longestText);
+        QVERIFY(desk.board().item(id)->text.startsWith("Callxxx"));
+        QVERIFY2(desk.backend.notice().contains("characters"), qPrintable(desk.backend.notice()));
+        // And typing on from there goes nowhere.
+        desk.type("yz");
+        QCOMPARE(editor->property("length").toInt(), Item::longestText);
+        QVERIFY(!desk.board().item(id)->text.contains('y'));
+        desk.key(Qt::Key_Escape);
+        QVERIFY(!desk.canvas->editing());
+        QCOMPARE(desk.board().item(id)->text.size(), Item::longestText);
+
+        // Pasted onto the board instead, it is text of the same length.
+        desk.hover(QPointF(600, 400));
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        QCOMPARE(desk.last()->kind, Item::Kind::Text);
+        QCOMPARE(desk.last()->text.size(), Item::longestText);
+        QCOMPARE(desk.warnings, QStringList());
+    }
+
+    void whatIsBeingWrittenIsPartOfTheFrame() {
+        // Three thousand notes and, beside them, one with as much written
+        // on it as a note holds.
+        Desk desk("pile", [](const QString &home) {
+            QJsonArray items;
+            for (int i = 0; i < 3000; ++i)
+                items.append(QJsonObject{{"type", "note"}, {"x", (i % 40) * 30.0}, {"y", (i / 40 % 30) * 30.0}});
+            items.append(QJsonObject{{"type", "note"}, {"x", 1400}, {"y", 0}, {"text", QString(Item::longestText, 'a')}});
+            QDir(home).mkpath("boards/pile");
+            write(home + "/boards/pile/board.json", QJsonDocument(QJsonObject{{"sprawl", 1}, {"items", items}}).toJson());
+        });
+        QVERIFY(desk.ready());
+        QTRY_COMPARE_WITH_TIMEOUT(desk.canvas->pendingItems(), 0, 30000);
+        desk.canvas->setView(QPointF(-100, -100), 0.5);
+        desk.window->grabWindow();
+        const SceneLoad whole = desk.canvas->load();
+        QCOMPARE(whole.items, 3001);
+        QVERIFY(!whole.reduced);
+        QCOMPARE(whole.editor, qint64(0));
+
+        // The note being written in is the editor's to draw, and the editor
+        // draws every letter it holds, in view or not. That is counted...
+        const qint64 budget = whole.bytes - 500'000;
+        desk.canvas->setLoadBudget(budget);
+        desk.doubleClick(QPointF(1476, 76));
+        QVERIFY(desk.canvas->editing());
+        desk.window->grabWindow();
+        const SceneLoad writing = desk.canvas->load();
+        QCOMPARE(writing.editor, qint64(Item::longestText) * 2 * 96);
+        // ...and the board gives way to it: the frame is what it may be.
+        QVERIFY(writing.reduced);
+        QVERIFY2(writing.bytes + writing.editor <= budget, qPrintable(QString::number(writing.bytes)));
+        QVERIFY(writing.items > 0);
+        // With the writing done, nothing is counted for it.
+        desk.key(Qt::Key_Escape);
+        desk.window->grabWindow();
+        QCOMPARE(desk.canvas->load().editor, qint64(0));
+    }
+
+    void nothingWrittenInTheWindowIsReadAsMarkup() {
+        // A board that will not open, in a folder named to look like markup
+        // and saying why in words made to look like it too.
+        Desk desk("<b>loud", [](const QString &home) {
+            QDir(home).mkpath("boards/<b>loud");
+            write(home + "/boards/<b>loud/board.json",
+                  R"({"sprawl": 1, "items": [{"type": "<i>sticker", "x": 0, "y": 0}]})");
+        });
+        QVERIFY(desk.ready());
+        QCOMPARE(desk.backend.boardName(), QString("<b>loud"));
+        QQuickItem *problem = desk.item("problem");
+        QVERIFY(problem && problem->isVisible());
+        QVERIFY2(problem->property("text").toString().contains("<i>sticker"),
+                 qPrintable(problem->property("text").toString()));
+        // Every piece of text there is, with each panel open in turn: the
+        // characters it was given, and nothing made of them.
+        for (const QString &panel : QStringList{"", "keys", "boards", "export", "quit"}) {
+            if (!panel.isEmpty())
+                QMetaObject::invokeMethod(desk.window, "openPanel", Q_ARG(QVariant, panel));
+            desk.window->grabWindow();
+            QVector<QQuickItem *> texts;
+            Desk::texts(desk.window->contentItem(), texts);
+            QVERIFY2(texts.size() > 5, qPrintable(panel));
+            QStringList marked;
+            for (const QQuickItem *text : std::as_const(texts))
+                if (text->property("textFormat").toInt() != Qt::PlainText)
+                    marked << text->property("text").toString();
+            QCOMPARE(marked, QStringList());
+        }
+    }
+
+    void nothingIsEverFetched() {
+        auto picture = [](const QTcpServer &server) {
+            return QString("import QtQuick\nImage { source: \"http://127.0.0.1:%1/picture.png\" }")
+                .arg(server.serverPort())
+                .toUtf8();
+        };
+        // Left to itself, an engine goes and asks for it...
+        {
+            QTcpServer asked;
+            QVERIFY(asked.listen(QHostAddress::LocalHost));
+            QQmlEngine engine;
+            QQmlComponent component(&engine);
+            component.setData(picture(asked), QUrl());
+            const std::unique_ptr<QObject> image(component.create());
+            QVERIFY2(image, qPrintable(component.errorString()));
+            QTRY_VERIFY(asked.hasPendingConnections());
+        }
+        // ...and the app's is told no before anything leaves. Somewhere of
+        // its own to listen, so nothing the other engine sent is heard here.
+        QTcpServer server;
+        QVERIFY(server.listen(QHostAddress::LocalHost));
+        Desk desk;
+        QVERIFY(desk.ready());
+        QQmlComponent component(&desk.engine);
+        component.setData(picture(server), QUrl());
+        const std::unique_ptr<QObject> image(component.create());
+        QVERIFY2(image, qPrintable(component.errorString()));
+        // Image.Error
+        QTRY_COMPARE(image->property("status").toInt(), 3);
+        QTest::qWait(200);
+        QVERIFY(!server.hasPendingConnections());
     }
 
     // --- Translator ----------------------------------------------------------

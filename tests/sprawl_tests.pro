@@ -1,4 +1,4 @@
-QT += core gui qml quick quickcontrols2 testlib dbus svg
+QT += core gui qml quick quickcontrols2 testlib dbus svg network
 CONFIG += c++20 testcase
 TARGET = sprawl_tests
 TEMPLATE = app
@@ -18,6 +18,7 @@ HEADERS += \
     ../src/item.h \
     ../src/library.h \
     ../src/materials.h \
+    ../src/offline.h \
     ../src/spatialgrid.h \
     ../src/textlayout.h \
     ../src/theme.h \

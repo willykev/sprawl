@@ -4,7 +4,6 @@
 
 #include <QClipboard>
 #include <QCursor>
-#include <QDir>
 #include <QFile>
 #include <QGuiApplication>
 #include <QJsonArray>
@@ -19,6 +18,7 @@
 #include <cmath>
 
 #include "imagestore.h"
+#include "library.h"
 
 namespace {
 
@@ -1645,7 +1645,9 @@ void CanvasView::insertText(const QString &text) {
     Item item;
     item.kind = Item::Kind::Text;
     item.fontSize = Defaults::textSize;
-    item.text = text.trimmed();
+    item.text = Item::fitted(text.trimmed());
+    if (item.text.size() < text.trimmed().size())
+        emit textLeftOut();
     // Pasted prose wraps at a readable width rather than running on.
     QSizeF natural = QSizeF();
     TextMetrics::fit(item);
@@ -1669,6 +1671,13 @@ void CanvasView::selectAll() {
 
 void CanvasView::clearSelection() { setSelection({}); }
 
+void CanvasView::setReadOnly(bool readOnly) {
+    if (readOnly == m_readOnly)
+        return;
+    m_readOnly = readOnly;
+    emit readOnlyChanged();
+}
+
 void CanvasView::deleteSelection() {
     if (!m_board || editing() || m_selection.isEmpty())
         return;
@@ -1684,10 +1693,19 @@ QByteArray CanvasView::serialize(const QVector<quint32> &ids) const {
     QVector<quint32> ordered = ids;
     std::sort(ordered.begin(), ordered.end(),
               [this](quint32 a, quint32 b) { return m_board->depth(a) < m_board->depth(b); });
+    // What is copied stands on its own, since it may be pasted anywhere: a
+    // connector's end that was on something left behind is where it was,
+    // and on nothing.
+    const QSet<quint32> copied(ids.constBegin(), ids.constEnd());
     QJsonArray items;
     for (quint32 id : std::as_const(ordered))
-        if (const Item *item = m_board->item(id))
-            items.append(Board::itemToJson(*item));
+        if (const Item *item = m_board->item(id)) {
+            Item copy = *item;
+            for (quint32 *end : {&copy.from, &copy.to})
+                if (!copied.contains(*end))
+                    *end = 0;
+            items.append(Board::itemToJson(copy));
+        }
     return QJsonDocument(QJsonObject{{"sprawl", Board::formatVersion}, {"items", items}, {"assets", m_assetFolder}})
         .toJson(QJsonDocument::Compact);
 }
@@ -1695,6 +1713,16 @@ QByteArray CanvasView::serialize(const QVector<quint32> &ids) const {
 QVector<quint32> CanvasView::addCopies(const QVector<Item> &items, QPointF offset) {
     QHash<quint32, quint32> ids, groups;
     QVector<quint32> added;
+    // What is being copied, by the ids it has where it came from.
+    QSet<quint32> originals;
+    for (const Item &item : items)
+        if (item.id)
+            originals.insert(item.id);
+    // A copied connector, and what its ends were on that is being copied too.
+    struct Join {
+        quint32 connector, from, to;
+    };
+    QVector<Join> joins;
     m_board->begin();
     for (Item item : items) {
         const quint32 original = item.id;
@@ -1707,21 +1735,36 @@ QVector<quint32> CanvasView::addCopies(const QVector<Item> &items, QPointF offse
                 groups.insert(item.group, m_board->newGroup());
             item.group = groups.value(item.group);
         }
+        Join join{0, 0, 0};
+        if (item.kind == Item::Kind::Connector) {
+            // A copied connector joins the copies of what it joined, once
+            // they are all there: until then those ends are on nothing, as
+            // the board would have it of an end whose item it cannot find.
+            // One that came along with something it joins keeps its other
+            // end on the original. One copied on its own is on nothing: a
+            // line where it was put, not a second one exactly over the first.
+            const bool cameAlong = originals.contains(item.from) || originals.contains(item.to);
+            for (const auto &[end, copied] : {std::pair{&item.from, &join.from}, std::pair{&item.to, &join.to}}) {
+                if (originals.contains(*end))
+                    *copied = *end;
+                if (*copied || !(cameAlong && m_board->item(*end)))
+                    *end = 0;
+            }
+        }
         const quint32 id = m_board->add(item);
         ids.insert(original, id);
         added.append(id);
+        if (join.from || join.to) {
+            join.connector = id;
+            joins.append(join);
+        }
     }
-    // A copied connector joins the copies of what it joined. An end whose
-    // item was not copied stays attached to the original when it is on this
-    // board, and is free otherwise.
-    for (quint32 id : std::as_const(added)) {
-        const Item *copy = m_board->item(id);
-        if (!copy || copy->kind != Item::Kind::Connector)
-            continue;
-        Item connector = *copy;
-        for (quint32 *end : {&connector.from, &connector.to})
-            if (*end)
-                *end = ids.value(*end, m_board->item(*end) ? *end : 0);
+    for (const Join &join : std::as_const(joins)) {
+        Item connector = *m_board->item(join.connector);
+        if (join.from)
+            connector.from = ids.value(join.from);
+        if (join.to)
+            connector.to = ids.value(join.to);
         m_board->set(connector);
     }
     m_board->commit();
@@ -1771,13 +1814,17 @@ bool CanvasView::paste() {
     if (!Board::parse(root, items).isEmpty() || items.isEmpty())
         return true;
 
-    // Pictures copied from another board come along with their files.
+    // Pictures copied from another board come along with their files. The
+    // clipboard only says where to look for them, and anything running can
+    // put something on the clipboard: a picture is taken in as one dropped
+    // on the board would be, and what is not a picture is not taken at all.
     const QString from = root.value("assets").toString();
     if (!from.isEmpty() && from != m_assetFolder && !m_assetFolder.isEmpty())
-        for (const Item &item : std::as_const(items))
+        for (Item &item : items)
             if (item.kind == Item::Kind::Image && !QFile::exists(m_assetFolder + "/" + item.asset)) {
-                QDir().mkpath(m_assetFolder);
-                QFile::copy(from + "/" + item.asset, m_assetFolder + "/" + item.asset);
+                const QString kept = Library::importFile(m_assetFolder, from + "/" + item.asset);
+                if (!kept.isEmpty())
+                    item.asset = kept;
             }
 
     // Centered where the mouse is, as anything inserted is.

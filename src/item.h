@@ -83,6 +83,21 @@ struct Item {
     // Image: the file in the board's assets folder.
     QString asset;
 
+    // The most text one item holds: three pages or so, which is more than a
+    // board is for. It is also what keeps writing safe. The editor draws
+    // every letter of what it is given, in view or not, so what an item may
+    // hold is what one frame may be asked for on its account.
+    static constexpr int longestText = 10'000;
+    // As much of `text` as an item holds, never ending on half a character.
+    static QString fitted(QString text) {
+        if (text.size() > longestText) {
+            text.truncate(longestText);
+            if (text.back().isHighSurrogate())
+                text.chop(1);
+        }
+        return text;
+    }
+
     bool operator==(const Item &other) const = default;
 
     // The colors of the theme a person picks from, in the order the toolbar

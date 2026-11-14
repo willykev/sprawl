@@ -68,7 +68,7 @@ Card {
         }
     ]
 
-    Text {
+    PlainText {
         x: 20
         y: 18
         text: qsTr("Keys")
@@ -77,7 +77,7 @@ Card {
         font.bold: true
     }
 
-    Text {
+    PlainText {
         anchors.right: parent.right
         anchors.rightMargin: 20
         y: 22
@@ -105,7 +105,7 @@ Card {
                 width: modelData.width
                 bottomPadding: 4
 
-                Text {
+                PlainText {
                     text: section.modelData.title
                     color: theme.accent
                     opacity: 0.85
@@ -124,7 +124,7 @@ Card {
                         width: section.width
                         height: 28
 
-                        Text {
+                        PlainText {
                             anchors.verticalCenter: parent.verticalCenter
                             text: row.modelData.label
                             color: theme.foreground

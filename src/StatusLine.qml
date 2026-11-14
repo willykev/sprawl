@@ -94,7 +94,7 @@ Rectangle {
             height: parent.height
             color: bar.modeColor
 
-            Text {
+            PlainText {
                 id: modeText
                 anchors.centerIn: parent
                 text: bar.modeName
@@ -114,7 +114,7 @@ Rectangle {
                 anchors.centerIn: parent
                 spacing: 6
 
-                Text {
+                PlainText {
                     anchors.verticalCenter: parent.verticalCenter
                     text: backend.boardName
                     color: theme.foreground
@@ -140,6 +140,7 @@ Rectangle {
 
     // The middle: something wrong, something done, or what is selected.
     Item {
+        id: middle
         anchors.left: left.right
         anchors.right: right.left
         anchors.leftMargin: 12
@@ -159,9 +160,13 @@ Rectangle {
                 color: theme.danger
             }
 
-            Text {
+            PlainText {
+                objectName: "problem"
                 text: backend.problem
                 color: theme.danger
+                // As much of it as there is room for, and a sign that there is more.
+                width: Math.min(implicitWidth, middle.width - 20)
+                elide: Text.ElideRight
             }
         }
 
@@ -187,9 +192,11 @@ Rectangle {
                 color: bar.view.penColor.length ? theme.swatch(bar.view.penColor) : theme.bright
             }
 
-            Text {
+            PlainText {
                 text: backend.notice.length ? backend.notice : bar.context
                 color: theme.foreground
+                width: Math.min(implicitWidth, middle.width - 16)
+                elide: Text.ElideRight
             }
         }
     }
@@ -201,7 +208,7 @@ Rectangle {
 
         // More is in view than a frame is allowed to hold, so some of it
         // is left out. Said, rather than done quietly.
-        Text {
+        PlainText {
             visible: bar.view.simplified && bar.width >= 760
             height: parent.height
             verticalAlignment: Text.AlignVCenter
@@ -223,7 +230,7 @@ Rectangle {
                        : backend.saveState === "failed" ? theme.danger : theme.warning
             }
 
-            Text {
+            PlainText {
                 anchors.verticalCenter: parent.verticalCenter
                 text: backend.saveState === "saved" ? qsTr("saved")
                       : backend.saveState === "failed" ? qsTr("not saved") : qsTr("saving")
@@ -238,7 +245,7 @@ Rectangle {
             height: parent.height
             color: theme.raised
 
-            Text {
+            PlainText {
                 id: coordinates
                 anchors.centerIn: parent
                 text: qsTr("x %1  y %2").arg(Math.round(bar.view.pointer.x)).arg(Math.round(bar.view.pointer.y))
@@ -251,7 +258,7 @@ Rectangle {
             height: parent.height
             color: bar.modeColor
 
-            Text {
+            PlainText {
                 id: zoomText
                 anchors.centerIn: parent
                 text: qsTr("%1%").arg(Math.round(bar.view.zoom * 100))

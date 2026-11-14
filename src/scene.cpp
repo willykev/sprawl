@@ -1255,10 +1255,16 @@ QSGNode *CanvasView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *) {
         scene->rehome(id, m_place.value(id));
     m_rehome.clear();
 
-    // With the board as it now is: what of it this frame draws.
+    // With the board as it now is: what of it this frame draws. The text
+    // being written is drawn by the editor, every letter of it whether in
+    // view or not, so what that asks for comes out of what the board may.
     bool waiting = false;
     const bool was = m_load.reduced;
-    m_load = scene->apply(visibleArea(), m_zoom * devicePixels(), m_loadBudget, m_drawEverything, &waiting);
+    const Item *written = editing() && m_board ? m_board->item(m_editing) : nullptr;
+    const qint64 editor = written ? qint64(written->text.size()) * 2 * glyphBytes : 0;
+    m_load = scene->apply(visibleArea(), m_zoom * devicePixels(), qMax<qint64>(0, m_loadBudget - editor),
+                          m_drawEverything, &waiting);
+    m_load.editor = editor;
     if (waiting)
         QMetaObject::invokeMethod(this, &CanvasView::requestFrame, Qt::QueuedConnection);
     if (m_load.reduced != was)

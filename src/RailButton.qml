@@ -26,7 +26,7 @@ Item {
         color: button.active ? theme.accent : area.containsMouse ? theme.bright : theme.foreground
     }
 
-    Text {
+    PlainText {
         visible: button.label.length > 0
         anchors.centerIn: parent
         text: button.label
@@ -34,7 +34,7 @@ Item {
         font.pixelSize: theme.size("subtitle")
     }
 
-    Text {
+    PlainText {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         anchors.rightMargin: 4

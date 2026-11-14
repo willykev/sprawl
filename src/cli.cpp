@@ -22,11 +22,36 @@
 #include "textlayout.h"
 #include "theme.h"
 
+QString printableText(const QString &text) {
+    QString safe = text;
+    for (QChar &c : safe)
+        if (c.category() == QChar::Other_Control && c != '\n' && c != '\t')
+            c = QChar(QChar::ReplacementCharacter);
+    return safe;
+}
+
+QByteArray printableJson(const QByteArray &json) {
+    // QJsonDocument escapes what is below a space. Delete and the controls
+    // above it are written as they are, and can only be inside a string.
+    const QString text = QString::fromUtf8(json);
+    QString safe;
+    safe.reserve(text.size());
+    for (const QChar c : text) {
+        if (c.unicode() >= 0x7f && c.unicode() <= 0x9f)
+            safe += QString("\\u%1").arg(int(c.unicode()), 4, 16, QChar('0'));
+        else
+            safe += c;
+    }
+    return safe.toUtf8();
+}
+
 namespace {
 
-void print(FILE *stream, const QString &text) { fprintf(stream, "%s\n", qPrintable(text)); }
-void print(const QJsonObject &object) { fprintf(stdout, "%s", QJsonDocument(object).toJson().constData()); }
-void print(const QJsonArray &array) { fprintf(stdout, "%s", QJsonDocument(array).toJson().constData()); }
+void print(FILE *stream, const QString &text) { fprintf(stream, "%s\n", qPrintable(printableText(text))); }
+void print(const QJsonObject &object) {
+    fprintf(stdout, "%s", printableJson(QJsonDocument(object).toJson()).constData());
+}
+void print(const QJsonArray &array) { fprintf(stdout, "%s", printableJson(QJsonDocument(array).toJson()).constData()); }
 int fail(const QString &message) {
     print(stderr, message);
     return 1;

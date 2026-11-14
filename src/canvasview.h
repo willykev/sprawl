@@ -53,6 +53,9 @@ struct SceneLoad {
     // Something was left out to keep the frame within what is asked of the
     // GPU, not because it was too small to see.
     bool reduced = false;
+    // What the editor asks for on top of that, for the text being written:
+    // it draws that itself, and the board is allowed that much less.
+    qint64 editor = 0;
 };
 
 // The board on screen: an endless surface to pan and zoom, and the tools
@@ -107,6 +110,9 @@ class CanvasView : public QQuickItem {
     // The text editor that opens over an item: where it goes and how its
     // text is set, so what is typed looks exactly like what stays.
     Q_PROPERTY(bool editing READ editing NOTIFY editingChanged)
+    Q_PROPERTY(int longestText READ longestText CONSTANT)
+    // The board can be looked at and not changed: it could not be read.
+    Q_PROPERTY(bool readOnly READ readOnly WRITE setReadOnly NOTIFY readOnlyChanged)
     Q_PROPERTY(QString editorText READ editorText NOTIFY editingChanged)
     Q_PROPERTY(QPointF editorPosition READ editorPosition NOTIFY editorChanged)
     Q_PROPERTY(qreal editorWidth READ editorWidth NOTIFY editorChanged)
@@ -180,6 +186,8 @@ public:
     const QVector<quint32> &selection() const { return m_selection; }
 
     bool editing() const { return m_editing != 0; }
+    // The most text an item holds, which the editor keeps to as it is typed in.
+    int longestText() const { return Item::longestText; }
     QString editorText() const { return m_editorText; }
     QPointF editorPosition() const { return m_editorPosition; }
     qreal editorWidth() const { return m_editorStyle.box.width(); }
@@ -192,6 +200,8 @@ public:
     bool canRedo() const { return m_board && m_board->canRedo(); }
     int pendingItems() const { return int(m_dirty.size()); }
     bool simplified() const { return m_load.reduced; }
+    bool readOnly() const { return m_readOnly; }
+    void setReadOnly(bool readOnly);
     SceneLoad load() const { return m_load; }
     // The most a frame may ask of the GPU, in the bytes SceneLoad counts.
     qint64 loadBudget() const { return m_loadBudget; }
@@ -285,6 +295,9 @@ signals:
     void historyChanged();
     void pendingItemsChanged();
     void loadChanged();
+    // More text was given than an item holds, and what was over was left out.
+    void textLeftOut();
+    void readOnlyChanged();
     // The board is all on screen for the first time (or again, after a
     // change of board or theme).
     void settled();
@@ -488,6 +501,7 @@ private:
     // somewhere past seven times this it filled.
     qint64 m_loadBudget = 8'000'000;
     bool m_drawEverything = false;
+    bool m_readOnly = false;
     // The selection's chrome and whatever is being drawn: dirty until
     // prepared, then ready until the scene has taken it.
     bool m_chromeDirty = true, m_chromeReady = false;

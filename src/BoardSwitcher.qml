@@ -93,7 +93,7 @@ Card {
                 color: switcher.mode === "remove" ? theme.danger : theme.accent
             }
 
-            Text {
+            PlainText {
                 anchors.left: prompt.right
                 anchors.leftMargin: 8
                 anchors.verticalCenter: parent.verticalCenter
@@ -172,7 +172,7 @@ Card {
                 border.width: theme.controlBorderWidth
                 radius: Math.min(4, theme.radius)
 
-                Text {
+                PlainText {
                     x: 12
                     anchors.verticalCenter: parent.verticalCenter
                     text: row.modelData.name
@@ -181,7 +181,7 @@ Card {
                     width: parent.width - 120
                 }
 
-                Text {
+                PlainText {
                     anchors.right: parent.right
                     anchors.rightMargin: 12
                     anchors.verticalCenter: parent.verticalCenter
@@ -203,7 +203,7 @@ Card {
             }
         }
 
-        Text {
+        PlainText {
             visible: switcher.mode === "switch" && switcher.matches.length === 0
             x: 12
             height: 28
@@ -239,7 +239,7 @@ Card {
                 width: column.width
                 height: 28
 
-                Text {
+                PlainText {
                     x: 12
                     anchors.verticalCenter: parent.verticalCenter
                     text: action.modelData.label
@@ -265,7 +265,7 @@ Card {
             }
         }
 
-        Text {
+        PlainText {
             x: 12
             height: 30
             verticalAlignment: Text.AlignVCenter

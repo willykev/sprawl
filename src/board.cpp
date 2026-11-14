@@ -11,6 +11,19 @@ namespace {
 // How many steps of undo a board keeps.
 const int historyLimit = 500;
 
+// What a file said, for saying what is wrong with it: a few words of it at
+// most and all on one line, because it goes wherever the answer is read,
+// a status line and a terminal among them.
+QString said(const QString &value) {
+    QString words = value.left(40);
+    if (!words.isEmpty() && words.back().isHighSurrogate())
+        words.chop(1);
+    for (QChar &c : words)
+        if (c.category() == QChar::Other_Control)
+            c = ' ';
+    return value.size() > words.size() ? words + "..." : words;
+}
+
 const QStringList kindNames{"note", "text", "shape", "stroke", "connector", "image", "frame"};
 // As Item::Shape lists them.
 const QStringList shapeNames{"rect",     "rounded",  "pill",    "ellipse", "diamond", "triangle",   "right-triangle",
@@ -316,6 +329,7 @@ quint32 Board::add(Item item) {
     const bool alone = !m_open;
     if (alone)
         begin();
+    item.text = Item::fitted(item.text);
     item.id = ++m_lastId;
     m_created.insert(item.id);
     place(item);
@@ -330,6 +344,13 @@ quint32 Board::add(Item item) {
 }
 
 void Board::set(const Item &item) {
+    if (item.text.size() > Item::longestText) {
+        // No more text than an item holds, whoever is asking.
+        Item fitted = item;
+        fitted.text = Item::fitted(item.text);
+        set(fitted);
+        return;
+    }
     const auto found = m_items.find(item.id);
     if (found == m_items.end() || *found == item)
         return;
@@ -639,7 +660,7 @@ QString Board::itemFromJson(const QJsonObject &object, Item &item) {
     const QString type = object.value("type").toString();
     const int kind = kindNames.indexOf(type);
     if (kind < 0)
-        return type.isEmpty() ? QString("it has no type") : QString("there is no item type \"%1\"").arg(type);
+        return type.isEmpty() ? QString("it has no type") : QString("there is no item type \"%1\"").arg(said(type));
     item = Item();
     item.kind = Item::Kind(kind);
 
@@ -696,7 +717,7 @@ QString Board::itemFromJson(const QJsonObject &object, Item &item) {
         const int index = int(names.indexOf(value.toString()));
         if (index < 0 && problem.isEmpty())
             problem = QString("there is no %1 \"%2\" (the %3 are %4)")
-                          .arg(one, value.toString(), many, names.join(", "));
+                          .arg(one, said(value.toString()), many, names.join(", "));
         return qMax(0, index);
     };
     const double far = 1e9;
@@ -709,9 +730,15 @@ QString Board::itemFromJson(const QJsonObject &object, Item &item) {
     item.group = identifier("group");
     item.color = text("color");
     if (!item.color.isEmpty() && !Item::colorNames().contains(item.color) && problem.isEmpty())
-        problem = QString("there is no color \"%1\" (the colors are %2)").arg(item.color, Item::colorNames().join(", "));
-    if (item.hasText())
+        problem = QString("there is no color \"%1\" (the colors are %2)")
+                      .arg(said(item.color), Item::colorNames().join(", "));
+    if (item.hasText()) {
         item.text = text("text");
+        if (item.text.size() > Item::longestText && problem.isEmpty())
+            problem = QString("\"text\" is %1 characters long, and an item holds %2 at most")
+                          .arg(item.text.size())
+                          .arg(Item::longestText);
+    }
 
     switch (item.kind) {
     case Item::Kind::Note:
@@ -726,7 +753,7 @@ QString Board::itemFromJson(const QJsonObject &object, Item &item) {
         const QString shape = object.value("shape").toString("rect");
         const int index = shapeNames.indexOf(shape);
         if (index < 0 && problem.isEmpty())
-            problem = QString("there is no shape \"%1\" (the shapes are %2)").arg(shape, shapeNames.join(", "));
+            problem = QString("there is no shape \"%1\" (the shapes are %2)").arg(said(shape), shapeNames.join(", "));
         item.shape = Item::Shape(qMax(0, index));
         const QSizeF size = Defaults::shapeSize(item.shape);
         box(size.width(), size.height());

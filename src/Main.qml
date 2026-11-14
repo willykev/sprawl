@@ -121,6 +121,9 @@ ApplicationWindow {
             if (canvas.busy)
                 win.shapesOpen = false
         }
+        function onTextLeftOut() {
+            backend.notify(qsTr("One item holds %1 characters. The rest was left out.").arg(canvas.longestText))
+        }
     }
 
     Connections {
@@ -284,6 +287,7 @@ ApplicationWindow {
             board: backend.board
             theme: win.desktop
             assetFolder: backend.assetFolder
+            readOnly: backend.readOnly
 
             onViewChanged: {
                 if (win.viewRestored)
@@ -320,6 +324,7 @@ ApplicationWindow {
             // stands in for, so starting to type moves nothing.
             TextEdit {
                 id: editor
+                objectName: "editor"
                 visible: canvas.editing
                 x: canvas.editorPosition.x
                 y: canvas.editorPosition.y
@@ -336,6 +341,17 @@ ApplicationWindow {
                 selectedTextColor: color
                 Component.onCompleted: canvas.attachEditor(textDocument)
                 onTextChanged: {
+                    // Never more in it than an item holds. What goes in
+                    // over that comes straight back out, from the end of
+                    // what was just put in (where the cursor is), before a
+                    // frame is drawn of it: the editor draws all it holds.
+                    if (length > canvas.longestText) {
+                        const over = length - canvas.longestText
+                        const end = Math.max(over, cursorPosition)
+                        remove(end - over, end)
+                        canvas.textLeftOut()
+                        return
+                    }
                     if (canvas.editing && activeFocus)
                         canvas.editorEdited(text)
                 }
@@ -366,7 +382,7 @@ ApplicationWindow {
                 color: theme.accent
                 radius: Math.min(4, theme.radius)
 
-                Text {
+                PlainText {
                     id: sizeText
                     anchors.centerIn: parent
                     text: canvas.selectionSize

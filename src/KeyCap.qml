@@ -13,7 +13,7 @@ Rectangle {
     border.width: theme.controlBorderWidth
     radius: Math.min(4, theme.radius)
 
-    Text {
+    PlainText {
         id: text
         anchors.centerIn: parent
         text: cap.label

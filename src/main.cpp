@@ -20,6 +20,7 @@
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QRandomGenerator>
+#include <QRegularExpression>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <QUrl>
@@ -32,6 +33,7 @@
 #include "cli.h"
 #include "geometry.h"
 #include "library.h"
+#include "offline.h"
 #include "portalfilepicker.h"
 #include "theme.h"
 #include "translator.h"
@@ -48,6 +50,10 @@ bool focusOpenWindow() {
     for (const QJsonValue &value : QJsonDocument::fromJson(clients.readAllStandardOutput()).array()) {
         const QJsonObject client = value.toObject();
         if (client.value("class").toString() != "sprawl")
+            continue;
+        // An address is a number, and is all that is ever put in a command.
+        static const QRegularExpression number("^0x[0-9a-fA-F]+$");
+        if (!number.match(client.value("address").toString()).hasMatch())
             continue;
         const QString window = "address:" + client.value("address").toString();
         // Hyprland's Lua dispatchers, then the syntax of the versions before them.
@@ -295,11 +301,15 @@ private:
 // screen at each of the two is how many triangles a block of that buffer
 // holds, which is what the frame budget (CanvasView::m_loadBudget) is
 // reckoned from. It never draws more than the megabytes it is given.
+//
+// `--probe-with writing` asks the same of the editor instead, which draws
+// what is being written itself: a note is written in, a little more at each
+// step, up to what an item holds or the megabytes given, whichever is less.
 class Probe : public QObject {
 public:
     Probe(QQuickWindow *window, CanvasView *canvas, Board *board, double megabytes, const QString &kind)
         : m_window(window), m_canvas(canvas), m_board(board), m_limit(qint64(megabytes * 1e6)),
-          m_notes(kind == "notes"), m_far(kind == "far"), m_unseen(kind == "unseen") {
+          m_notes(kind == "notes"), m_far(kind == "far"), m_unseen(kind == "unseen"), m_writing(kind == "writing") {
         connect(window, &QQuickWindow::frameSwapped, this, &Probe::frame, Qt::QueuedConnection);
         connect(&m_kernel, &QProcess::readyReadStandardOutput, this, &Probe::heard);
         m_kernel.start("journalctl", {"-k", "-f", "-n", "0", "-o", "cat"});
@@ -314,7 +324,7 @@ public:
         // which type still is, which is where the most of it fits; or all
         // the way out, where strokes are specks and there are the most.
         const qreal pixels = m_window->effectiveDevicePixelRatio();
-        m_canvas->setView(QPointF(0, 0), m_far ? 0.1 : (m_notes ? 0.5 : 1) / pixels);
+        m_canvas->setView(QPointF(0, 0), m_far ? 0.1 : m_writing ? 1 : (m_notes ? 0.5 : 1) / pixels);
         if (m_unseen) {
             // Strokes that are handed to the GPU but are nowhere in the
             // window: whether those cost it anything is the question.
@@ -327,7 +337,11 @@ public:
                 .arg(m_window->height())
                 .arg(m_window->effectiveDevicePixelRatio())
                 .arg(megabytes(m_limit),
-                     m_notes ? "notes" : m_far ? "strokes from far off" : m_unseen ? "strokes out of view" : "strokes"));
+                     m_writing  ? "a note being written in"
+                     : m_notes  ? "notes"
+                     : m_far    ? "strokes from far off"
+                     : m_unseen ? "strokes out of view"
+                                : "strokes"));
         m_canvas->update();
     }
 
@@ -344,6 +358,8 @@ private:
         // A step every thirty frames, so each has settled before the next.
         if (++m_frames % 30 != 0)
             return;
+        if (m_writing)
+            return write();
         const SceneLoad load = m_canvas->load();
         say(QString("items=%1 triangles=%2 bytes=%3").arg(m_strokes).arg(load.triangles).arg(load.bytes));
         if (load.bytes >= m_limit || load.reduced)
@@ -369,6 +385,36 @@ private:
                 m_board->add(scribble(at, m_strokes));
             }
         }
+    }
+
+    // The note has more written on it at each step, never more than twice
+    // what it had, and is opened in the editor again: the editor draws all
+    // of what it holds, most of it below the window.
+    void write() {
+        const Item *note = m_note ? m_board->item(m_note) : nullptr;
+        const qsizetype letters = note ? note->text.size() : 0;
+        say(QString("letters=%1 editor bytes=%2").arg(letters).arg(m_canvas->load().editor));
+        if (letters >= Item::longestText)
+            return finish("an item holds no more than that");
+        if (m_canvas->load().editor >= m_limit)
+            return finish("reached the limit without hearing from the kernel twice");
+        Item next;
+        if (note) {
+            next = *note;
+            m_canvas->commitEdit();
+        } else {
+            next.kind = Item::Kind::Note;
+            next.color = "yellow";
+            next.rect = QRectF(40, 40, Defaults::noteSize, Defaults::noteSize);
+        }
+        const qsizetype more = qBound(qsizetype(100), letters, qsizetype(500));
+        next.text += QString("written all over ").repeated(more / 17 + 1).left(more);
+        if (note)
+            m_board->set(next);
+        else
+            m_note = m_board->add(next);
+        m_canvas->select({m_note});
+        m_canvas->editSelection();
     }
 
     void heard() {
@@ -403,8 +449,9 @@ private:
     Board *m_board;
     QProcess m_kernel;
     qint64 m_limit;
-    bool m_notes, m_far, m_unseen;
+    bool m_notes, m_far, m_unseen, m_writing;
     int m_frames = 0, m_strokes = 0;
+    quint32 m_note = 0;
     bool m_started = false, m_done = false;
 };
 
@@ -470,7 +517,10 @@ int main(int argc, char *argv[]) {
     args.addOption({"theme", "Show another Omarchy theme than the desktop's: its name, or its folder", "theme"});
     args.addOption({"bench", "Measure frames on a made-up board of this many items, and exit", "items"});
     args.addOption({"probe", "Measure what a frame costs the GPU, drawing no more than this, and exit", "megabytes"});
-    args.addOption({"probe-with", "What --probe draws: strokes (the default), notes, far (strokes, zoomed out) or unseen", "kind"});
+    args.addOption({"probe-with",
+                    "What --probe draws: strokes (the default), notes, far (strokes, zoomed out), unseen, or writing "
+                    "(a note in the editor)",
+                    "kind"});
     args.process(app);
     const QString requested = args.positionalArguments().value(1);
     const bool screenshot = args.isSet("screenshot"), probe = args.isSet("probe");
@@ -537,7 +587,10 @@ int main(int argc, char *argv[]) {
     qmlRegisterType<CanvasView>("Sprawl", 1, 0, "CanvasView");
     qmlRegisterUncreatableType<Board>("Sprawl", 1, 0, "Board", "Boards belong to the backend");
 
+    // Before the engine, which it has to outlast.
+    Offline offline;
     QQmlApplicationEngine engine;
+    engine.setNetworkAccessManagerFactory(&offline);
     QObject::connect(&translator, &Translator::changed, &engine, &QQmlEngine::retranslate);
     QObject::connect(&engine, &QQmlEngine::warnings, [](const QList<QQmlError> &errors) {
         for (const auto &error : errors)

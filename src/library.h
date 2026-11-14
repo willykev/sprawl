@@ -54,7 +54,8 @@ public:
     static int score(const QString &name, const QString &query);
 
     // Copies a picture into a board's assets, named for its contents so the
-    // same picture is only kept once. Returns the name it has there.
+    // same picture is only kept once. Returns the name it has there, or
+    // nothing, with `error` saying why, for what is not a picture.
     static QString importFile(const QString &assetsFolder, const QString &source, QString *error = nullptr);
     static QString importImage(const QString &assetsFolder, const QImage &image, QString *error = nullptr);
 

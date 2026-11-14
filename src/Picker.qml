@@ -106,7 +106,7 @@ Rectangle {
         height: 28
 
         // What the one under the mouse is called, or the one picked.
-        Text {
+        PlainText {
             anchors.left: parent.left
             anchors.leftMargin: 4
             // Up to the keys, where they are shown, and to the edge otherwise.

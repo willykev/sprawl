@@ -53,7 +53,7 @@ Card {
         y: 14
         width: parent.width - 32
 
-        Text {
+        PlainText {
             x: 4
             height: 34
             text: dialog.selection ? qsTr("Export what is selected") : qsTr("Export the board")
@@ -77,7 +77,7 @@ Card {
                 border.width: theme.controlBorderWidth
                 radius: Math.min(4, theme.radius)
 
-                Text {
+                PlainText {
                     x: 12
                     anchors.verticalCenter: parent.verticalCenter
                     text: row.modelData.label
@@ -100,7 +100,7 @@ Card {
             }
         }
 
-        Text {
+        PlainText {
             x: 12
             height: 32
             verticalAlignment: Text.AlignVCenter

@@ -61,6 +61,10 @@ Backend::Backend(Library *library, FilePicker *picker, Theme *theme, QObject *pa
         connect(m_picker, &FilePicker::imagesSelected, this, &Backend::addFiles);
         connect(m_picker, &FilePicker::failed, this, &Backend::setProblem);
         connect(m_picker, &FilePicker::exportSelected, this, [this](const QUrl &url, const QString &format) {
+            if (!url.isLocalFile()) {
+                setProblem(tr("Sprawl exports to files on this computer, and %1 is not one.").arg(url.toDisplayString()));
+                return;
+            }
             QString path = url.toLocalFile();
             if (!path.endsWith("." + format, Qt::CaseInsensitive))
                 path += "." + format;
@@ -123,7 +127,7 @@ bool Backend::open(const Library::Location &location) {
     if (problem.isEmpty())
         problems = m_board.fromJson(root);
     m_location = location;
-    m_readOnly = !problem.isEmpty() || !problems.isEmpty();
+    setReadOnly(!problem.isEmpty() || !problems.isEmpty());
     if (m_readOnly) {
         // Say what is wrong, show an empty board, and never save over the
         // file that could not be read.
@@ -363,7 +367,7 @@ void Backend::fileChanged() {
                        .arg(m_location.name, problem));
         return;
     }
-    m_readOnly = false;
+    setReadOnly(false);
     m_savedRevision = m_board.revision();
     setSaveState("saved");
     setNotice(tr("Reloaded %1: it changed on disk").arg(m_location.name));
@@ -379,6 +383,13 @@ void Backend::setProblem(const QString &problem) {
 }
 
 void Backend::dismissProblem() { setProblem({}); }
+
+void Backend::setReadOnly(bool readOnly) {
+    if (readOnly == m_readOnly)
+        return;
+    m_readOnly = readOnly;
+    emit readOnlyChanged();
+}
 
 void Backend::setNotice(const QString &notice) {
     if (notice.isEmpty())
@@ -448,8 +459,9 @@ void Backend::addFiles(const QList<QUrl> &urls) {
             continue;
         QImageReader reader(path);
         reader.setAutoTransform(true);
-        QSize size = reader.size();
-        if (!reader.canRead() || !size.isValid()) {
+        // Only a file is looked into: a pipe or a device would never answer.
+        QSize size = QFileInfo(path).isFile() ? reader.size() : QSize();
+        if (!size.isValid() || !reader.canRead()) {
             setProblem(tr("%1 is not a picture Sprawl can show.").arg(QFileInfo(path).fileName()));
             continue;
         }

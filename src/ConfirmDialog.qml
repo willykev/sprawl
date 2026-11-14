@@ -36,7 +36,7 @@ Card {
         width: parent.width - 40
         spacing: 8
 
-        Text {
+        PlainText {
             width: parent.width
             text: dialog.title
             color: theme.bright
@@ -45,7 +45,7 @@ Card {
             wrapMode: Text.Wrap
         }
 
-        Text {
+        PlainText {
             width: parent.width
             visible: text.length > 0
             text: dialog.detail
@@ -53,7 +53,7 @@ Card {
             wrapMode: Text.Wrap
         }
 
-        Text {
+        PlainText {
             width: parent.width
             topPadding: 4
             text: dialog.hint

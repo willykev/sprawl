@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QSaveFile>
@@ -46,7 +47,12 @@ QVector<Library::Entry> Library::boards() const {
     return entries;
 }
 
-bool Library::exists(const QString &name) const { return !name.isEmpty() && QFile::exists(boardFile(name)); }
+bool Library::exists(const QString &name) const {
+    // A name is the name of a folder among the boards, never a way out of them.
+    if (name.isEmpty() || name.contains('/') || name == "." || name == "..")
+        return false;
+    return QFile::exists(boardFile(name));
+}
 
 QString Library::slug(const QString &text) {
     // Letters and digits of any script, in lower case, joined by single
@@ -184,9 +190,17 @@ QString Library::importFile(const QString &assetsFolder, const QString &source, 
             *error = message;
         return QString();
     };
+    // Only ever a picture, wherever the asking came from: a folder, a pipe
+    // or a device is not opened, and a file that is something else is not
+    // copied.
+    const QFileInfo info(source);
+    if (info.exists() && !info.isFile())
+        return fail(QString("%1 is not a file.").arg(source));
     QFile input(source);
     if (!input.open(QIODevice::ReadOnly))
         return fail(QString("Could not read %1: %2.").arg(source, input.errorString()));
+    if (!QImageReader(source).canRead())
+        return fail(QString("%1 is not a picture Sprawl can show.").arg(source));
     QCryptographicHash hash(QCryptographicHash::Sha1);
     if (!hash.addData(&input))
         return fail(QString("Could not read %1.").arg(source));

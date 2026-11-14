@@ -143,6 +143,12 @@ read is never written over. Which board was open, and where each was left, is
 in `~/.local/state/sprawl/state.json`. Setting `SPRAWL_HOME` keeps boards and
 state somewhere else.
 
+A board from somewhere else is only ever read as a board. What it says, and
+what it and its pictures are called, is shown as written and never as markup;
+only a picture is ever kept as one, wherever a board or the clipboard says to
+look; an item holds 10,000 characters at most; and what the commands print
+of it has nothing in it that a terminal obeys.
+
 ## How it draws
 
 Sprawl is C++ and Qt Quick, and the canvas is a single item that builds its
@@ -164,7 +170,10 @@ the budget were measured on an M3 Max not to make that buffer grow at all.
 When more is in view than fits (hundreds of long pen strokes at once, or
 notes piled thousands deep), type goes first, then the curves of strokes,
 then the strokes, and the line at the foot of the window says
-`zoom in for full detail`.
+`zoom in for full detail`. The one thing the canvas does not draw is the
+text being written: the editor does, every letter of it whether in view or
+not, which is why an item holds only so much, and what the editor is holding
+comes out of the budget for as long as it is open.
 
 On that machine, on a made-up board of 48,000 items, panning, zooming all the
 way out and back, and dragging an item each keep up with its 120 Hz display
@@ -175,6 +184,7 @@ bin/build                      # build/sprawl
 bin/test                       # the tests, with no display
 sprawl open --bench 10000      # time frames on a made-up board of that size
 sprawl open --probe 8          # Asahi: what a frame of 8 MB costs the GPU's buffer
+sprawl open --probe 2 --probe-with writing   # the same, of a note in the editor
 sprawl open --theme gruvbox    # look at it in another Omarchy theme
 bin/shaders                    # after editing a shader (needs qt6-shadertools)
 ```
@@ -182,7 +192,8 @@ bin/shaders                    # after editing a shader (needs qt6-shadertools)
 ## What it does not do
 
 Boards live on this machine: there is no sync, sharing, or working on one
-board together. There are no tables, links between boards, rotation, or
+board together, and Sprawl never uses the network (its interface is not
+given one to use). There are no tables, links between boards, rotation, or
 alignment guides; text has one weight and size per item; the pen has no
 pressure and there is no eraser other than deleting a stroke. The window is
 in English until someone translates it: every string is ready to be, and

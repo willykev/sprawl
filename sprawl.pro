@@ -1,4 +1,4 @@
-QT += core gui qml quick quickcontrols2 dbus svg
+QT += core gui qml quick quickcontrols2 dbus svg network
 
 CONFIG += c++20 release
 TARGET = sprawl
@@ -19,6 +19,7 @@ HEADERS += \
     src/item.h \
     src/library.h \
     src/materials.h \
+    src/offline.h \
     src/portalfilepicker.h \
     src/spatialgrid.h \
     src/textlayout.h \

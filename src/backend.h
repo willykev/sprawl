@@ -30,6 +30,9 @@ class Backend : public QObject {
     Q_PROPERTY(QString problem READ problem NOTIFY problemChanged)
     // Something that went right, said for a moment.
     Q_PROPERTY(QString notice READ notice NOTIFY noticeChanged)
+    // The open board could not be read: it is shown as it is, nothing can be
+    // changed on it, and nothing is ever saved over its file.
+    Q_PROPERTY(bool readOnly READ readOnly NOTIFY readOnlyChanged)
 
 public:
     Backend(Library *library, FilePicker *picker, Theme *theme, QObject *parent = nullptr);
@@ -41,6 +44,7 @@ public:
     QString saveState() const { return m_saveState; }
     QString problem() const { return m_problem; }
     QString notice() const { return m_notice; }
+    bool readOnly() const { return m_readOnly; }
 
     // Opens the board named on the command line, or the one that was open
     // last, or the newest, or, the very first time, a welcome board.
@@ -77,6 +81,8 @@ public:
     // Writes the board now. False when it could not be written.
     Q_INVOKABLE bool flush();
     Q_INVOKABLE void dismissProblem();
+    // Something worth saying once, in the status line, that then goes away.
+    Q_INVOKABLE void notify(const QString &notice) { setNotice(notice); }
     void setProblem(const QString &problem);
 
 signals:
@@ -86,6 +92,7 @@ signals:
     void saveStateChanged();
     void problemChanged();
     void noticeChanged();
+    void readOnlyChanged();
     // A picture is in the board's assets and ready to be placed. `position`
     // counts the pictures of one batch, so they can be fanned out.
     void imageAdded(const QString &asset, const QSize &size, int position);
@@ -98,6 +105,7 @@ private:
     void saved(quint64 revision, const QString &error);
     void setSaveState(const QString &state);
     void setNotice(const QString &notice);
+    void setReadOnly(bool readOnly);
     void watch();
     void fileChanged();
     QString viewKey() const;
