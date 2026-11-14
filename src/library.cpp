@@ -2,6 +2,7 @@
 
 #include <QBuffer>
 #include <QCryptographicHash>
+#include <QDeadlineTimer>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -10,10 +11,24 @@
 #include <QJsonDocument>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QThread>
 #include <algorithm>
 #include <climits>
+#include <unistd.h>
 
 #include "board.h"
+
+namespace {
+
+// How long a writer waits for another to be done with a board's file: far
+// longer than reading and writing even a large board takes.
+const int lockWait = 20000;
+
+QByteArray fingerprintOf(const QByteArray &contents) {
+    return QCryptographicHash::hash(contents, QCryptographicHash::Sha1);
+}
+
+} // namespace
 
 Library::Library(const QString &root) : m_root(root) {
     // SPRAWL_HOME puts the boards somewhere else, for trying things without
@@ -71,8 +86,13 @@ QString Library::slug(const QString &text) {
     return name;
 }
 
+QString Library::nameFor(const QString &text) {
+    const QString name = slug(text);
+    return name.isEmpty() ? QStringLiteral("untitled") : name;
+}
+
 QString Library::freeName(const QString &base) const {
-    const QString name = slug(base).isEmpty() ? QStringLiteral("untitled") : slug(base);
+    const QString name = nameFor(base);
     if (!QFile::exists(boardFolder(name)))
         return name;
     for (int i = 2;; ++i) {
@@ -82,11 +102,22 @@ QString Library::freeName(const QString &base) const {
     }
 }
 
+QString Library::taken(const QString &name) const {
+    if (exists(name))
+        return QString("There is already a board called %1.").arg(name);
+    // A folder with no board in it (its file taken out by hand), or a file:
+    // no board, and not to be made one.
+    if (QFile::exists(boardFolder(name)))
+        return QString("%1 is there already and is not a board.").arg(boardFolder(name));
+    return {};
+}
+
 QString Library::create(const QString &name) {
     if (name.isEmpty() || name != slug(name))
         return QString("\"%1\" is not a name a board can have.").arg(name);
-    if (QFile::exists(boardFolder(name)))
-        return QString("There is already a board called %1.").arg(name);
+    const QString why = taken(name);
+    if (!why.isEmpty())
+        return why;
     if (!QDir().mkpath(boardFolder(name)))
         return QString("Could not make the folder %1.").arg(boardFolder(name));
     return write(boardFile(name), QJsonObject{{"sprawl", Board::formatVersion}, {"items", QJsonArray()}});
@@ -97,8 +128,9 @@ QString Library::rename(const QString &from, const QString &to) {
         return QString("\"%1\" is not a name a board can have.").arg(to);
     if (!exists(from))
         return QString("There is no board called %1.").arg(from);
-    if (QFile::exists(boardFolder(to)))
-        return QString("There is already a board called %1.").arg(to);
+    const QString why = taken(to);
+    if (!why.isEmpty())
+        return why;
     if (!QDir().rename(boardFolder(from), boardFolder(to)))
         return QString("Could not rename %1.").arg(from);
     return {};
@@ -112,12 +144,15 @@ QString Library::remove(const QString &name) {
     return {};
 }
 
-QString Library::read(const QString &file, QJsonObject &root) {
+QString Library::read(const QString &file, QJsonObject &root, QByteArray *fingerprint) {
     QFile input(file);
     if (!input.open(QIODevice::ReadOnly))
         return QString("Could not read %1: %2.").arg(file, input.errorString());
+    const QByteArray contents = input.readAll();
+    if (fingerprint)
+        *fingerprint = fingerprintOf(contents);
     QJsonParseError error;
-    const QJsonDocument document = QJsonDocument::fromJson(input.readAll(), &error);
+    const QJsonDocument document = QJsonDocument::fromJson(contents, &error);
     if (error.error != QJsonParseError::NoError)
         return QString("%1 is not valid JSON: %2 (at character %3).").arg(file, error.errorString()).arg(error.offset);
     if (!document.isObject())
@@ -126,16 +161,67 @@ QString Library::read(const QString &file, QJsonObject &root) {
     return {};
 }
 
-QString Library::write(const QString &file, const QJsonObject &root) {
+QString Library::write(const QString &file, const QJsonObject &root, QByteArray *fingerprint) {
+    return write(file, contentsOf(root), fingerprint);
+}
+
+QString Library::write(const QString &file, const QByteArray &contents, QByteArray *fingerprint,
+                       const std::function<bool()> &still) {
     if (!QDir().mkpath(QFileInfo(file).absolutePath()))
         return QString("Could not make the folder for %1.").arg(file);
     QSaveFile output(file);
     if (!output.open(QIODevice::WriteOnly))
         return QString("Could not write %1: %2.").arg(file, output.errorString());
-    output.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    output.write(contents);
+    if (still) {
+        // Writing, and above all getting it onto the disk, can take a while,
+        // and a file renamed over this one meanwhile by something that takes
+        // no lock would be replaced unseen: it is all done before the asking.
+        if (!output.flush())
+            return QString("Could not write %1: %2.").arg(file, output.errorString());
+        ::fsync(output.handle());
+        // Not to be replaced: what was written beside it goes.
+        if (!still())
+            return {};
+    }
     if (!output.commit())
         return QString("Could not write %1: %2.").arg(file, output.errorString());
+    if (fingerprint)
+        *fingerprint = fingerprintOf(contents);
     return {};
+}
+
+QByteArray Library::contentsOf(const QJsonObject &root) {
+    return QJsonDocument(root).toJson(QJsonDocument::Indented);
+}
+
+QByteArray Library::fingerprint(const QString &file) {
+    QFile input(file);
+    return input.open(QIODevice::ReadOnly) ? fingerprintOf(input.readAll()) : QByteArray();
+}
+
+std::unique_ptr<QLockFile> Library::lock(const QString &file, QString *error) {
+    auto fail = [error](const QString &message) {
+        if (error)
+            *error = message;
+        return std::unique_ptr<QLockFile>();
+    };
+    if (!QDir().mkpath(QFileInfo(file).absolutePath()))
+        return fail(QString("Could not make the folder for %1.").arg(file));
+    auto lock = std::make_unique<QLockFile>(file + ".lock");
+    // Tried often, so that a queue of writers (an agent's commands, run side
+    // by side) is soon through.
+    const QDeadlineTimer deadline(lockWait);
+    while (!lock->tryLock(0)) {
+        if (lock->error() == QLockFile::PermissionError)
+            return fail(QString("Could not write %1: its folder cannot be written to.").arg(file));
+        if (lock->error() != QLockFile::LockFailedError)
+            return fail(QString("Could not write %1: %2 could not be made.").arg(file, lock->fileName()));
+        if (deadline.hasExpired())
+            return fail(QString("Could not write %1: something else has been writing it for too long.").arg(file));
+        QThread::msleep(10);
+    }
+    return lock;
 }
 
 int Library::score(const QString &name, const QString &query) {
@@ -212,8 +298,10 @@ QString Library::importFile(const QString &assetsFolder, const QString &source, 
     if (!QDir().mkpath(assetsFolder))
         return fail(QString("Could not make the folder %1.").arg(assetsFolder));
     // The original is only ever read; the board keeps a copy of its own.
+    // One put there meanwhile, whole, by whatever else was adding the same
+    // picture (the window, a command beside it) is that same picture.
     input.close();
-    if (!QFile::copy(source, target))
+    if (!QFile::copy(source, target) && !QFile::exists(target))
         return fail(QString("Could not copy %1 into the board.").arg(source));
     return name;
 }
@@ -243,14 +331,27 @@ QString Library::importImage(const QString &assetsFolder, const QImage &image, Q
 }
 
 Library::Location Library::locate(const QString &nameOrPath) const {
-    const QFileInfo info(nameOrPath);
+    // Nothing named is no board, not the folder the command is run from.
+    if (nameOrPath.isEmpty())
+        return {};
+    // A board's name is that board, whatever the folder a command is run
+    // from has in it. Anything else is a path: what has a slash in it (never
+    // a name), or a .json at its end, or is the name of no board.
+    const bool named = exists(nameOrPath);
+    if (named && !nameOrPath.endsWith(".json", Qt::CaseInsensitive))
+        return {nameOrPath, boardFile(nameOrPath), assetsFolder(nameOrPath)};
+    // Made whole and tidy first, so that "plans/" (as the shell completes a
+    // folder) and "." have the names of their folders.
+    const QFileInfo info(QDir::cleanPath(QDir::current().absoluteFilePath(nameOrPath)));
     // A folder holding a board.json, or the file itself.
     if (info.isDir() && QFile::exists(info.filePath() + "/board.json"))
         return {info.fileName(), info.absoluteFilePath() + "/board.json", info.absoluteFilePath() + "/assets"};
     if (info.isFile())
         return {info.fileName() == "board.json" ? info.absoluteDir().dirName() : info.completeBaseName(),
                 info.absoluteFilePath(), info.absolutePath() + "/assets"};
-    if (exists(nameOrPath))
+    // A board in the library whose folder was given a file's name by hand is
+    // had by that name where the path leads to no board.
+    if (named)
         return {nameOrPath, boardFile(nameOrPath), assetsFolder(nameOrPath)};
     return {};
 }

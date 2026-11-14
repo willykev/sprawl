@@ -6,6 +6,7 @@
 #include <QString>
 #include <QStringList>
 #include <QVector>
+#include <cmath>
 
 // One thing on a board. A plain value: the board, the undo history, the
 // clipboard and the files all pass these around, and the heavy members
@@ -97,6 +98,10 @@ struct Item {
         }
         return text;
     }
+    // The farthest from the middle of the board a file has anything, and the
+    // most it has anything across or down: a billion units, far past where
+    // anyone works. A board with anything past that does not open.
+    static constexpr qreal farthest = 1e9;
 
     bool operator==(const Item &other) const = default;
 
@@ -141,4 +146,20 @@ inline constexpr qreal minimumSize = 16;
 inline constexpr qreal textSize = 12;
 inline constexpr qreal penWidth = 2;
 inline constexpr qreal connectorWidth = 1.5;
+// A picture starts at its own size in pixels, `natural` (never empty). A
+// screenful of photo is too much: it is brought down to a size to arrange.
+// And a sliver is too little: it grows in proportion until no side is less
+// than anything can be made, as far as that size allows, and a strip still
+// thinner is a long thin box, never a line.
+inline QSizeF pictureSize(QSizeF natural) {
+    const QSizeF arrange(420, 320);
+    QSizeF size = natural;
+    if (size.width() > arrange.width() || size.height() > arrange.height())
+        size.scale(arrange, Qt::KeepAspectRatio);
+    const qreal needed = qMax(minimumSize / size.width(), minimumSize / size.height());
+    const qreal room = qMin(arrange.width() / size.width(), arrange.height() / size.height());
+    if (needed > 1 && room > 1)
+        size *= qMin(needed, room);
+    return QSizeF(qMax(minimumSize, std::round(size.width())), qMax(minimumSize, std::round(size.height())));
+}
 } // namespace Defaults

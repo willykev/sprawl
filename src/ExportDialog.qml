@@ -3,6 +3,7 @@ import QtQuick
 // Ctrl+E: what kind of file to make of the board, or of what is selected.
 Card {
     id: dialog
+    objectName: "export"
 
     property bool selection: false
     property int current: 0
@@ -14,7 +15,9 @@ Card {
         { format: "pdf", label: qsTr("PDF document"), key: "D" }
     ]
 
-    cardWidth: 380
+    // Wide enough for its title and its hint, with room on either side, at
+    // whatever size the type is.
+    cardWidth: Math.max(380, title.implicitWidth + 40, hint.implicitWidth + 56)
     cardHeight: column.implicitHeight + 32
 
     function open(selected) {
@@ -54,11 +57,12 @@ Card {
         width: parent.width - 32
 
         PlainText {
+            id: title
             x: 4
             height: 34
             text: dialog.selection ? qsTr("Export what is selected") : qsTr("Export the board")
             color: theme.bright
-            font.pixelSize: theme.size("heading")
+            font.pixelSize: theme.sizes.heading
             font.bold: true
         }
 
@@ -101,12 +105,13 @@ Card {
         }
 
         PlainText {
+            id: hint
             x: 12
             height: 32
             verticalAlignment: Text.AlignVCenter
             text: qsTr("Enter chooses where to save it · Esc closes")
             color: theme.dim
-            font.pixelSize: theme.size("small")
+            font.pixelSize: theme.sizes.small
         }
     }
 }

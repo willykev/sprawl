@@ -3,6 +3,7 @@ import QtQuick
 // Every shortcut, on one card.
 Card {
     id: overlay
+    objectName: "keys"
 
     cardWidth: columns.implicitWidth + 40
     cardHeight: columns.implicitHeight + 76
@@ -73,7 +74,7 @@ Card {
         y: 18
         text: qsTr("Keys")
         color: theme.bright
-        font.pixelSize: theme.size("heading")
+        font.pixelSize: theme.sizes.heading
         font.bold: true
     }
 
@@ -83,7 +84,7 @@ Card {
         y: 22
         text: qsTr("? or Esc closes")
         color: theme.foreground
-        font.pixelSize: theme.size("small")
+        font.pixelSize: theme.sizes.small
     }
 
     // Sections run down each column and over into the next, so the card is
@@ -102,14 +103,22 @@ Card {
             Column {
                 id: section
                 required property var modelData
-                width: modelData.width
+                // As wide as the section is set, or as the widest thing in it
+                // needs at the size the type is now: a label never runs under
+                // its keys.
+                width: {
+                    let widest = modelData.width
+                    for (let i = 0; i < children.length; ++i)
+                        widest = Math.max(widest, children[i].implicitWidth)
+                    return widest
+                }
                 bottomPadding: 4
 
                 PlainText {
                     text: section.modelData.title
                     color: theme.accent
                     opacity: 0.85
-                    font.pixelSize: theme.size("small")
+                    font.pixelSize: theme.sizes.small
                     font.bold: true
                     font.letterSpacing: 1
                     height: 28
@@ -121,16 +130,20 @@ Card {
                     Item {
                         id: row
                         required property var modelData
+                        // Its label, room to tell them apart, and its keys.
+                        implicitWidth: label.implicitWidth + 16 + caps.implicitWidth
                         width: section.width
                         height: 28
 
                         PlainText {
+                            id: label
                             anchors.verticalCenter: parent.verticalCenter
                             text: row.modelData.label
                             color: theme.foreground
                         }
 
                         Row {
+                            id: caps
                             anchors.right: parent.right
                             anchors.verticalCenter: parent.verticalCenter
                             spacing: 5

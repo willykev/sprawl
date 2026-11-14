@@ -119,7 +119,7 @@ Rectangle {
                 return translator.language && choice.length ? picker.view.optionTitle(picker.kind, choice) : ""
             }
             color: theme.foreground
-            font.pixelSize: theme.size("small")
+            font.pixelSize: theme.sizes.small
             elide: Text.ElideRight
         }
 

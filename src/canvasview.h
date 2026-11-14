@@ -13,9 +13,11 @@
 
 #include "board.h"
 #include "geometry.h"
+#include "spatialgrid.h"
 #include "textlayout.h"
 #include "theme.h"
 
+class QKeySequence;
 class QQuickTextDocument;
 class QSGTexture;
 class ImageStore;
@@ -29,7 +31,9 @@ struct ScenePlace {
     // The square of the board it is in, and which part of that square.
     qint32 column = 0, row = 0;
     quint8 part = 0;
-    // Too big to belong to one square of the board.
+    // An item bigger than a square of the board is kept apart from smaller
+    // ones, in buckets of their own, and has a part of one to itself: the
+    // first that is free, not `part`.
     bool wide = false;
     bool operator==(const ScenePlace &) const = default;
 };
@@ -45,9 +49,15 @@ struct SceneLoad {
     // what a GPU has to keep of those triangles to draw one frame, in bytes.
     int items = 0;
     qint64 triangles = 0, bytes = 0;
-    // How much the pen's strokes were simplified: 0 is not at all.
+    // How much the pen's strokes were simplified: 0 is not at all. And
+    // whether the pen's long strokes were left out: those of a stroke still
+    // being drawn only once it is too long to keep (see SceneNodes::apply()).
     int strokeDetail = 0;
     bool strokesHidden = false;
+    // How much shapes with curves and dashed lines were simplified: no more
+    // than the pen's strokes, and only as far as the frame needs. Those are
+    // never left out on their own (see SceneNodes::apply()).
+    int diagramDetail = 0;
     // Type smaller than this, in units, was left out.
     qreal smallestText = 0;
     // Something was left out to keep the frame within what is asked of the
@@ -56,6 +66,20 @@ struct SceneLoad {
     // What the editor asks for on top of that, for the text being written:
     // it draws that itself, and the board is allowed that much less.
     qint64 editor = 0;
+    // And what is being drawn (a stroke of the pen, a box, a line), which is
+    // drawn whole: the board is allowed that much less again. A stroke is
+    // not drawn at all in a frame with no room left for it once the board
+    // has left out all it can (see CanvasView::updatePaintNode()).
+    qint64 draft = 0;
+    // And the selection's outlines and handles, the same.
+    qint64 chrome = 0;
+    // What the board may still come to however little room the rest leaves
+    // it: it leaves out whole parts of itself when it must, but never the one
+    // nearest the middle of the view, whatever that holds (see
+    // SceneNodes::apply()). This is what is always drawn of the heaviest
+    // part in view, which could be that one, its shapes and lines at their
+    // plainest included.
+    qint64 floor = 0;
 };
 
 // The board on screen: an endless surface to pan and zoom, and the tools
@@ -106,6 +130,11 @@ class CanvasView : public QQuickItem {
     Q_PROPERTY(QString selectionSize READ selectionSize NOTIFY selectionBoxChanged)
     // Something is being dragged, so floating chrome keeps out of the way.
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
+    // The mouse is down on the canvas, from the press until it lets go (or
+    // Esc puts back what it did), whether or not it has gone far enough to
+    // be a drag: until then the board is the mouse's, and keys that would
+    // change it wait.
+    Q_PROPERTY(bool pressed READ pressed NOTIFY pressedChanged)
 
     // The text editor that opens over an item: where it goes and how its
     // text is set, so what is typed looks exactly like what stays.
@@ -123,6 +152,9 @@ class CanvasView : public QQuickItem {
 
     Q_PROPERTY(bool canUndo READ canUndo NOTIFY historyChanged)
     Q_PROPERTY(bool canRedo READ canRedo NOTIFY historyChanged)
+    // The keys that redo: the desktop's own, and Ctrl+Y unless it is one of
+    // them already.
+    Q_PROPERTY(QVariantList redoKeys READ redoKeys CONSTANT)
     // Frames drawn and items waiting to be built, for the benchmark.
     Q_PROPERTY(int pendingItems READ pendingItems NOTIFY pendingItemsChanged)
     // More is in view than is drawn in full: zooming in brings it back.
@@ -176,14 +208,15 @@ public:
     qreal penWidth() const { return m_penWidth; }
     void setPenWidth(qreal width);
 
-    int selectionCount() const { return int(m_selection.size()); }
+    int selectionCount() const { return int(m_selected.size()); }
     QString selectionKind() const;
     QString selectionColor() const;
     QString selectionShape() const;
-    QRectF selectionBox() const { return m_selectionBox; }
-    QString selectionSize() const { return m_selectionSize; }
+    QRectF selectionBox() const;
+    QString selectionSize() const;
     bool busy() const { return m_drag != Drag::None && m_dragStarted; }
-    const QVector<quint32> &selection() const { return m_selection; }
+    bool pressed() const { return m_drag != Drag::None; }
+    const QVector<quint32> &selection() const;
 
     bool editing() const { return m_editing != 0; }
     // The most text an item holds, which the editor keeps to as it is typed in.
@@ -198,17 +231,46 @@ public:
 
     bool canUndo() const { return m_board && m_board->canUndo(); }
     bool canRedo() const { return m_board && m_board->canRedo(); }
+    QVariantList redoKeys() const;
+    // The keys that redo where the desktop's own are `desktop`.
+    static QVariantList redoKeysWith(const QList<QKeySequence> &desktop);
     int pendingItems() const { return int(m_dirty.size()); }
+    // How many times all of the selection, or all of the board, has been
+    // gone through to keep up with what is selected and the box around it:
+    // for the tests, which count that a change to a big selection is kept up
+    // with once, and not once for each thing in it.
+    int selectionPasses() const { return m_selectionPasses; }
+    // How many times every item's layer has been worked out from nothing:
+    // for the tests, which count that what is put down has its own layer
+    // worked out, and not every other one on the board again with it.
+    int layerings() const { return m_layerings; }
+    // How many times one item's layer has been worked out by asking how deep
+    // it is in the stack: for the tests, which count that what is put down
+    // on top is layered without asking, which after each thing put down has
+    // the board count out its whole stack again.
+    int depthsAsked() const { return m_depthsAsked; }
     bool simplified() const { return m_load.reduced; }
     bool readOnly() const { return m_readOnly; }
     void setReadOnly(bool readOnly);
     SceneLoad load() const { return m_load; }
     // The most a frame may ask of the GPU, in the bytes SceneLoad counts.
     qint64 loadBudget() const { return m_loadBudget; }
+    // Whoever sets it, it is never more than largestLoadBudget.
     void setLoadBudget(qint64 bytes);
+    // As much as any frame is ever allowed: twice its budget (see
+    // m_loadBudget), which is still well short of the five times that had
+    // the GPU's buffer half full. Only measuring asks for more than the
+    // budget (sprawl open --probe), to find out what more costs.
+    static constexpr qint64 largestLoadBudget = 16'000'000;
     // Draws the whole board whatever is in view: only for measuring what
     // that costs (sprawl open --probe).
     void setDrawingEverything(bool everything);
+    // The pictures the GPU holds for the board, as of the last frame, and how
+    // many times a picture has been handed to it: for the tests, which count
+    // that a picture is handed over once, however often what shows it is
+    // drawn again, and let go of with the last thing that shows it.
+    int picturesHeld() const { return m_picturesHeld; }
+    int picturesUploaded() const { return m_picturesUploaded; }
 
     // --- View ----------------------------------------------------------------
 
@@ -259,14 +321,18 @@ public:
     Q_INVOKABLE void stepShape(int by);
     Q_INVOKABLE void copy();
     Q_INVOKABLE void cut();
-    // False when the clipboard holds nothing a board takes, in which case
-    // the caller may look for an image in it.
+    // False when the clipboard holds nothing a board takes, or nothing of it
+    // can be read, in which case the caller may look for a picture or text
+    // in it.
     Q_INVOKABLE bool paste();
     Q_INVOKABLE void undo();
     Q_INVOKABLE void redo();
     // Steps back out of whatever is going on: a drag, editing, a tool, the
     // selection. False when there was nothing to step out of.
     Q_INVOKABLE bool escape();
+    // A stroke still being drawn is kept as far as it got, as when the mouse
+    // is taken away: for a window that closes in the middle of one.
+    Q_INVOKABLE void keepStroke();
 
     Q_INVOKABLE void editSelection();
     Q_INVOKABLE void editorEdited(const QString &text);
@@ -290,6 +356,7 @@ signals:
     void selectionChanged();
     void selectionBoxChanged();
     void busyChanged();
+    void pressedChanged();
     void editingChanged();
     void editorChanged();
     void historyChanged();
@@ -297,6 +364,10 @@ signals:
     void loadChanged();
     // More text was given than an item holds, and what was over was left out.
     void textLeftOut();
+    // Something on the clipboard could not be read, and was not pasted. Told
+    // once the rest is down; when none of it could be read, once whoever
+    // asked for the paste has pasted what else the clipboard holds.
+    void itemsLeftOut();
     void readOnlyChanged();
     // The board is all on screen for the first time (or again, after a
     // change of board or theme).
@@ -331,9 +402,14 @@ private:
         QRectF bounds;
         Geo::ShapeMesh shapes;
         Geo::StrokeMesh strokes;
-        // A long stroke again, in less detail, for when it is small on
-        // screen. Empty for anything else.
+        // A long stroke, a shape with curves or a long dashed line again, in
+        // less detail, for when it is small on screen. Empty for anything
+        // else.
         Geo::StrokeMesh coarse[2];
+        // Whether that is a shape's or a line's: part of the diagram, which a
+        // full frame draws more plainly but, unlike a stroke of the pen,
+        // never leaves out on its own (see scene.cpp).
+        bool diagram = false;
         std::unique_ptr<TextBlock> text;
         QColor textColor, titleColor;
         QPointF textOffset;
@@ -342,7 +418,6 @@ private:
         // What the title and the rest are set in: text that shares a style
         // can be drawn together.
         quint64 titleStyle = 0, bodyStyle = 0;
-        QString asset;
         QImage image;
         QRectF imageRect;
     };
@@ -352,8 +427,12 @@ private:
     void prepareVisible(bool measure);
     void prepareDecorations(Geo::ShapeMesh &shapes);
     void prepareDraft(Geo::ShapeMesh &shapes, Geo::StrokeMesh &strokes);
+    // The most triangles the stroke being drawn may come to.
+    qsizetype strokeLimit() const;
     void buildItem(SceneNodes *scene, quint32 id, const Prepared &prepared);
     // Which layer each item is drawn in, and where: see scene.cpp.
+    void placeUnmeasured(quint32 id);
+    void markUnmeasured(quint32 id);
     void relayer(quint32 id);
     void raiseLayer(quint32 id, int layer);
     void relayerAll();
@@ -368,6 +447,7 @@ private:
     // --- Board changes -------------------------------------------------------
     void onItemChanged(quint32 id, Board::Change change);
     void onOrderChanged();
+    void onRenumbered(quint32 from, quint32 to);
     void onReset();
     void onThemeChanged();
     void onImageLoaded(const QString &asset);
@@ -381,7 +461,15 @@ private:
     // --- Selection -----------------------------------------------------------
     void setSelection(QVector<quint32> ids);
     QVector<quint32> withGroups(const QVector<quint32> &ids) const;
-    void refreshSelectionBox();
+    // Works out the box around the selection again, if anything it is made
+    // of has changed since it last was.
+    void measureSelection() const;
+    // Tells the window what has changed of the selection since it was last
+    // told: once, however many of its items changed. Later is once the
+    // events of the moment have been handled, or before the next frame is
+    // drawn if that comes first, for a change nothing tells sooner.
+    void tellSelection();
+    void tellSelectionLater();
     QRectF itemBoxOnScreen(const Item &item) const;
     struct HandleSpot {
         int handle;
@@ -392,15 +480,31 @@ private:
     const Item *soleSelection() const;
 
     // --- Tools ---------------------------------------------------------------
+    // Whether the board may be changed now, by anything but a drag that is
+    // already under way.
+    bool mayChange() const;
     void setToolTo(Tool tool);
     void updateCursor(QPointF itemPoint);
     void setPointer(QPointF itemPoint, bool inside);
     void startMove();
+    // What a move of the selection takes along, as it all is now.
+    QHash<quint32, Item> carried() const;
+    // Puts each of `items` `delta` from where it was when it was taken.
+    void moveBy(const QHash<quint32, Item> &items, QPointF delta);
     void dragMove(QPointF canvasPoint);
     void dragResize(QPointF canvasPoint, bool keepAspect);
     void dragEnd(QPointF canvasPoint);
     void dragMarquee(QPointF itemPoint);
-    void finishStroke();
+    // The pen: the stroke being drawn, carried on to a point; cut again when
+    // the pen or the view changes under it; and, once it is as much as one
+    // stroke may be, put on the board as far as it has got and carried on
+    // from there as another.
+    Geo::Pen penInHand() const;
+    void drawTo(QPointF canvasPoint);
+    void refreshPen();
+    bool full(const Geo::Pen &pen) const;
+    void carryOn();
+    quint32 finishStroke();
     void finishBox(QPointF canvasPoint);
     void finishConnect(QPointF canvasPoint);
     void cancelDrag();
@@ -445,10 +549,23 @@ private:
     QString m_noteColor = QStringLiteral("yellow");
 
     // Selection
-    QVector<quint32> m_selection;
+    // What is selected, in the order it was picked, and the same as a set.
+    // A thing that leaves the board leaves the set at once, and the list
+    // when it is next read: taken out of the list one by one, many things
+    // removed together would go through the whole list once for each.
+    mutable QVector<quint32> m_selection;
     QSet<quint32> m_selected;
-    QRectF m_selectionBox;
-    QString m_selectionSize;
+    mutable bool m_selectionHoles = false;
+    // The box around it on screen, and its size on the board, as last
+    // worked out; stale once anything they are made of has changed, and
+    // news until the window has been told.
+    mutable QRectF m_selectionBox;
+    mutable QString m_selectionSize;
+    mutable bool m_selectionBoxStale = false, m_selectionBoxNews = false;
+    // What is selected, or something of it, has changed since the window was
+    // told; and a telling is on its way.
+    bool m_selectionNews = false, m_tellQueued = false;
+    mutable int m_selectionPasses = 0;
 
     // Dragging
     Drag m_drag = Drag::None;
@@ -460,11 +577,23 @@ private:
     int m_dragHandle = -1;
     QRectF m_marquee;
     QVector<quint32> m_marqueeBase;
-    QVector<QPointF> m_draftPoints;
+    Geo::Pen m_pen;
+    // The group a stroke put on the board in pieces is put down in, so that
+    // it is one thing to pick up: none until a piece of it is down. From
+    // then until the pen is lifted, the board keeps to what is left when a
+    // stroke is as big as it may be (see updatePaintNode()). And the pieces
+    // themselves, which are drawn with what is still being drawn for as long
+    // as the board can make room for them (see SceneNodes::apply()).
+    quint32 m_strokeGroup = 0;
+    QVector<quint32> m_strokePieces;
     QRectF m_draftBox;
     quint32 m_connectFrom = 0, m_connectTarget = 0;
     QPointF m_connectStart, m_connectEnd;
     bool m_connectSideways = true;
+    // Things are being moved, and nothing else is done to them: whatever the
+    // board says of them meanwhile, and of the connectors that follow them,
+    // is only where they are.
+    bool m_moving = false;
 
     // Editing
     quint32 m_editing = 0;
@@ -486,10 +615,13 @@ private:
     QHash<quint32, ScenePlace> m_place;
     QSet<quint32> m_rehome;
     bool m_layersStale = true;
+    int m_layerings = 0, m_depthsAsked = 0;
     bool m_sceneReset = true, m_viewDirty = true;
     // What the last frame came to. Written while the scene synchronizes,
     // when this thread is waiting on it.
     SceneLoad m_load;
+    // And the pictures on the GPU then, and how many have been put there.
+    int m_picturesHeld = 0, m_picturesUploaded = 0;
     // Eight megabytes is about sixty-five thousand small triangles. A
     // tile-based GPU keeps every triangle of a frame in a buffer of fixed
     // size until the frame is drawn, and the Apple GPU driver on Asahi does
@@ -509,5 +641,16 @@ private:
     Geo::ShapeMesh m_chromeShapes, m_draftShapes;
     Geo::StrokeMesh m_draftStrokes;
     QElapsedTimer m_polishTimer;
-    bool m_measuring = false;
+    // The item being made big enough for its text as it is prepared, if any.
+    quint32 m_measuring = 0;
+    // Text not yet measured since it came onto the board or last changed, or
+    // the theme did, and all each could cover, from its corner, once it is.
+    QHash<quint32, QRectF> m_unmeasured;
+    // And the same of the notes and shapes not yet made big enough for what
+    // is written on them, which could grow past the size they have.
+    QHash<quint32, QRectF> m_unfitted;
+    // Both, by all each could cover from where it is now.
+    SpatialGrid m_reaching;
+    // What is waiting to be prepared, in the order the frames take it in.
+    QList<quint32> m_waiting;
 };

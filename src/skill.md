@@ -20,7 +20,9 @@ board is open in it.
 
 - Boards: `sprawl list --json`, `sprawl new <name> --json` (prints the file).
   A board is named in lower case with dashes (`weekend-trip`), or given as a
-  path to its folder or its `board.json`.
+  path to its folder or its `board.json`. A board's name always means that
+  board, even where the folder you are in has a file or folder called the
+  same: give that folder as `./weekend-trip`.
 - See: `sprawl show <board> --json` prints every item with its `id`, back to
   front. Without `--json` it is one line per item.
 - Add: `sprawl add <board> <type> [options] --json` prints the item as saved.
@@ -42,8 +44,8 @@ board is open in it.
     `--start arrow` as well for one that goes both ways.
   - `image --file picture.png` (the picture is copied into the board)
   - Place with `--x` and `--y` (the top left corner, in units; a unit is a
-    pixel at 100%) and size with `--width` and `--height`. Without `--x` and
-    `--y` the item goes below everything else, at the left edge.
+    pixel at 100%) and size with `--width` and `--height`. Without `--y` the
+    item goes below everything else, and without `--x` at its left edge.
   - Colors are `yellow`, `orange`, `red`, `magenta`, `blue`, `cyan`, `green`.
   - One item holds at most 10,000 characters of text.
 - Remove: `sprawl remove <board> <id>...` takes items with their connectors.
@@ -57,6 +59,8 @@ board is open in it.
   (the squarer shapes, like `star` and `cylinder`, are about 104 by 104).
   Leave about 20 units between neighbors; a column of notes is `x` the same
   and `y` 172 apart.
+- A note or a shape grows taller to hold what is written on it, wherever it
+  was written: `sprawl show <board> --json` gives the size each is drawn at.
 - For a flowchart, add the shapes first, read their ids from `--json`, then
   add connectors between them. Connectors follow their shapes when moved.
 - A frame draws a titled border around whatever is placed inside it.
@@ -74,8 +78,16 @@ board is open in it.
   ```
 
   Items are listed back to front. `id` is optional except where a connector
-  refers to it. Write the file whole (to a temporary name, then rename it
-  over), and run `sprawl check <board>` afterwards.
+  refers to it. A new one comes after every id in the file, and after
+  `lastId` when the file has one: the last id given, to an item since
+  removed. Leave `lastId` as it is, so no id is ever given twice. Once the
+  board is open in the window, the ids it gives are written into the file
+  too. Read the file just before writing it, not from an earlier
+  `sprawl show`: the person may be changing the board in the window, and
+  whatever changed since it was read would be undone. Write it whole (to a
+  temporary name, then rename it over), and run `sprawl check <board>`
+  afterwards. `sprawl add` and `sprawl remove` never undo anything: prefer
+  them when the person may be working on the board.
 
 ## Working with the person
 

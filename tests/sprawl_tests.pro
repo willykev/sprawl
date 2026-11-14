@@ -1,7 +1,16 @@
 QT += core gui qml quick quickcontrols2 testlib dbus svg network
-CONFIG += c++20 testcase
+# The frame tests count what the canvas has put in the scene graph, which
+# only Qt Quick's own headers reach.
+QT += quick-private
+CONFIG += c++20 testcase no_private_qt_headers_warning
 TARGET = sprawl_tests
 TEMPLATE = app
+
+# A window that loses the keys to none of the app's own, as one does when
+# the desktop shows another workspace, is only made through Qt GUI's own
+# interface to the platform.
+QT += gui-private
+CONFIG += no_private_qt_headers_warning
 
 INCLUDEPATH += ../src
 DEFINES += SPRAWL_VERSION=\\\"test\\\"
@@ -16,8 +25,10 @@ HEADERS += \
     ../src/geometry.h \
     ../src/imagestore.h \
     ../src/item.h \
+    ../src/launch.h \
     ../src/library.h \
     ../src/materials.h \
+    ../src/measuring.h \
     ../src/offline.h \
     ../src/spatialgrid.h \
     ../src/textlayout.h \

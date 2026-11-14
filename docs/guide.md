@@ -25,9 +25,10 @@ and written from the command line.
   own: nothing, an arrow, an open arrow, a triangle, a dot, a circle, a
   diamond, an open diamond, or a bar. A selected connector's four choices
   are on the bar beside it, and the connector tool's are on a bar of its own.
-- **Pen** strokes, smoothed as they are drawn, in the theme's colors and four
-  widths. **Pictures** from a file dialog, a drop, or the clipboard, kept with
-  the board. **Frames**: a titled border that carries what sits inside it.
+- **Pen** strokes, smoothed as they are drawn but sharp at the corners the
+  hand turns, in the theme's colors and four widths. **Pictures** from a file
+  dialog, a drop, or the clipboard, kept with the board. **Frames**: a titled
+  border that carries what sits inside it.
 - **Select, move, resize, group, restack, duplicate, copy and paste**, with
   undo and redo for every step. Anything new lands under the pointer.
 - **Boards** switched by typing a few letters of a name (`Ctrl+O`), made,
@@ -46,14 +47,16 @@ follows it live, the way the Omarchy shell does:
   strokes are colored by name (yellow, blue, ...), so a board changes shade
   with the theme, and note paper is toned so that dark writing always reads
   on it. Light themes work.
-- **The shell's controls**, from `shell.toml`: panels, rows, and key caps are
+- **The shell's controls**, from the theme's `shell.toml` and your own
+  (`~/.config/omarchy/shell.toml`) over it: panels, rows, and key caps are
   drawn with the same fills, hairline borders, and selected states as the
   shell's own menus.
 - **A rail and a mode line** rather than toolbars: the tools down the left
   edge with their keys, and along the bottom the mode in its color, the
   board, what is selected, whether it is saved, where the pointer is, and
   the zoom.
-- **The Omarchy font**, at the size the theme gives the shell.
+- **The Omarchy font**, at the size of the shell's own text: the theme's,
+  or the one you set with `omarchy display text size`.
 - **Hyprland's corners, border, and motion**: square where windows are
   square, and nothing glides when animations are off.
 
@@ -65,8 +68,10 @@ bin/install
 
 This builds Sprawl and installs it as an Arch package (`makepkg -fsi`), so it
 shows up in the Omarchy app launcher (`Super + Space`). It needs `qmake6`,
-`make`, a C++ compiler, and Qt's base, declarative, SVG, and Wayland modules,
-all of which are part of Omarchy.
+`make`, a C++ compiler, and Qt's base, declarative, image formats, SVG, and
+Wayland modules, all of which are part of Omarchy. AVIF, HEIC, and JPEG XL
+pictures also need `kimageformats` and the library for each: `libavif`,
+`libheif`, and `libjxl`.
 
 ## Shortcuts
 
@@ -120,6 +125,16 @@ sprawl export weekend-trip -o trip.pdf
 sprawl open weekend-trip
 ```
 
+A board is given by its name, or by a path to its folder or its
+`board.json`. A board's name always means that board, even where the folder
+you are in has a file or folder called the same: give that folder as
+`./weekend-trip`.
+
+With Sprawl open, `sprawl open` on its own brings its window to the front.
+Given a board, or something to start with such as `--theme nord` or
+`--zoom 0.5`, it opens a window of its own, on the last board if none is
+named.
+
 `sprawl help` lists the commands and `sprawl help add` a command's options.
 `sprawl skill install` installs a short skill so coding agents can lay out
 boards for you.
@@ -137,11 +152,14 @@ is plain enough to write by hand, and an `assets` folder with its pictures.
 ]}
 ```
 
-Items are listed back to front; a unit is a pixel at 100%. `sprawl check`
-says what is wrong with a file that will not open, and a board that cannot be
-read is never written over. Which board was open, and where each was left, is
-in `~/.local/state/sprawl/state.json`. Setting `SPRAWL_HOME` keeps boards and
-state somewhere else.
+Items are listed back to front; a unit is a pixel at 100%. An item written
+without an `id` is given one, which the window writes into the file once it has
+the board open. `sprawl check` says what is wrong with a file that will not
+open, and a board that cannot be read is never written over: the window says
+why (a click on "read only" says it again), shows it read only, and opens it by
+itself once the file can be read. Which board was open, and where each was
+left, is in `~/.local/state/sprawl/state.json`. Setting `SPRAWL_HOME` keeps
+boards and state somewhere else.
 
 A board from somewhere else is only ever read as a board. What it says, and
 what it and its pictures are called, is shown as written and never as markup;
@@ -170,14 +188,37 @@ the budget were measured on an M3 Max not to make that buffer grow at all.
 When more is in view than fits (hundreds of long pen strokes at once, or
 notes piled thousands deep), type goes first, then the curves of strokes,
 then the strokes, and the line at the foot of the window says
-`zoom in for full detail`. The one thing the canvas does not draw is the
-text being written: the editor does, every letter of it whether in view or
-not, which is why an item holds only so much, and what the editor is holding
-comes out of the budget for as long as it is open.
+`zoom in for full detail`. Shapes and lines never go with the strokes,
+though a shape's curves and a line's dashes can give way with theirs.
+Strokes give way a whole level at a time, which can leave room for those
+curves and dashes again, and then for the type: it comes back, the largest
+first, as far as it goes. Curves and dashes give way a whole level at a time
+too, and that can bring type back as well. The one thing the canvas does not
+draw is the text being written: the editor does, every letter of it whether
+in view or not, which is why an item holds only so much, and what the editor
+is holding comes out of the budget for as long as it is open. The stroke
+being drawn is drawn whole too, cut only as finely as it shows on screen, so
+it is no more triangles for being drawn far out; it comes out of the budget
+as well, and one that would be more than a quarter of it (or than the board
+leaves room for) goes on the board as it is and carries on as another stroke
+from the same point. From then until the pen is lifted, the board keeps to
+what is left, so its detail does not come and go with each piece, and the
+pieces stay drawn: the rest of the board makes room for them, down to the
+part of it nearest the middle of the window. Only a scribble too long to fit
+beside that gives up its oldest pieces until the pen is lifted. However
+many strokes it comes to, it is one thing to pick up and one step of undo,
+and `Esc` while drawing takes back all of it. The selection's outlines come
+out of the budget too.
 
 On that machine, on a made-up board of 48,000 items, panning, zooming all the
 way out and back, and dragging an item each keep up with its 120 Hz display
 (118 to 119 frames a second, measured with `--bench`).
+
+What measures the canvas runs on the GPU it measures, so it keeps to what is
+known to be safe there. No frame is ever allowed more than twice the budget,
+whoever asks: `--probe` goes up to 16 MB at most, whatever it draws, and
+`--bench` makes up boards of 100,000 items at most. Either says so when it is
+asked for more, and refuses what makes no sense.
 
 ```sh
 bin/build                      # build/sprawl
@@ -185,6 +226,7 @@ bin/test                       # the tests, with no display
 sprawl open --bench 10000      # time frames on a made-up board of that size
 sprawl open --probe 8          # Asahi: what a frame of 8 MB costs the GPU's buffer
 sprawl open --probe 2 --probe-with writing   # the same, of a note in the editor
+sprawl open --probe 2 --probe-with drawing   # the same, of a stroke being drawn
 sprawl open --theme gruvbox    # look at it in another Omarchy theme
 bin/shaders                    # after editing a shader (needs qt6-shadertools)
 ```

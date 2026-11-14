@@ -22,8 +22,37 @@ QVector<QPointF> simplify(const QVector<QPointF> &points, qreal tolerance);
 
 // A smooth curve through the points (centripetal Catmull-Rom, which never
 // loops or overshoots between unevenly spaced points), flattened to line
-// segments that stay within `tolerance` of the curve.
+// segments that stay within `tolerance` of the curve. At a point given twice
+// it comes to a point, as it does at its ends: that is a corner.
 QVector<QPointF> smooth(const QVector<QPointF> &points, qreal tolerance);
+// What the end of a line drawn by hand comes to as the hand goes on: the
+// last `back` of its points give way to `points`, which give a corner twice.
+struct Corner {
+    int back = 0;
+    QVector<QPointF> points;
+};
+// Where the line through `points`, going on to `next`, has made a corner
+// that it does not come to a point at yet, judged as it is drawn; `pixel`
+// is how long a screen pixel is. A corner is where the line turned by 75
+// degrees or more, at a point or split between two that it went by either
+// side of the corner, or by 40 or more where the line goes on straight
+// either side and the corner would show rounded off: an L, a V, the points
+// of a zigzag or a star, the corners of a box, an arrow's head, a tick.
+// Rounded off, a corner bulges out past where it was, the more the longer
+// the stretches either side of it. The corner is no more than two points
+// back (see Pen::redraw()). Where the pen went is only known to the pixel,
+// so one the hand went by is placed as near as the pixels tell, which for
+// the sharpest is a pixel or two.
+Corner cornerBefore(const QVector<QPointF> &points, QPointF next, qreal pixel);
+// Drops the points the curve through them does not need: the curve through
+// those kept (see smooth()) is nowhere further than `tolerance` from the
+// curve through them all. A corner is kept twice or not at all, and every
+// point the path needs is kept (see simplify()). A line that only waves by
+// less than `tolerance` is kept as the line, unless the curve through its
+// points waves further than that.
+QVector<QPointF> simplifyCurve(const QVector<QPointF> &points, qreal tolerance);
+// How closely a pen stroke on the board follows its curve, in units.
+inline constexpr qreal strokeTolerance = 0.1;
 
 QRectF boundsOf(const QVector<QPointF> &points);
 
@@ -58,9 +87,89 @@ enum class Join { Round, Miter, Bevel };
 // Premultiplied color as the bytes a StrokeVertex carries.
 quint32 packColor(const QColor &color, qreal opacity = 1);
 
-// Appends the triangles of a line through `points` (moved by `offset`).
+// Appends the triangles of a line through `points` (moved by `offset`). Its
+// round ends and corners are cut finely enough for any zoom; given a
+// `scale`, only as finely as they show when a unit is that many screen
+// pixels, which for a line a pixel or two wide on screen is hardly at all.
 void strokePolyline(StrokeMesh &mesh, const QVector<QPointF> &points, QPointF offset, qreal halfWidth, quint32 color,
-                    Cap cap = Cap::Round, Join join = Join::Round);
+                    Cap cap = Cap::Round, Join join = Join::Round, qreal scale = 0);
+
+// The same line cut a point at a time. Where one segment meets the next
+// depends on both, so a segment is cut when the point after it comes, and
+// the last one, with the end of the line, by end(). All it keeps is how the
+// line ends so far, which is small: a copy of one is the line as it was,
+// and can be carried on from there in another direction.
+class StrokeLine {
+public:
+    StrokeLine(qreal halfWidth, quint32 color, Cap cap = Cap::Round, Join join = Join::Round, qreal scale = 0);
+    void add(StrokeMesh &mesh, QPointF point);
+    void end(StrokeMesh &mesh) const;
+
+private:
+    struct Pair {
+        quint32 left = 0, right = 0;
+    };
+    Pair pairAt(StrokeMesh &mesh, QPointF center, QPointF normal) const;
+    void corner(StrokeMesh &mesh, QPointF direction, QPointF normal);
+
+    float m_halfWidth;
+    quint32 m_color;
+    Cap m_cap;
+    Join m_join;
+    // How much of an arc one triangle takes.
+    qreal m_step;
+    int m_count = 0;
+    QPointF m_first, m_last;
+    // The segment that ends at the last point, and the pair of vertices it
+    // starts from.
+    QPointF m_direction, m_normal;
+    Pair m_start;
+};
+
+// --- The pen ---------------------------------------------------------------
+
+// The line the pen is drawing, smoothed as smooth() smooths a stroke and
+// cut into triangles as it is drawn. A point bends the curve no further back
+// than the point before last, and the last two points can be taken back
+// (see redraw()), so the line up to two points before that is cut once and
+// kept, and each point only has the end of it cut again: a long line costs
+// no more to carry on than a short one. It is cut as finely as it shows when
+// a unit is `scale` screen pixels and no finer, never more finely than it
+// will be once it is on the board, so a line drawn far out is no more
+// triangles than the same line drawn close up.
+class Pen {
+public:
+    explicit Pen(qreal halfWidth = 1, quint32 color = 0, qreal scale = 1);
+    void add(QPointF point);
+    // Takes back the last `back` points, two at most, and goes on through
+    // `points` instead: the end of the line as the pen thinks again about
+    // it (see cornerBefore()).
+    void redraw(int back, const QVector<QPointF> &points);
+    const QVector<QPointF> &points() const { return m_points; }
+    const StrokeMesh &mesh() const { return m_mesh; }
+    qsizetype triangles() const { return m_mesh.indices.size() / 3; }
+    // How closely it follows the curve through its points, in units.
+    qreal tolerance() const { return m_tolerance; }
+    // Whether the two are cut alike: as wide, in one color, for one scale.
+    bool cutAlike(const Pen &other) const {
+        return m_halfWidth == other.m_halfWidth && m_color == other.m_color && m_scale == other.m_scale;
+    }
+
+private:
+    void cut();
+
+    qreal m_halfWidth;
+    quint32 m_color;
+    qreal m_scale, m_tolerance;
+    QVector<QPointF> m_points;
+    StrokeMesh m_mesh;
+    // The line as far as it is settled: the curve between the points that
+    // no point to come can bend or take back, of which `m_settled`
+    // stretches are cut, and so much of the mesh.
+    StrokeLine m_line;
+    int m_settled = 0;
+    qsizetype m_vertices = 0, m_indices = 0;
+};
 
 // --- Shape meshes ----------------------------------------------------------
 

@@ -14,6 +14,7 @@
 #include <QStandardPaths>
 #include <cmath>
 #include <functional>
+#include <optional>
 
 namespace {
 
@@ -47,6 +48,14 @@ void fillNotes(Palette &palette) {
         palette.notes.insert(it.key(), Theme::notePaper(it.value(), palette.background, palette.dark));
 }
 
+// A table as QML reads one: an object with a property for every name.
+template <typename Value> QVariantMap forQml(const QHash<QString, Value> &table) {
+    QVariantMap map;
+    for (auto it = table.constBegin(); it != table.constEnd(); ++it)
+        map.insert(it.key(), QVariant::fromValue(it.value()));
+    return map;
+}
+
 } // namespace
 
 Palette Palette::fallback() {
@@ -62,6 +71,8 @@ Palette Palette::fallback() {
 }
 
 QStringList Theme::swatchOrder() { return Item::colorNames(); }
+
+QString Theme::userShellFile() { return QDir::homePath() + "/.config/omarchy/shell.toml"; }
 
 QColor Theme::mix(const QColor &base, const QColor &other, double amount) {
     return QColor::fromRgbF(base.redF() + (other.redF() - base.redF()) * amount,
@@ -129,8 +140,40 @@ QHash<QString, QString> Theme::readToml(const QString &path) {
     return values;
 }
 
-Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl)
-    : QObject(parent), m_directory(directory.isEmpty() ? QDir::homePath() + "/.local/state/omarchy/current" : directory) {
+QList<std::pair<QString, QString>> Theme::readShell(const QString &path) {
+    QList<std::pair<QString, QString>> values;
+    QFile file(path);
+    if (path.isEmpty() || !file.open(QIODevice::ReadOnly))
+        return values;
+    static const QRegularExpression header(R"(^\[([A-Za-z0-9_-]+)\]\s*(#.*)?$)");
+    // A quoted string that is not empty, one to four numbers (a border's
+    // widths), or a word; and perhaps a comment after it.
+    static const QRegularExpression entry(R"re(^([A-Za-z0-9_-]+)\s*=\s*(?:)re"
+                                          R"re(["']([^"']+)["']|)re"
+                                          R"re((-?[0-9]+(?:\.[0-9]+)?(?:\s+-?[0-9]+(?:\.[0-9]+)?){0,3})|)re"
+                                          R"re(([A-Za-z][A-Za-z0-9_-]*))re"
+                                          R"re()\s*(#.*)?$)re");
+    QString section;
+    const QStringList lines = QString::fromUtf8(file.readAll()).split('\n');
+    for (const QString &untrimmed : lines) {
+        const QString line = untrimmed.trimmed();
+        const auto named = header.match(line);
+        if (named.hasMatch()) {
+            section = named.captured(1);
+            continue;
+        }
+        const auto match = entry.match(line);
+        if (match.hasMatch() && !section.isEmpty())
+            values.append({section + "." + match.captured(1),
+                           match.captured(2) + match.captured(3) + match.captured(4)});
+    }
+    return values;
+}
+
+Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl, const QString &userShell)
+    : QObject(parent),
+      m_directory(directory.isEmpty() ? QDir::homePath() + "/.local/state/omarchy/current" : directory),
+      m_userShell(!userShell.isEmpty() ? userShell : directory.isEmpty() ? userShellFile() : QString()) {
     m_debounce.setSingleShot(true);
     m_debounce.setInterval(80);
     connect(&m_watcher, &QFileSystemWatcher::directoryChanged, this, [this] { m_debounce.start(); });
@@ -153,6 +196,7 @@ Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl)
         const auto value = answer(m_roundingProcess, code, status).value("int");
         if (value.isDouble() && value.toInt(-1) >= 0 && value.toInt() != m_radius) {
             m_radius = value.toInt();
+            ++m_revision;
             emit changed();
         }
     });
@@ -160,6 +204,7 @@ Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl)
         const auto value = answer(m_borderProcess, code, status).value("int");
         if (value.isDouble() && value.toInt(-1) >= 0 && value.toInt() != m_borderWidth) {
             m_borderWidth = value.toInt();
+            ++m_revision;
             emit changed();
         }
     });
@@ -172,6 +217,7 @@ Theme::Theme(const QString &directory, QObject *parent, const QString &hyprctl)
         const bool animates = reply.contains("bool") ? reply.value("bool").toBool() : reply.value("int").toInt() != 0;
         if (m_reduceMotion == animates) {
             m_reduceMotion = !animates;
+            ++m_revision;
             emit changed();
         }
     });
@@ -201,19 +247,51 @@ void Theme::askHyprland() {
         m_animationsProcess.start(m_hyprctl, {"-j", "getoption", "animations:enabled"});
 }
 
+QVariantMap Theme::swatches() const { return forQml(m_palette.swatches); }
+QVariantMap Theme::notes() const { return forQml(m_palette.notes); }
+QVariantMap Theme::sizes() const { return forQml(m_sizes); }
+
 int Theme::size(const QString &token) const { return m_sizes.value(token, m_fontSize); }
 
-QColor Theme::inkOn(const QColor &color) const {
+QFont Theme::font() const {
+    QFont font(fontFamily());
+    font.setStyleHint(QFont::Monospace);
+    font.setPixelSize(m_fontSize);
+    return font;
+}
+
+QColor Theme::inkOn(const QColor &color, int) const {
     const QColor &bg = m_palette.background, &fg = m_palette.bright;
     const QColor &dark = luminance(bg) < luminance(fg) ? bg : fg, &light = luminance(bg) < luminance(fg) ? fg : bg;
     return luminance(color) > .179 ? dark : light;
 }
 
 void Theme::reload() {
+    // Watched afresh before anything is read: a change made while this one is
+    // taken in, as the shell's text size slider makes one after another, is
+    // then caught and read in turn, and never lost in between.
+    watch();
     askHyprland();
     const QString theme = m_directory + "/theme";
     const QHash<QString, QString> colors = readToml(theme + "/colors.toml");
-    const QHash<QString, QString> shell = readToml(theme + "/shell.toml");
+    // The shell's own dictionary (Color.mergeShell): the theme's keys with the
+    // person's values over them, so a size they set outlasts every theme
+    // switch, and after them the person's other keys.
+    QHash<QString, QString> shell;
+    QStringList order;
+    for (const auto &[key, value] : readShell(theme + "/shell.toml") + readShell(m_userShell)) {
+        if (!shell.contains(key))
+            order << key;
+        shell.insert(key, value);
+    }
+    // [style] is the shell's old name for [controls]. Where both have a key,
+    // the one later in that dictionary counts, as in Style.applyShellValues.
+    QHash<QString, QString> controls;
+    for (const QString &key : std::as_const(order))
+        if (key.startsWith("controls.") || key.startsWith("style."))
+            controls.insert(key.section('.', 1), shell.value(key));
+    for (auto it = controls.constBegin(); it != controls.constEnd(); ++it)
+        shell.insert("controls." + it.key(), it.value());
     const Palette defaults = Palette::fallback();
 
     auto named = [&colors](const QString &key, const QColor &fallback) {
@@ -282,10 +360,29 @@ void Theme::reload() {
     auto token = [&](const QString &key, const QColor &fallback) {
         return shell.contains(key) ? resolve(shell.value(key), fallback, 0) : fallback;
     };
+    // A number, as the shell reads one (Number): all of the value, or none.
+    // Deliberately not what only JavaScript makes a number of, a blank (0)
+    // or "0x10" (16), which nobody writes for an alpha or a width.
     auto number = [&shell](const QString &key, double fallback) {
         bool ok = false;
         const double value = shell.value(key).toDouble(&ok);
-        return ok ? value : fallback;
+        return ok && std::isfinite(value) ? value : fallback;
+    };
+    // A size, as the shell reads one (parseInt): the whole number its value
+    // starts with, if it starts with one. One too big to be a size is none,
+    // where the shell's would wrap around to some other number.
+    auto whole = [&shell](const QString &key) -> std::optional<int> {
+        static const QRegularExpression leading("^\\s*([+-]?[0-9]+)");
+        const auto match = leading.match(shell.value(key));
+        bool ok = false;
+        const int value = match.hasMatch() ? match.captured(1).toInt(&ok) : 0;
+        return ok ? std::optional<int>(value) : std::nullopt;
+    };
+    auto flag = [&shell](const QString &key, bool fallback) {
+        const QString value = shell.value(key).trimmed().toLower();
+        return QStringList{"true", "1", "yes", "on"}.contains(value)     ? true
+               : QStringList{"false", "0", "no", "off"}.contains(value) ? false
+                                                                         : fallback;
     };
 
     const QColor normal = token("controls.normal-color", fg);
@@ -313,18 +410,24 @@ void Theme::reload() {
     const QColor scrim = withAlpha(token("menu.scrim", bg), number("menu.scrim-alpha", .5));
     const QColor good = named("green", "#9ece6a");
 
-    // The shell's type scale: every size derives from base-size unless the
-    // theme pins one.
-    const int base = qMax(1, int(number("font.base-size", 12)));
+    // The shell's type scale (Style.font): every size derives from base-size,
+    // at the shell's own ratios, unless the theme or the person pins one.
+    const int base = qMax(1, whole("font.base-size").value_or(12));
     auto scaled = [&](const QString &key, double ratio) {
-        return qMax(1, int(std::lround(number("font." + key, base * ratio))));
+        const int pinned = whole("font." + key).value_or(0);
+        return pinned > 0 ? pinned : qMax(1, int(std::lround(base * ratio)));
     };
     const QHash<QString, int> sizes{
-        {"caption", scaled("caption", 10.0 / 12)},   {"small", scaled("body-small", 11.0 / 12)},
-        {"body", scaled("body", 1)},                 {"subtitle", scaled("subtitle", 13.0 / 12)},
-        {"title", scaled("title", 14.0 / 12)},       {"heading", scaled("heading", 16.0 / 12)},
+        {"caption", scaled("caption", .833)}, {"small", scaled("body-small", .917)},
+        {"body", scaled("body", 1)},          {"subtitle", scaled("subtitle", 1.083)},
+        {"title", scaled("title", 1.167)},    {"heading", scaled("heading", 1.333)},
         {"display", scaled("display", 2)},
     };
+    // The bar (Style.bar): as tall as the theme or the person makes it at
+    // base-size 12, and grown or shrunk with the type unless they say not to.
+    const int barSize = whole("bar.size-horizontal").value_or(0);
+    const double barScale = flag("bar.scale-with-font", true) ? base / 12.0 : 1;
+    const int barHeight = qMax(1, int(std::lround((barSize > 0 ? barSize : 26) * barScale)));
     const int borderWidth = qMax(0, int(std::lround(number("controls.normal-border-width", 1))));
 
     const bool same = m_loaded && palette == m_palette && dim == m_dim && faint == m_faint && red == m_danger &&
@@ -334,7 +437,8 @@ void Theme::reload() {
                       controlBorder == m_controlBorder && focusBorder == m_focusBorder &&
                       cardBackground == m_cardBackground && cardBorder == m_cardBorder &&
                       menuBackground == m_menuBackground && menuBorder == m_menuBorder && scrim == m_scrim &&
-                      sizes == m_sizes && base == m_fontSize && borderWidth == m_controlBorderWidth;
+                      sizes == m_sizes && base == m_fontSize && barHeight == m_barHeight &&
+                      borderWidth == m_controlBorderWidth;
     if (!same) {
         m_palette = palette;
         m_dim = dim;
@@ -355,22 +459,34 @@ void Theme::reload() {
         m_scrim = scrim;
         m_sizes = sizes;
         m_fontSize = base;
+        m_barHeight = barHeight;
         m_controlBorderWidth = borderWidth;
         m_loaded = true;
+        ++m_revision;
         emit changed();
     }
+}
 
-    // A theme switch replaces symlinks and files, so watch the parents too
-    // and re-arm after every change. Watching the nearest existing ancestor
-    // means installing Omarchy later works without restarting the app.
+// A theme switch replaces symlinks and files, so watch the parents too and
+// re-arm before every reading. Watching the nearest existing ancestor means
+// installing Omarchy later works without restarting the app.
+void Theme::watch() {
     const QStringList watched = m_watcher.files() + m_watcher.directories();
     if (!watched.isEmpty())
         m_watcher.removePaths(watched);
-    QString ancestor = m_directory;
-    while (!QFileInfo::exists(ancestor) && ancestor != "/")
-        ancestor = QFileInfo(ancestor).absolutePath();
+    auto nearestExisting = [](QString path) {
+        while (!QFileInfo::exists(path) && path != "/")
+            path = QFileInfo(path).absolutePath();
+        return path;
+    };
+    const QString theme = m_directory + "/theme";
+    const QString ancestor = nearestExisting(m_directory);
     QStringList candidates{ancestor,               QFileInfo(ancestor).absolutePath(), m_directory, theme,
                            theme + "/colors.toml", theme + "/shell.toml"};
+    // The person's settings are made the first time a size is set and then
+    // replaced by a new file each time, so their folder is watched as well.
+    if (!m_userShell.isEmpty())
+        candidates << nearestExisting(QFileInfo(m_userShell).absolutePath()) << m_userShell;
     candidates.removeDuplicates();
     for (const QString &path : candidates)
         if (QFileInfo::exists(path))

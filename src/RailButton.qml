@@ -20,10 +20,13 @@ Item {
     }
 
     Icon {
+        id: symbol
         visible: button.icon.length > 0
         anchors.centerIn: parent
         path: button.icon
-        color: button.active ? theme.accent : area.containsMouse ? theme.bright : theme.foreground
+        // Faint when it is not to be had.
+        color: button.active ? theme.accent : !button.enabled ? theme.faint
+               : area.containsMouse ? theme.bright : theme.foreground
     }
 
     PlainText {
@@ -31,17 +34,26 @@ Item {
         anchors.centerIn: parent
         text: button.label
         color: button.active ? theme.accent : area.containsMouse ? theme.bright : theme.foreground
-        font.pixelSize: theme.size("subtitle")
+        font.pixelSize: theme.sizes.subtitle
     }
 
+    // The key, in the corner beside the icon: no bigger than there is room
+    // for between the icon and the edge, however big the type, so it never
+    // runs into the icon.
     PlainText {
+        anchors.left: symbol.right
         anchors.right: parent.right
         anchors.bottom: parent.bottom
+        anchors.leftMargin: 2
         anchors.rightMargin: 4
         anchors.bottomMargin: 2
+        horizontalAlignment: Text.AlignRight
+        verticalAlignment: Text.AlignBottom
+        fontSizeMode: Text.HorizontalFit
+        minimumPixelSize: 8
         text: button.key
         color: button.active ? theme.accent : theme.faint
-        font.pixelSize: Math.max(8, theme.size("caption") - 1)
+        font.pixelSize: Math.max(8, theme.sizes.caption - 1)
     }
 
     MouseArea {

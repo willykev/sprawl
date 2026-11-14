@@ -10,17 +10,20 @@ Rectangle {
     signal openBoards()
 
     // As tall as the Omarchy bar across the top of the screen.
-    height: Math.round(26 * theme.fontSize / 12)
+    height: theme.barHeight
     color: theme.panel
 
     readonly property string mode: view.editing ? "edit" : view.tool
     // Like an editor's mode line: one color for looking, one for making,
     // one for the pen, one for typing.
     readonly property color modeColor: mode === "select" ? theme.accent
-                                       : mode === "pan" ? theme.swatch("cyan")
-                                       : mode === "pen" ? theme.swatch("magenta")
-                                       : mode === "edit" ? theme.swatch("yellow")
-                                       : theme.swatch("green")
+                                       : mode === "pan" ? theme.swatches.cyan
+                                       : mode === "pen" ? theme.swatches.magenta
+                                       : mode === "edit" ? theme.swatches.yellow
+                                       : theme.swatches.green
+    // The theme's dark or light, whichever reads on it. (Handed the theme's
+    // revision, so it is asked again when the theme changes.)
+    readonly property color modeInk: theme.inkOn(modeColor, theme.revision)
     readonly property string modeName: mode === "select" ? qsTr("SELECT")
                                        : mode === "pan" ? qsTr("PAN")
                                        : mode === "note" ? qsTr("NOTE")
@@ -90,15 +93,17 @@ Rectangle {
         height: parent.height
 
         Rectangle {
+            objectName: "mode"
             width: modeText.implicitWidth + 28
             height: parent.height
             color: bar.modeColor
 
             PlainText {
                 id: modeText
+                objectName: "mode-name"
                 anchors.centerIn: parent
                 text: bar.modeName
-                color: theme.inkOn(bar.modeColor)
+                color: bar.modeInk
                 font.bold: true
                 font.letterSpacing: 0.6
             }
@@ -161,10 +166,12 @@ Rectangle {
             }
 
             PlainText {
+                id: problemLine
                 objectName: "problem"
                 text: backend.problem
                 color: theme.danger
-                // As much of it as there is room for, and a sign that there is more.
+                // As much of it as there is room for, and a sign that there
+                // is more: the whole of it is over the board.
                 width: Math.min(implicitWidth, middle.width - 20)
                 elide: Text.ElideRight
             }
@@ -173,7 +180,9 @@ Rectangle {
         MouseArea {
             anchors.fill: parent
             enabled: backend.problem.length > 0
-            cursorShape: Qt.PointingHandCursor
+            // A hand only while a click does something: one that is not
+            // enabled shows its cursor all the same.
+            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
             onClicked: backend.dismissProblem()
         }
 
@@ -184,12 +193,15 @@ Rectangle {
 
             // The pen's color, beside its width.
             Rectangle {
+                objectName: "pen-color"
                 anchors.verticalCenter: parent.verticalCenter
                 visible: bar.view.tool === "pen" && !bar.view.editing && backend.notice.length === 0
                 width: 8
                 height: 8
                 radius: Math.min(2, theme.radius)
-                color: bar.view.penColor.length ? theme.swatch(bar.view.penColor) : theme.bright
+                // As the board draws what the pen makes: in the swatch it
+                // names, and in the bright when there is no such swatch.
+                color: theme.swatches[bar.view.penColor] || theme.bright
             }
 
             PlainText {
@@ -217,24 +229,48 @@ Rectangle {
             color: theme.warning
         }
 
-        Row {
+        Item {
+            width: saving.width
             height: parent.height
-            spacing: 8
-            rightPadding: 14
 
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                width: 6
-                height: 6
-                color: backend.saveState === "saved" ? theme.good
-                       : backend.saveState === "failed" ? theme.danger : theme.warning
+            Row {
+                id: saving
+                height: parent.height
+                spacing: 8
+                rightPadding: 14
+
+                // The board could not be written, or is waiting to be: nothing
+                // is written over a file that cannot be read until it can be.
+                // Or it could not be read at all, and nothing of it ever is.
+                readonly property bool notSaved: backend.saveState === "failed" || backend.saveState === "paused"
+                                                 || backend.saveState === "readonly"
+
+                Rectangle {
+                    objectName: "saveMark"
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 6
+                    height: 6
+                    color: backend.saveState === "saved" ? theme.good
+                           : parent.notSaved ? theme.danger : theme.warning
+                }
+
+                PlainText {
+                    objectName: "saveState"
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: backend.saveState === "saved" ? qsTr("saved")
+                          : backend.saveState === "readonly" ? qsTr("read only")
+                          : parent.notSaved ? qsTr("not saved") : qsTr("saving")
+                    color: theme.foreground
+                }
             }
 
-            PlainText {
-                anchors.verticalCenter: parent.verticalCenter
-                text: backend.saveState === "saved" ? qsTr("saved")
-                      : backend.saveState === "failed" ? qsTr("not saved") : qsTr("saving")
-                color: theme.foreground
+            // Read only, or waiting for a file that cannot be read: a click
+            // says why again, once that has been put away.
+            MouseArea {
+                anchors.fill: parent
+                enabled: backend.saveState === "readonly" || backend.saveState === "paused"
+                cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                onClicked: backend.sayWhy()
             }
         }
 
@@ -260,9 +296,10 @@ Rectangle {
 
             PlainText {
                 id: zoomText
+                objectName: "zoom"
                 anchors.centerIn: parent
                 text: qsTr("%1%").arg(Math.round(bar.view.zoom * 100))
-                color: theme.inkOn(bar.modeColor)
+                color: bar.modeInk
                 font.bold: true
             }
 
@@ -270,6 +307,93 @@ Rectangle {
                 anchors.fill: parent
                 onClicked: bar.view.zoomActual()
             }
+        }
+    }
+
+    // A problem too long for the line is shown whole over the board, where
+    // there is room for all of it; or, in a window too small even for that,
+    // as much as the board has room for, and the wheel brings in the rest.
+    // A click on either puts it away.
+    Rectangle {
+        id: whole
+        objectName: "wholeProblem"
+        visible: backend.problem.length > 0 && problemLine.truncated
+        // At the top of the board, clear of the bars along its bottom, and
+        // never past the board onto the line.
+        x: Math.round(bar.view.x - bar.x + (bar.view.width - width) / 2)
+        y: Math.round(bar.view.y - bar.y + 16)
+        width: Math.min(560, bar.view.width - 32)
+        height: Math.min(wholeRow.implicitHeight + 24, bar.view.height - 32)
+        color: theme.cardBackground
+        border.color: theme.cardBorder
+        border.width: theme.borderWidth
+        radius: theme.radius
+
+        // Clicks on it are for it: one puts it away. So is the wheel, which
+        // goes through what does not fit as it would pan the board.
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.AllButtons
+            cursorShape: Qt.PointingHandCursor
+            onClicked: backend.dismissProblem()
+            onWheel: (wheel) => {
+                // A touchpad says how far the fingers moved; a wheel, notches.
+                const by = wheel.pixelDelta.y !== 0 ? wheel.pixelDelta.y : wheel.angleDelta.y / 120 * 48
+                words.down = Math.max(0, Math.min(words.more, words.down - by))
+                wheel.accepted = true
+            }
+        }
+
+        // As much of it as there is room for.
+        Item {
+            id: words
+            x: 14
+            y: 12
+            width: whole.width - 28
+            height: whole.height - 24
+            clip: true
+
+            // How far down it has been read, and how much further it goes.
+            property real down: 0
+            readonly property real more: Math.max(0, wholeRow.implicitHeight - height)
+
+            Row {
+                id: wholeRow
+                y: -Math.min(words.down, words.more)
+                spacing: 8
+
+                Icon {
+                    // Level with the first line.
+                    y: Math.round((wholeText.contentHeight / Math.max(1, wholeText.lineCount) - height) / 2)
+                    path: Icons.close
+                    size: 12
+                    color: theme.danger
+                }
+
+                PlainText {
+                    id: wholeText
+                    width: whole.width - 48
+                    text: backend.problem
+                    color: theme.foreground
+                    wrapMode: Text.Wrap
+                    // Another problem is read from its start.
+                    onTextChanged: words.down = 0
+                }
+            }
+        }
+
+        // Beside it, while not all of it is in view: how much is, and where.
+        Rectangle {
+            objectName: "wholeProblemInView"
+            readonly property real all: Math.max(1, wholeRow.implicitHeight)
+
+            visible: words.more > 0
+            x: whole.width - 9
+            y: words.y + Math.round(words.height * Math.min(words.down, words.more) / all)
+            width: 3
+            height: Math.round(words.height * words.height / all)
+            radius: 1
+            color: theme.muted
         }
     }
 }

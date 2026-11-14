@@ -47,8 +47,9 @@ Rectangle {
                 }
 
                 Rectangle {
+                    objectName: "pen-" + (swatch.modelData || "ink")
                     anchors.fill: parent
-                    color: swatch.modelData.length ? theme.swatch(swatch.modelData) : theme.bright
+                    color: swatch.modelData.length ? theme.swatches[swatch.modelData] : theme.bright
                     radius: Math.min(2, theme.radius)
                 }
 

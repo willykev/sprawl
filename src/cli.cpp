@@ -77,25 +77,42 @@ QString boardNames(const Library &library) {
                            : "The boards are: " + names.join(", ");
 }
 
-// Text is as big as its type; a file only says where it starts.
-void fitText(Board &board) {
-    for (quint32 id : board.order()) {
-        Item item = *board.item(id);
-        if (item.kind == Item::Kind::Text && TextMetrics::fit(item))
-            board.setMeasuredRect(id, item.rect);
-    }
-}
+// What the help of each command that takes a board says it can be given. A
+// board's name is that board whatever the folder a command is run from has
+// in it, so a folder there with the same name is had only by its path.
+const char *const boardArgument = "A board's name, or a path to a board's folder or .json file. A board's name means "
+                                  "that board; a folder here with the same name is given as ./name";
+
+// How many times a command that changes a board reads it again and does it
+// over, when a whole board was renamed over the file as it was written back
+// (by an agent, which takes no lock). Once is rare; this many times in a row
+// is something writing it without end.
+const int writeTries = 5;
 
 // Reads the board named on the command line: one in the library, a board's
-// folder, or a .json file. Says what is wrong when it cannot.
-bool load(const Library &library, const QString &name, Library::Location &location, Board &board) {
+// folder, or a .json file. Says what is wrong when it cannot. A command that
+// changes the board asks for `lock`, which it holds until it has written the
+// board back: nothing else (the window, a command run beside it) writes the
+// board in between, to be written over. Read again, it is read under the
+// lock it holds already. `fingerprint`, when asked for, is that of the file
+// as it was read.
+bool load(const Library &library, const QString &name, Library::Location &location, Board &board,
+          std::unique_ptr<QLockFile> *lock = nullptr, QByteArray *fingerprint = nullptr) {
     location = library.locate(name);
     if (!location.isValid()) {
-        print(stderr, QString("There is no board %1. %2").arg(name, boardNames(library)));
+        print(stderr, QString("There is no board \"%1\". %2").arg(name, boardNames(library)));
         return false;
     }
+    if (lock && !*lock) {
+        QString error;
+        *lock = Library::lock(location.file, &error);
+        if (!*lock) {
+            print(stderr, error);
+            return false;
+        }
+    }
     QJsonObject root;
-    const QString problem = Library::read(location.file, root);
+    const QString problem = Library::read(location.file, root, fingerprint);
     if (!problem.isEmpty()) {
         print(stderr, problem);
         return false;
@@ -107,8 +124,51 @@ bool load(const Library &library, const QString &name, Library::Location &locati
             print(stderr, "  " + line);
         return false;
     }
-    fitText(board);
+    TextMetrics::fitAll(board);
     return true;
+}
+
+// Writes the board back over its file, read as `fingerprint`, while the file
+// is still that one at the moment before it would be replaced (see
+// Library::write()). An agent, which takes no lock, may have renamed a whole
+// board over it meanwhile, or the board may have been renamed or deleted:
+// then nothing is written, and `changed` says so.
+QString writeBack(const QString &file, const Board &board, const QByteArray &fingerprint, bool &changed) {
+    // Gone, it is not made again: whatever took it away has it now.
+    changed = !QFileInfo::exists(file);
+    if (changed)
+        return {};
+    return Library::write(file, Library::contentsOf(board.toJson()), nullptr, [&] {
+        changed = Library::fingerprint(file) != fingerprint;
+        return !changed;
+    });
+}
+
+// Reads the board named on the command line, as load() does, has `change`
+// change it, and writes it back, under the board's lock all along. Written
+// over meanwhile, or taken away, the board is read and changed again, so
+// that what is done is done to the board as it is. `change` says what is
+// wrong when it cannot be done. False, said why, when nothing was written.
+bool rewrite(const Library &library, const QString &name, Library::Location &location, Board &board,
+             const std::function<QString()> &change) {
+    std::unique_ptr<QLockFile> lock;
+    for (int tries = 1;; ++tries) {
+        QByteArray fingerprint;
+        if (!load(library, name, location, board, &lock, &fingerprint))
+            return false;
+        bool changed = false;
+        QString problem = change();
+        if (problem.isEmpty())
+            problem = writeBack(location.file, board, fingerprint, changed);
+        if (problem.isEmpty() && changed && tries == writeTries)
+            problem = QString("Could not write %1: something else keeps writing it.").arg(location.file);
+        if (!problem.isEmpty()) {
+            print(stderr, problem);
+            return false;
+        }
+        if (!changed)
+            return true;
+    }
 }
 
 QString describe(const Item &item) {
@@ -207,7 +267,7 @@ int create(const QStringList &arguments) {
 
 int show(const QStringList &arguments) {
     Command command("show", "Describe a board: what is on it, and where.");
-    command.parser.addPositionalArgument("board", "A board's name, its folder, or a .json file", "<board>");
+    command.parser.addPositionalArgument("board", boardArgument, "<board>");
     command.json();
     command.parser.process(arguments);
     if (command.arguments().isEmpty())
@@ -232,7 +292,7 @@ int show(const QStringList &arguments) {
 
 int check(const QStringList &arguments) {
     Command command("check", "Check that a board is one Sprawl can open, and say what is wrong when it is not.");
-    command.parser.addPositionalArgument("board", "A board's name, its folder, or a .json file", "<board>");
+    command.parser.addPositionalArgument("board", boardArgument, "<board>");
     command.json();
     command.parser.process(arguments);
     if (command.arguments().isEmpty())
@@ -243,7 +303,7 @@ int check(const QStringList &arguments) {
     QStringList problems;
     QVector<Item> items;
     if (!location.isValid()) {
-        problems << QString("There is no board %1. %2").arg(name, boardNames(library));
+        problems << QString("There is no board \"%1\". %2").arg(name, boardNames(library));
     } else {
         QJsonObject root;
         const QString problem = Library::read(location.file, root);
@@ -275,7 +335,7 @@ int check(const QStringList &arguments) {
 
 int exportBoard(const QStringList &arguments) {
     Command command("export", "Write a board as a picture or a document, with no display.");
-    command.parser.addPositionalArgument("board", "A board's name, its folder, or a .json file", "<board>");
+    command.parser.addPositionalArgument("board", boardArgument, "<board>");
     command.parser.addOption({{"f", "format"}, "png, svg or pdf (the default is the output's, or png)", "format"});
     command.parser.addOption({{"o", "output"}, "The file to write (the default is <board>.<format> here)", "file"});
     command.parser.addOption({"scale", "PNG: pixels per unit of the board (the default is 2)", "number", "2"});
@@ -326,8 +386,9 @@ int exportBoard(const QStringList &arguments) {
 }
 
 int add(const QStringList &arguments) {
-    Command command("add", "Add an item to a board. Without --x and --y it goes below everything else.");
-    command.parser.addPositionalArgument("board", "A board's name, its folder, or a .json file", "<board>");
+    Command command("add", "Add an item to a board. Without --y it goes below everything else, and without --x at "
+                           "its left edge.");
+    command.parser.addPositionalArgument("board", boardArgument, "<board>");
     command.parser.addPositionalArgument("type", "note, text, shape, frame, connector or image", "<type>");
     command.parser.addOption({"text", "What it says (\\n starts a new line; a note's first line is its title)", "text"});
     command.parser.addOption({"x", "Where its left edge is", "number"});
@@ -351,11 +412,6 @@ int add(const QStringList &arguments) {
     const QStringList words = command.arguments();
     if (words.size() < 2)
         return fail("Say which board and what to add: sprawl add <board> note --text \"Call Sam\"");
-    const Library library;
-    Library::Location location;
-    Board board;
-    if (!load(library, words[0], location, board))
-        return 1;
 
     // The item is described the way a board file describes it, so it is
     // checked by the same rules.
@@ -368,8 +424,14 @@ int add(const QStringList &arguments) {
         if (parser.isSet(option)) {
             bool ok = false;
             const double number = parser.value(option).toDouble(&ok);
-            if (!ok)
+            // "nan" and "inf" are read as numbers, but no file can say them.
+            if (!ok || !std::isfinite(number))
                 return fail(QString("--%1 takes a number.").arg(option));
+            // A file may say a box is less than a unit across or down, from
+            // before boxes were kept to one, and it is read as a unit. Asked
+            // for here, it is a slip.
+            if ((key == "w" || key == "h") && number < 1)
+                return fail(QString("--%1 takes a number of 1 or more, like 200.").arg(option));
             object.insert(key, number);
         }
     for (const char *key : {"color", "shape", "route", "start", "end", "dash"})
@@ -380,36 +442,55 @@ int add(const QStringList &arguments) {
     if (parser.isSet("bold"))
         object.insert("bold", true);
 
-    const bool placed = parser.isSet("x") && parser.isSet("y");
-    if (!placed) {
-        object.insert("x", 0);
-        object.insert("y", 0);
-    }
+    // A file says where every item is. Where --x or --y does not, it is
+    // decided once the board is read (see below).
+    for (const char *key : {"x", "y"})
+        if (!parser.isSet(key))
+            object.insert(key, 0);
     if (words[1] == "image") {
         if (!parser.isSet("file"))
             return fail("An image needs --file <picture>.");
+        // Only ever a picture: a folder, a pipe or a device is not opened even
+        // to be looked at (see Library::importFile()), and is refused before
+        // the board is read, so a pipe that never sends anything holds up
+        // nothing else that writes the board.
+        const QFileInfo info(parser.value("file"));
+        if (info.exists() && !info.isFile())
+            return fail(QString("%1 is not a file.").arg(parser.value("file")));
         QImageReader reader(parser.value("file"));
         reader.setAutoTransform(true);
         QSize size = reader.size();
-        if (!reader.canRead() || !size.isValid())
+        // A picture of no width or height, as an SVG can say it is, has
+        // nothing to show and no proportions to keep.
+        if (!reader.canRead() || size.isEmpty())
             return fail(QString("%1 is not a picture Sprawl can show.").arg(parser.value("file")));
         if (reader.transformation() & QImageIOHandler::TransformationRotate90)
             size.transpose();
-        QString problem;
-        const QString asset = Library::importFile(location.assets, parser.value("file"), &problem);
-        if (asset.isEmpty())
-            return fail(problem);
-        object.insert("asset", asset);
-        QSizeF fitted = size;
-        if (fitted.width() > 420 || fitted.height() > 320)
-            fitted.scale(420, 320, Qt::KeepAspectRatio);
-        if (!parser.isSet("width"))
-            object.insert("w", qRound(fitted.width()));
+        // It starts at a size to arrange and to see: neither a screenful nor
+        // a sliver. A width asked for takes the height along with it, in
+        // proportion, and a unit at least.
+        QSizeF start = Defaults::pictureSize(size);
+        if (parser.isSet("width"))
+            start.setHeight(qMax(1.0, std::round(object.value("w").toDouble() * size.height() / size.width())));
+        else
+            object.insert("w", start.width());
         if (!parser.isSet("height"))
-            object.insert("h", qRound(object.value("w").toDouble() * size.height() / size.width()));
+            object.insert("h", start.height());
+        // The picture is copied into the board last, once nothing can refuse
+        // it, so that one refused leaves nothing behind. A copy is never
+        // taken back, for other items may show it already. Until it is made,
+        // the picture goes by a name like the one it will be kept under.
+        object.insert("asset", "picture.png");
     }
     if (words[1] == "connector" && !(parser.isSet("from") && parser.isSet("to")))
         return fail("A connector needs --from <id> and --to <id>: the ids are in sprawl show <board> --json.");
+    // A connector is where the items it joins are, and as big: where else it
+    // was asked to be would be left out unsaid.
+    for (const char *option : {"x", "y", "width", "height"})
+        if (words[1] == "connector" && parser.isSet(option))
+            return fail(QString("--%1 is not for a connector, which goes from one item to another: place those "
+                                "items instead.")
+                            .arg(option));
     if (words[1] == "stroke")
         return fail("Strokes are drawn with the pen, in the window.");
 
@@ -417,24 +498,54 @@ int add(const QStringList &arguments) {
     const QString problem = Board::itemFromJson(object, item);
     if (!problem.isEmpty())
         return fail(QString("That item cannot be added: %1.").arg(problem));
-    for (quint32 end : {item.from, item.to}) {
-        const Item *attached = end ? board.item(end) : nullptr;
-        if (end && (!attached || !Board::canAttach(*attached)))
-            return fail(QString("There is no item %1 to attach to: the ids are in sprawl show <board> --json.").arg(end));
-    }
+
+    // Its corner is where --x and --y say, even once it has grown to hold its
+    // text (a shape grows about its middle). Where either does not say, it
+    // is where it would go with neither: below everything, lined up with its
+    // left edge.
+    const QPointF asked = item.rect.topLeft();
     TextMetrics::fit(item);
-    if (!placed && item.kind != Item::Kind::Connector) {
-        // Below everything, lined up with its left edge.
-        QRectF content;
-        for (quint32 other : board.order())
-            content |= board.item(other)->rect;
-        item.rect.moveTo(content.isNull() ? QPointF(0, 0)
-                                          : QPointF(std::round(content.left()), std::round(content.bottom() + 24)));
-    }
-    const quint32 id = board.add(item);
-    const QString written = Library::write(location.file, board.toJson());
-    if (!written.isEmpty())
-        return fail(written);
+    // Only now is the board read, the command line and the picture checked
+    // already: it is held from here until the item is written to it (see
+    // load()), and nothing else that writes it waits on more than that.
+    const Library library;
+    Library::Location location;
+    Board board;
+    quint32 id = 0;
+    const bool added = rewrite(library, words[0], location, board, [&] {
+        for (quint32 end : {item.from, item.to}) {
+            const Item *attached = end ? board.item(end) : nullptr;
+            if (end && (!attached || !Board::canAttach(*attached)))
+                return QString("There is no item %1 to attach to: the ids are in sprawl show <board> --json.").arg(end);
+        }
+        if (item.kind != Item::Kind::Connector) {
+            QRectF content;
+            for (quint32 other : board.order())
+                content |= board.item(other)->rect;
+            const QPointF below = content.isNull()
+                                      ? QPointF(0, 0)
+                                      : QPointF(std::round(content.left()), std::round(content.bottom() + 24));
+            item.rect.moveTo(parser.isSet("x") ? asked.x() : below.x(), parser.isSet("y") ? asked.y() : below.y());
+            // Below everything on a board that reaches as far down as a board
+            // can, it would be further out than a file may say anything is,
+            // and the board could not be read back: where it is put is
+            // checked by the rules a board is read by, as what the command
+            // line said was.
+            Item placed;
+            if (!Board::itemFromJson(Board::itemToJson(item), placed).isEmpty())
+                return QString("There is no room for it below everything else: place it with --x and --y.");
+        }
+        if (item.kind == Item::Kind::Image) {
+            QString error;
+            item.asset = Library::importFile(location.assets, parser.value("file"), &error);
+            if (item.asset.isEmpty())
+                return error;
+        }
+        id = board.add(item);
+        return QString();
+    });
+    if (!added)
+        return 1;
     if (command.wantsJson())
         print(Board::itemToJson(*board.item(id)));
     else
@@ -444,7 +555,7 @@ int add(const QStringList &arguments) {
 
 int removeItems(const QStringList &arguments) {
     Command command("remove", "Remove items from a board, with the connectors attached to them.");
-    command.parser.addPositionalArgument("board", "A board's name, its folder, or a .json file", "<board>");
+    command.parser.addPositionalArgument("board", boardArgument, "<board>");
     command.parser.addPositionalArgument("ids", "The ids of the items, from sprawl show", "<id>...");
     command.json();
     command.parser.process(arguments);
@@ -454,24 +565,25 @@ int removeItems(const QStringList &arguments) {
     const Library library;
     Library::Location location;
     Board board;
-    if (!load(library, words[0], location, board))
+    int before = 0;
+    const bool removed = rewrite(library, words[0], location, board, [&] {
+        QVector<quint32> ids;
+        for (const QString &word : words.mid(1)) {
+            bool ok = false;
+            const quint32 id = word.toUInt(&ok);
+            if (!ok || !board.item(id))
+                return QString("There is no item %1 on %2.").arg(word, location.name);
+            ids.append(id);
+        }
+        before = board.count();
+        board.begin();
+        for (quint32 id : std::as_const(ids))
+            board.remove(id);
+        board.commit();
+        return QString();
+    });
+    if (!removed)
         return 1;
-    QVector<quint32> ids;
-    for (const QString &word : words.mid(1)) {
-        bool ok = false;
-        const quint32 id = word.toUInt(&ok);
-        if (!ok || !board.item(id))
-            return fail(QString("There is no item %1 on %2.").arg(word, location.name));
-        ids.append(id);
-    }
-    const int before = board.count();
-    board.begin();
-    for (quint32 id : std::as_const(ids))
-        board.remove(id);
-    board.commit();
-    const QString written = Library::write(location.file, board.toJson());
-    if (!written.isEmpty())
-        return fail(written);
     if (command.wantsJson())
         print(QJsonObject{{"removed", before - board.count()}, {"items", board.count()}});
     else

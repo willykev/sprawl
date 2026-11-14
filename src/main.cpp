@@ -3,16 +3,15 @@
 
 #include <QCommandLineParser>
 #include <QDateTime>
-#include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
-#include <QFileInfo>
 #include <QFont>
 #include <QGuiApplication>
 #include <QIcon>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMouseEvent>
 #include <QMutex>
 #include <QProcess>
 #include <QQmlApplicationEngine>
@@ -32,7 +31,9 @@
 #include "canvasview.h"
 #include "cli.h"
 #include "geometry.h"
+#include "launch.h"
 #include "library.h"
+#include "measuring.h"
 #include "offline.h"
 #include "portalfilepicker.h"
 #include "theme.h"
@@ -300,16 +301,24 @@ private:
 // kernel as it goes, and stops the moment it hears the second: what was on
 // screen at each of the two is how many triangles a block of that buffer
 // holds, which is what the frame budget (CanvasView::m_loadBudget) is
-// reckoned from. It never draws more than the megabytes it is given.
+// reckoned from. It never draws more than the megabytes it is given, and it
+// is never given more than any frame is allowed (see measuring.h).
 //
 // `--probe-with writing` asks the same of the editor instead, which draws
 // what is being written itself: a note is written in, a little more at each
 // step, up to what an item holds or the megabytes given, whichever is less.
+//
+// `--probe-with drawing` asks it of the pen: a scribble is drawn far out and
+// fast, with the mouse never let go, a hundred points longer at each step.
+// The frame is allowed the megabytes given and the stroke being drawn comes
+// out of that, so however long the scribble goes on, the frame is never
+// more; if it ever is, the probe stops there.
 class Probe : public QObject {
 public:
-    Probe(QQuickWindow *window, CanvasView *canvas, Board *board, double megabytes, const QString &kind)
-        : m_window(window), m_canvas(canvas), m_board(board), m_limit(qint64(megabytes * 1e6)),
-          m_notes(kind == "notes"), m_far(kind == "far"), m_unseen(kind == "unseen"), m_writing(kind == "writing") {
+    Probe(QQuickWindow *window, CanvasView *canvas, Board *board, qint64 limit, const QString &kind)
+        : m_window(window), m_canvas(canvas), m_board(board), m_limit(limit),
+          m_notes(kind == "notes"), m_far(kind == "far"), m_unseen(kind == "unseen"), m_writing(kind == "writing"),
+          m_drawing(kind == "drawing") {
         connect(window, &QQuickWindow::frameSwapped, this, &Probe::frame, Qt::QueuedConnection);
         connect(&m_kernel, &QProcess::readyReadStandardOutput, this, &Probe::heard);
         m_kernel.start("journalctl", {"-k", "-f", "-n", "0", "-o", "cat"});
@@ -322,14 +331,21 @@ public:
     void start() {
         // At a size where strokes are drawn in full; at the smallest at
         // which type still is, which is where the most of it fits; or all
-        // the way out, where strokes are specks and there are the most.
+        // the way out, where strokes are specks and there are the most, and
+        // where a stroke being drawn used to be the most triangles.
         const qreal pixels = m_window->effectiveDevicePixelRatio();
-        m_canvas->setView(QPointF(0, 0), m_far ? 0.1 : m_writing ? 1 : (m_notes ? 0.5 : 1) / pixels);
+        m_canvas->setView(QPointF(0, 0), m_far || m_drawing ? 0.1 : m_writing ? 1 : (m_notes ? 0.5 : 1) / pixels);
+        if (m_drawing) {
+            m_canvas->setLoadBudget(m_limit);
+            m_canvas->setTool("pen");
+        }
         if (m_unseen) {
             // Strokes that are handed to the GPU but are nowhere in the
-            // window: whether those cost it anything is the question.
+            // window: whether those cost it anything is the question. The
+            // frame may come to as much as any frame is allowed, which is
+            // never less than the limit, so it is the limit that stops it.
             m_canvas->setDrawingEverything(true);
-            m_canvas->setLoadBudget(m_limit * 4);
+            m_canvas->setLoadBudget(CanvasView::largestLoadBudget);
         }
         m_started = true;
         say(QString("%5: window %1x%2 at scale %3, up to %4 MB")
@@ -337,11 +353,12 @@ public:
                 .arg(m_window->height())
                 .arg(m_window->effectiveDevicePixelRatio())
                 .arg(megabytes(m_limit),
-                     m_writing  ? "a note being written in"
-                     : m_notes  ? "notes"
-                     : m_far    ? "strokes from far off"
-                     : m_unseen ? "strokes out of view"
-                                : "strokes"));
+                     m_writing   ? "a note being written in"
+                     : m_drawing ? "a stroke being drawn, far out"
+                     : m_notes   ? "notes"
+                     : m_far     ? "strokes from far off"
+                     : m_unseen  ? "strokes out of view"
+                                 : "strokes"));
         m_canvas->update();
     }
 
@@ -349,6 +366,25 @@ private:
     static void say(const QString &line) {
         printf("%s %s\n", qPrintable(QDateTime::currentDateTime().toString("HH:mm:ss.zzz")), qPrintable(line));
         fflush(stdout);
+    }
+
+    // Where it has got to: what it has made, and what the frame came to. Each
+    // step says so, and so does anything heard from the kernel, which is
+    // when it matters most.
+    QString progress() const {
+        const SceneLoad load = m_canvas->load();
+        if (m_writing) {
+            const Item *note = m_note ? m_board->item(m_note) : nullptr;
+            return QString("letters=%1 editor bytes=%2").arg(note ? note->text.size() : 0).arg(load.editor);
+        }
+        if (m_drawing)
+            return QString("points=%1 strokes=%2 drawing=%3 board=%4 frame=%5")
+                .arg(m_points)
+                .arg(m_board->count())
+                .arg(load.draft)
+                .arg(load.bytes)
+                .arg(load.bytes + load.draft + load.editor + load.chrome);
+        return QString("items=%1 triangles=%2 bytes=%3").arg(m_strokes).arg(load.triangles).arg(load.bytes);
     }
 
     void frame() {
@@ -360,8 +396,10 @@ private:
             return;
         if (m_writing)
             return write();
+        if (m_drawing)
+            return draw();
         const SceneLoad load = m_canvas->load();
-        say(QString("items=%1 triangles=%2 bytes=%3").arg(m_strokes).arg(load.triangles).arg(load.bytes));
+        say(progress());
         if (load.bytes >= m_limit || load.reduced)
             return finish("reached the limit without hearing from the kernel twice");
         const QRectF area = m_canvas->visibleArea();
@@ -393,7 +431,7 @@ private:
     void write() {
         const Item *note = m_note ? m_board->item(m_note) : nullptr;
         const qsizetype letters = note ? note->text.size() : 0;
-        say(QString("letters=%1 editor bytes=%2").arg(letters).arg(m_canvas->load().editor));
+        say(progress());
         if (letters >= Item::longestText)
             return finish("an item holds no more than that");
         if (m_canvas->load().editor >= m_limit)
@@ -417,17 +455,42 @@ private:
         m_canvas->editSelection();
     }
 
+    // The scribble goes on by a hundred points, round and round in loops a
+    // hundred and sixty pixels across, a seventh of one at each point, as
+    // fast as a hand scribbling something out, up and down the middle of the
+    // window. Curved all the way round, it is many triangles to a point; a
+    // hand shading back and forth comes to a point at every turn instead.
+    void draw() {
+        const SceneLoad load = m_canvas->load();
+        say(progress());
+        if (load.bytes + load.draft + load.editor + load.chrome > m_limit)
+            return finish("the frame came to more than it may");
+        if (m_points > 0 && load.draft == 0 && m_board->count() == 0)
+            return finish("the pen drew nothing");
+        if (m_points >= 12000)
+            return finish("drew all that without hearing from the kernel twice");
+        const QPointF middle(m_canvas->width() / 2, m_canvas->height() / 2);
+        for (int i = 0; i < 100; ++i, ++m_points) {
+            const qreal round = m_points * 2 * M_PI / 7, wander = std::sin(m_points * 0.002) * m_canvas->height() / 4;
+            const QPointF at = middle + QPointF(80 * std::cos(round), 80 * std::sin(round) + wander);
+            mouse(m_points == 0 ? QEvent::MouseButtonPress : QEvent::MouseMove, at);
+        }
+    }
+
+    // The mouse, with its button held down, at a place on the canvas.
+    void mouse(QEvent::Type type, QPointF at) {
+        const QPointF inWindow = m_canvas->mapToScene(at);
+        QMouseEvent event(type, inWindow, inWindow, m_window->mapToGlobal(inWindow),
+                          type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(m_window, &event);
+    }
+
     void heard() {
         while (m_kernel.canReadLine()) {
             const QString line = QString::fromUtf8(m_kernel.readLine()).trimmed();
             if (!line.contains("gpu", Qt::CaseInsensitive) && !line.contains("asahi", Qt::CaseInsensitive))
                 continue;
-            const SceneLoad load = m_canvas->load();
-            say(QString("KERNEL at items=%1 triangles=%2 bytes=%3: %4")
-                    .arg(m_strokes)
-                    .arg(load.triangles)
-                    .arg(load.bytes)
-                    .arg(line));
+            say(QString("KERNEL at %1: %2").arg(progress(), line));
             // The second growth is all there is to learn; anything about a
             // fault is a reason to stop at once.
             if (line.contains("PB growth request 1") || line.contains("fault", Qt::CaseInsensitive) ||
@@ -449,8 +512,8 @@ private:
     Board *m_board;
     QProcess m_kernel;
     qint64 m_limit;
-    bool m_notes, m_far, m_unseen, m_writing;
-    int m_frames = 0, m_strokes = 0;
+    bool m_notes, m_far, m_unseen, m_writing, m_drawing;
+    int m_frames = 0, m_strokes = 0, m_points = 0;
     quint32 m_note = 0;
     bool m_started = false, m_done = false;
 };
@@ -486,6 +549,9 @@ int main(int argc, char *argv[]) {
         return runCli(app.arguments());
     }
 
+    // Qt takes its own options out of the arguments as it starts, and says
+    // so only in how many are left.
+    const int given = argc;
     QGuiApplication app(argc, argv);
     app.setApplicationName("sprawl");
     app.setApplicationVersion(SPRAWL_VERSION);
@@ -504,7 +570,10 @@ int main(int argc, char *argv[]) {
     args.setApplicationDescription("An infinite canvas for the Omarchy desktop.\n\n" + cliSummary());
     args.addHelpOption();
     args.addPositionalArgument("open", "Open the window", "open");
-    args.addPositionalArgument("board", "The board to open: a name, a board's folder, or a .json file", "[board]");
+    args.addPositionalArgument("board",
+                               "The board to open: a name, or a path to a board's folder or .json file. A board's "
+                               "name means that board; a folder here with the same name is given as ./name",
+                               "[board]");
     args.addOption({"new-window", "Open another window even when one is open"});
     // For looking at the app without a person at it.
     args.addOption({"screenshot", "Save a picture of the window and exit", "file"});
@@ -513,23 +582,46 @@ int main(int argc, char *argv[]) {
     args.addOption({"tool", "Start with a tool: pen, note, shape...", "tool"});
     args.addOption({"select", "Start with these items selected", "id,id"});
     args.addOption({"zoom", "Start at this zoom, like 0.5", "factor"});
-    args.addOption({"default-theme", "Ignore the desktop's theme and show Omarchy's default"});
-    args.addOption({"theme", "Show another Omarchy theme than the desktop's: its name, or its folder", "theme"});
-    args.addOption({"bench", "Measure frames on a made-up board of this many items, and exit", "items"});
-    args.addOption({"probe", "Measure what a frame costs the GPU, drawing no more than this, and exit", "megabytes"});
+    args.addOption({"default-theme",
+                    "Ignore the desktop's theme and your own settings for the shell, and show Omarchy's default"});
+    args.addOption({"theme",
+                    "Show another Omarchy theme than the desktop's, with your own settings for the shell over it: "
+                    "its name, or its folder",
+                    "theme"});
+    args.addOption({"bench",
+                    QString("Measure frames on a made-up board of this many items (%1 at most), and exit")
+                        .arg(Measuring::mostItems),
+                    "items"});
+    args.addOption({"probe",
+                    QString("Measure what a frame costs the GPU, drawing no more than this (%1 at most), and exit")
+                        .arg(CanvasView::largestLoadBudget / 1e6),
+                    "megabytes"});
     args.addOption({"probe-with",
-                    "What --probe draws: strokes (the default), notes, far (strokes, zoomed out), unseen, or writing "
-                    "(a note in the editor)",
+                    "What --probe draws: strokes (the default), notes, far (strokes, zoomed out), unseen, writing "
+                    "(a note in the editor), or drawing (a stroke with the pen)",
                     "kind"});
     args.process(app);
     const QString requested = args.positionalArguments().value(1);
     const bool screenshot = args.isSet("screenshot"), probe = args.isSet("probe");
     const bool bench = args.isSet("bench") || probe;
 
+    // What the measuring tools are asked for, kept to what is known to be
+    // safe for the GPU before anything is drawn (see measuring.h). The probe
+    // starts from an empty board, so the bench's items only count when it is
+    // the bench that runs.
+    QStringList said;
+    const qint64 limit = probe ? Measuring::probeLimit(args.value("probe"), said) : 0;
+    const QString kind = probe ? Measuring::probeKind(args.value("probe-with"), said) : QString();
+    const int items = bench && !probe ? Measuring::benchItems(args.value("bench"), said) : 0;
+    for (const QString &line : std::as_const(said))
+        fprintf(stderr, "sprawl: %s\n", qPrintable(line));
+    if ((probe && (limit == 0 || kind.isEmpty())) || items < 0)
+        return 1;
+
     // A board is one thing to look at, so launching Sprawl again brings the
-    // window that is open to the front. Asking for a particular board still
-    // opens it, in a window of its own.
-    if (!screenshot && !bench && !args.isSet("new-window") && requested.isEmpty() && focusOpenWindow())
+    // window that is open to the front. Asking for anything, a board or a
+    // theme or a tool, still gets it, in a window of its own.
+    if (!wantsOwnWindow(args, argc < given) && focusOpenWindow())
         return 0;
 
     // The plainest style, as Hype uses: every control is drawn by Sprawl's
@@ -537,34 +629,26 @@ int main(int argc, char *argv[]) {
     QQuickStyle::setStyle("Basic");
 
     // The desktop's theme, unless another was asked for: a folder is made to
-    // stand in for Omarchy's own, with that theme as the current one.
+    // stand in for Omarchy's own, with that theme as the current one. The
+    // person's own settings for the shell go over it as userShellFor() says.
     QTemporaryDir themeHome;
     QString themeFolder;
     if (args.isSet("default-theme")) {
         themeFolder = "/nonexistent";
     } else if (args.isSet("theme")) {
         const QString asked = args.value("theme");
-        QString found;
-        for (const QString &candidate : {asked, QDir::homePath() + "/.config/omarchy/themes/" + asked,
-                                         "/usr/share/omarchy/themes/" + asked})
-            if (found.isEmpty() && QFile::exists(candidate + "/colors.toml"))
-                found = QFileInfo(candidate).absoluteFilePath();
+        const QString found = findTheme(asked);
         if (found.isEmpty() || !QFile::link(found, themeHome.filePath("theme"))) {
             fprintf(stderr, "sprawl: there is no theme %s\n", qPrintable(asked));
             return 1;
         }
         themeFolder = themeHome.path();
     }
-    Theme theme(themeFolder);
+    Theme theme(themeFolder, nullptr, {}, userShellFor(args));
 
     // The Omarchy font: "monospace" is the alias `omarchy font set` points at
-    // the chosen family, at the size the theme gives the shell.
-    auto adoptFont = [&theme] {
-        QFont font(theme.fontFamily());
-        font.setStyleHint(QFont::Monospace);
-        font.setPixelSize(theme.fontSize());
-        QGuiApplication::setFont(font);
-    };
+    // the chosen family, at the size of the shell's own text.
+    auto adoptFont = [&theme] { QGuiApplication::setFont(theme.font()); };
     adoptFont();
     QObject::connect(&theme, &Theme::changed, &app, adoptFont);
 
@@ -573,8 +657,7 @@ int main(int argc, char *argv[]) {
     QTemporaryDir scratch;
     Library library(bench ? scratch.path() : QString());
     if (bench) {
-        const QString problem =
-            Library::write(library.boardFile("bench"), madeUpBoard(probe ? 0 : args.value("bench").toInt()));
+        const QString problem = Library::write(library.boardFile("bench"), madeUpBoard(items));
         if (!problem.isEmpty()) {
             fprintf(stderr, "%s\n", qPrintable(problem));
             return 1;
@@ -631,7 +714,7 @@ int main(int argc, char *argv[]) {
     Benchmark *benchmark = nullptr;
     Probe *prober = nullptr;
     if (probe) {
-        prober = new Probe(window, canvas, backend.board(), args.value("probe").toDouble(), args.value("probe-with"));
+        prober = new Probe(window, canvas, backend.board(), limit, kind);
         // Once the window has been given its place on the desktop.
         QTimer::singleShot(1500, prober, [prober] { prober->start(); });
     } else if (bench) {

@@ -32,8 +32,10 @@ This builds and installs the app. Open **Sprawl** from the app launcher, or run
 `sprawl open`.
 
 Building requires a C++ compiler, `make`, `qmake6`, and the `qt6-base`,
-`qt6-declarative`, `qt6-svg`, and `qt6-wayland` packages. File dialogs use
-`xdg-desktop-portal` and your desktop's portal backend.
+`qt6-declarative`, `qt6-imageformats`, `qt6-svg`, and `qt6-wayland`
+packages. File dialogs use `xdg-desktop-portal` and your desktop's portal
+backend. AVIF, HEIC, and JPEG XL pictures also need `kimageformats` and the
+library for each: `libavif`, `libheif`, and `libjxl`.
 
 ## Start a board
 

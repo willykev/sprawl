@@ -40,7 +40,7 @@ Card {
             width: parent.width
             text: dialog.title
             color: theme.bright
-            font.pixelSize: theme.size("heading")
+            font.pixelSize: theme.sizes.heading
             font.bold: true
             wrapMode: Text.Wrap
         }
@@ -58,7 +58,7 @@ Card {
             topPadding: 4
             text: dialog.hint
             color: theme.dim
-            font.pixelSize: theme.size("small")
+            font.pixelSize: theme.sizes.small
             wrapMode: Text.Wrap
         }
     }

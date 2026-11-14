@@ -11,6 +11,10 @@ Card {
     // goes to the trash.
     property string mode: "switch"
     property var matches: []
+    // As many as fit comfortably; typing narrows the rest down, and a board
+    // named in full comes first. When there are any, the selection is one of
+    // them: Enter opens a board that is shown.
+    readonly property var rows: matches.slice(0, 9)
     property int current: 0
 
     readonly property string typed: backend.tidyName(input.text)
@@ -20,21 +24,44 @@ Card {
     cardHeight: column.implicitHeight + 32
 
     function open() {
-        mode = "switch"
-        input.text = ""
-        refresh()
+        begin("switch", "")
         visible = true
         input.forceActiveFocus()
     }
 
     function openNew() {
         open()
-        mode = "create"
+        begin("create", "")
+    }
+
+    // Every mode begins here: with the text given, and the list found again
+    // for it. Only switch lists boards; left listed in another mode, a click
+    // on one would make a new board, or rename or trash the open one,
+    // instead of opening it.
+    function begin(name, text) {
+        mode = name
+        input.text = text
         refresh()
     }
 
     function refresh() {
-        matches = mode === "switch" ? backend.findBoards(input.text) : []
+        const found = mode === "switch" ? backend.findBoards(input.text) : []
+        // A board named in full comes first. Its letters can fit longer
+        // names just as well (week-1 fits week-10 to week-19), and those,
+        // if changed later, would push it past the rows and out of reach.
+        // The name is read from the text itself: as a key is typed, this
+        // runs before typed has caught up with it.
+        const name = backend.tidyName(input.text)
+        let named = found.filter(match => match.name === name)
+        // Typed with a dot for a dash, or a dash too many (week.1, week--1),
+        // it is not found by its letters at all, and Enter would make
+        // week-1-2 beside it. So it is looked for by name as well, unless
+        // the text, in lower case and without its spaces, is the name
+        // already: that, the letters always find.
+        if (mode === "switch" && named.length === 0 && name.length > 0 &&
+            name !== input.text.toLowerCase().replace(/ /g, ""))
+            named = backend.findBoards(name).filter(match => match.name === name)
+        matches = named.concat(found.filter(match => match.name !== name))
         current = 0
     }
 
@@ -47,8 +74,8 @@ Card {
         } else if (mode === "remove") {
             if (backend.deleteBoard())
                 dismissed()
-        } else if (matches.length > 0) {
-            if (backend.openBoard(matches[current].name))
+        } else if (rows.length > 0) {
+            if (backend.openBoard(rows[current].name))
                 dismissed()
         } else if (fresh) {
             create()
@@ -65,9 +92,7 @@ Card {
             dismissed()
             return
         }
-        mode = "switch"
-        input.text = ""
-        refresh()
+        begin("switch", "")
     }
 
     Column {
@@ -118,6 +143,9 @@ Card {
                 color: theme.bright
                 selectionColor: Qt.alpha(theme.accent, 0.35)
                 selectedTextColor: theme.bright
+                // The size of the shell's own text, followed as PlainText
+                // follows it.
+                font.pixelSize: theme.fontSize
                 clip: true
                 onTextEdited: switcher.refresh()
 
@@ -129,7 +157,7 @@ Card {
                     } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                         switcher.accept()
                     } else if (event.key === Qt.Key_Down || event.key === Qt.Key_Tab) {
-                        switcher.current = Math.min(switcher.matches.length - 1, switcher.current + 1)
+                        switcher.current = Math.min(switcher.rows.length - 1, switcher.current + 1)
                     } else if (event.key === Qt.Key_Up || event.key === Qt.Key_Backtab) {
                         switcher.current = Math.max(0, switcher.current - 1)
                     } else if (control && event.key === Qt.Key_N && switcher.mode === "switch") {
@@ -137,16 +165,12 @@ Card {
                         if (switcher.typed.length > 0)
                             switcher.create()
                         else
-                            switcher.mode = "create"
+                            switcher.begin("create", "")
                     } else if (event.key === Qt.Key_F2 && switcher.mode === "switch") {
-                        switcher.mode = "rename"
-                        input.text = backend.boardName
+                        switcher.begin("rename", backend.boardName)
                         input.selectAll()
-                        switcher.refresh()
                     } else if (control && event.key === Qt.Key_Delete && switcher.mode === "switch") {
-                        switcher.mode = "remove"
-                        input.text = ""
-                        switcher.refresh()
+                        switcher.begin("remove", "")
                     } else {
                         event.accepted = false
                     }
@@ -157,14 +181,14 @@ Card {
         Item { width: 1; height: 8 }
 
         Repeater {
-            // As many as fit comfortably; typing narrows the rest down.
-            model: switcher.matches.slice(0, 9)
+            model: switcher.rows
 
             Rectangle {
                 id: row
                 required property var modelData
                 required property int index
                 readonly property bool selected: index === switcher.current
+                objectName: "board-" + modelData.name
                 width: column.width
                 height: 28
                 color: selected ? theme.hoverFill : rowArea.containsMouse ? theme.controlFill : "transparent"
@@ -188,7 +212,7 @@ Card {
                     visible: row.modelData.current
                     text: qsTr("open now")
                     color: row.selected ? theme.accent : theme.dim
-                    font.pixelSize: theme.size("small")
+                    font.pixelSize: theme.sizes.small
                 }
 
                 MouseArea {
@@ -274,7 +298,7 @@ Card {
                   : switcher.mode === "remove" ? qsTr("Enter moves it to the trash · Esc keeps it")
                   : qsTr("Enter opens · Esc closes")
             color: theme.dim
-            font.pixelSize: theme.size("small")
+            font.pixelSize: theme.sizes.small
         }
     }
 }

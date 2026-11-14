@@ -36,6 +36,9 @@ Rectangle {
             RailButton {
                 required property var modelData
                 objectName: "tool-" + modelData.tool
+                // A board that could not be read is only looked at: the tools
+                // that make things are not to be had.
+                enabled: !rail.view.readOnly || modelData.tool === "select" || modelData.tool === "pan"
                 icon: modelData.icon
                 key: modelData.key
                 active: rail.view.tool === modelData.tool && !rail.view.editing

@@ -8,4 +8,7 @@ import QtQuick
 // one of these.
 Text {
     textFormat: Text.PlainText
+    // The size of the shell's own text, followed when it changes: a text
+    // takes the application's font once, when it is made, and keeps it.
+    font.pixelSize: theme.fontSize
 }

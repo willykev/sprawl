@@ -12,6 +12,7 @@
 #include "item.h"
 #include "theme.h"
 
+class Board;
 class QPainter;
 
 // How an item's text is set: its type, its colors, and the box it sits in.
@@ -66,9 +67,26 @@ TextStyle styleFor(const Item &item, const Palette &palette);
 QPointF connectorLabelCorner(const Item &connector, QSizeF labelSize);
 
 // Makes an item big enough for its text: text items are exactly the size of
-// their text, and notes and shapes grow taller rather than spill. Returns
-// whether the item changed.
-bool fit(Item &item);
+// their text, and notes and shapes grow taller rather than spill, a shape to
+// the least height that holds it, to the hundredth a file keeps. Returns
+// whether the item changed. `laidOut`, when given, is its text as it is set
+// at the size the item is now, which is then not laid out again.
+bool fit(Item &item, const TextBlock *laidOut = nullptr);
+// Makes every item on a board big enough for its text, as the canvas makes
+// each one as it prepares it: what a file says of the size of a note or a
+// shape is how big it is at least, and of text only where it starts. That is
+// not an edit, so it is not undone, and a board that was saved still is. A
+// note or a shape that could never grow, by a reach() all measured, is not
+// laid out.
+void fitAll(Board &board);
+
+// All an item could cover, from its corner, once fit() has made it big
+// enough for its text: worked out from what is written on it without laying
+// that out. Text could reach that far across and down, a note that far down,
+// and a shape that far above and below its middle. `measured`, when given, is
+// whether all of that was measured, rather than allowed for: a handful of
+// signs can reach further than they are allowed.
+QRectF reach(const Item &item, bool *measured = nullptr);
 
 // Sizes on the board's type scale.
 inline constexpr qreal small = 11, body = 12, subtitle = 13, heading = 16, display = 28;

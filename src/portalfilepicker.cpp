@@ -69,20 +69,12 @@ void registerPortalFilterTypes() {
 }
 
 PortalFileFilter imageFilter() {
-    return {
-        QCoreApplication::translate("PortalFilePicker", "Pictures"),
-        {
-            {1, QStringLiteral("image/*")},
-            {0, QStringLiteral("*.png")},
-            {0, QStringLiteral("*.jpg")},
-            {0, QStringLiteral("*.jpeg")},
-            {0, QStringLiteral("*.webp")},
-            {0, QStringLiteral("*.gif")},
-            {0, QStringLiteral("*.svg")},
-            {0, QStringLiteral("*.bmp")},
-            {0, QStringLiteral("*.avif")},
-        },
-    };
+    // By their type, every kind of picture: HEIC and JPEG XL photos too,
+    // which Qt reads only with packages Sprawl has as optional.
+    PortalFilterRules rules{{1, QStringLiteral("image/*")}};
+    for (const QString &suffix : FilePicker::pictureSuffixes())
+        rules.append({0, QStringLiteral("*.") + suffix});
+    return {QCoreApplication::translate("PortalFilePicker", "Pictures"), rules};
 }
 
 PortalFileFilter exportFilter(const QString &format) {

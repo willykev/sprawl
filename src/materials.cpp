@@ -158,7 +158,11 @@ QSGMaterialShader *ShapeMaterial::createShader(QSGRendererInterface::RenderMode)
     return new ScaledShader("shape");
 }
 
-GridMaterial::GridMaterial() { setFlag(Blending); }
+GridMaterial::GridMaterial() {
+    setFlag(Blending);
+    // So its corners reach the shader as the canvas has them (see materials.h).
+    setFlag(RequiresFullMatrix);
+}
 
 QSGMaterialType *GridMaterial::type() const {
     static QSGMaterialType type;
@@ -168,6 +172,27 @@ QSGMaterialType *GridMaterial::type() const {
 QSGMaterialShader *GridMaterial::createShader(QSGRendererInterface::RenderMode) const { return new GridShader; }
 
 int GridMaterial::compare(const QSGMaterial *other) const { return this == other ? 0 : (this < other ? -1 : 1); }
+
+void GridMaterial::follow(const QMatrix4x4 &view, qreal viewZoom, qreal devicePixels) {
+    // Two grids a factor of two apart; the finer fades out as zooming
+    // out crowds its dots.
+    qreal step = 24;
+    while (step * viewZoom < 16)
+        step *= 2;
+    while (step * viewZoom >= 32)
+        step /= 2;
+    zoom = float(viewZoom);
+    spacing = float(step);
+    fade = float(qBound(0.0, (step * viewZoom - 16) / 8, 1.0));
+    dpr = float(devicePixels);
+    radius = dpr;
+    // The canvas point at the corner, wrapped to the grid in double
+    // precision here so the shader's floats stay small and exact however
+    // far the board has been panned.
+    const qreal period = step * 2;
+    origin = QVector2D(float(std::fmod(-view(0, 3) / viewZoom, period)),
+                       float(std::fmod(-view(1, 3) / viewZoom, period)));
+}
 
 namespace Nodes {
 

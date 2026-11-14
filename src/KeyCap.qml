@@ -7,7 +7,9 @@ Rectangle {
     property string label
 
     implicitWidth: Math.max(20, text.implicitWidth + 14)
-    implicitHeight: 20
+    // Taller once its letters need it, as they do at the shell's larger
+    // sizes, so they stay clear of its border.
+    implicitHeight: Math.max(20, text.implicitHeight + 2 * border.width)
     color: "transparent"
     border.color: theme.controlBorder
     border.width: theme.controlBorderWidth
@@ -18,6 +20,6 @@ Rectangle {
         anchors.centerIn: parent
         text: cap.label
         color: theme.foreground
-        font.pixelSize: theme.size("small")
+        font.pixelSize: theme.sizes.small
     }
 }

@@ -18,17 +18,20 @@
 //            where nothing overlaps is one layer; a pile of three notes is
 //            three.
 //   buckets  A layer is cut into squares of the board, and the items of a
-//            square are a bucket (or several, when there are many). In a
-//            bucket all the shapes come first, then the strokes, the
-//            pictures, and the text, style by style, so each is one call.
-//            A bucket is a batch of its own to the scene graph: changing
-//            an item costs its bucket, never the board.
+//            square are a bucket (or several, when there are many). What
+//            is bigger than a square goes by the square its middle is in,
+//            in buckets kept apart from smaller things. In a bucket all
+//            the shapes come first, then the strokes, the pictures, and
+//            the text, style by style, so each is one call. A bucket is a
+//            batch of its own to the scene graph: changing an item costs
+//            its bucket, never the board.
 //   view     Only what is near the window is in the scene graph at all: a
-//            bucket's square is cut again into sixteen parts, and the
-//            parts out of view are taken out of it. They cost nothing,
-//            however big the board is. That matters twice over, because a
-//            GPU is not done with a triangle that is off screen for free:
-//            measured, it holds on to those as it does the ones in view.
+//            bucket's square is cut again into sixteen parts (and what is
+//            bigger than a square has a part to itself), and the parts out
+//            of view are taken out of it. They cost nothing, however big
+//            the board is. That matters twice over, because a GPU is not
+//            done with a triangle that is off screen for free: measured,
+//            it holds on to those as it does the ones in view.
 //            (Taken out, not just blocked: the scene graph still calls on
 //            every piece of text under a blocked node, every frame.)
 //   detail   What is too small on screen to make out is left out: type
@@ -213,9 +216,13 @@ struct Bucket {
     QSGNode *layer = nullptr;
     // What it holds, in the order it is drawn. `strokes` is what is drawn
     // with few triangles (lines, frames, arrows, shapes with corners);
-    // `detail` what takes many (the pen's strokes, shapes with curves), at
-    // each level of detail, of which one is let in at a time.
-    Slot shapes, strokes, detail[detailLevels], images;
+    // `diagram` and `detail` what takes many, at each level of detail, of
+    // which one is let in at a time. The diagram is shapes with curves and
+    // long dashed lines, which a full frame draws more plainly but never
+    // leaves out on their own, only with the part of the board they are
+    // in; `detail` is the pen's long strokes, which are left out when even
+    // their plainest is too much.
+    Slot shapes, strokes, diagram[detailLevels], detail[detailLevels], images;
     QSGNode *texts = nullptr;
     struct Style {
         Slot slot;
@@ -224,13 +231,14 @@ struct Bucket {
     };
     QHash<quint64, Style> styles;
     // What is in each part of the square, what that covers, and what it
-    // asks of the GPU: of what is always drawn, of the long strokes at each
-    // level, and of the type in each style.
+    // asks of the GPU: of what is always drawn, of the diagram and the long
+    // strokes at each level, and of the type in each style. And whether a
+    // piece of the stroke being drawn is in it (see SceneNodes::apply()).
     struct Part {
         QSet<quint32> members;
         QRectF bounds;
-        bool stale = false, shown = false;
-        Load fixed, detailLoad[detailLevels];
+        bool stale = false, shown = false, drawing = false;
+        Load fixed, diagramLoad[detailLevels], detailLoad[detailLevels];
         QHash<quint64, Load> type;
     };
     Part parts[partCount];
@@ -242,6 +250,8 @@ struct Bucket {
     template <class Each> void eachSlot(Each each) {
         each(shapes);
         each(strokes);
+        for (Slot &level : diagram)
+            each(level);
         for (Slot &level : detail)
             each(level);
         each(images);
@@ -258,6 +268,8 @@ struct Home {
     QRectF bounds;
     QSGGeometryNode *shapes = nullptr, *strokes = nullptr;
     QSGGeometryNode *detail[detailLevels] = {};
+    // Whether those are part of the diagram (see Bucket) or a long stroke.
+    bool diagram = false;
     QSGImageNode *image = nullptr;
     QRectF imageRect;
     // Shared between the items showing the same picture.
@@ -296,11 +308,23 @@ struct SceneNodes : QSGNode {
     QSGNode *draft = nullptr;            // what is being drawn right now
     QSGNode *chrome = nullptr;           // selection boxes and handles, in screen pixels
     QSGGeometryNode *draftShapes = nullptr, *draftStrokes = nullptr, *chromeShapes = nullptr;
+    // What the draft and the chrome ask of the GPU in every frame: all of
+    // it, in view or not.
+    Load draftLoad, chromeLoad;
     QMap<int, QSGNode *> layers;
     QHash<ScenePlace, QVector<Bucket *>> squares;
     QSet<Bucket *> buckets;
     QHash<quint32, Home> homes;
-    QHash<QString, std::weak_ptr<QSGTexture>> textures;
+    // The pictures on the GPU, by the image each was made from: a picture as
+    // it was read, so that one read again, changed on disk, is a picture of
+    // its own. Each is held by the items that show it, and by this until
+    // none does: an item built again, in a new theme or at a new size, finds
+    // the picture it showed still here (see letGoOfPictures()).
+    QHash<qint64, std::shared_ptr<QSGTexture>> textures;
+    // While a board that started over is built again, the picture each of
+    // its items will show, held for it until it is built (see
+    // updatePaintNode()).
+    QHash<quint32, std::shared_ptr<QSGTexture>> keptFor;
 
     SceneNodes() {
         auto *quad = new QSGGeometry(QSGGeometry::defaultAttributes_Point2D(), 4);
@@ -322,6 +346,9 @@ struct SceneNodes : QSGNode {
     // the scene graph and nobody else's to delete, then the rest.
     ~SceneNodes() override {
         clear();
+        // What is being drawn, when a frame went without it.
+        if (!draft->parent())
+            delete draft;
         while (QSGNode *child = firstChild()) {
             removeChildNode(child);
             delete child;
@@ -344,11 +371,13 @@ struct SceneNodes : QSGNode {
     }
 
     // A bucket of that square of the board with room for the item, made
-    // when there is none.
+    // when there is none. What is bigger than a square has a part of a
+    // bucket to itself, so a bucket of those has room for one in each part.
     Bucket *roomIn(const ScenePlace &square, int vertices) {
+        const int most = square.wide ? partCount : bucketItems;
         QVector<Bucket *> &there = squares[square];
         for (auto it = there.crbegin(); it != there.crend(); ++it)
-            if ((*it)->items < bucketItems && (*it)->vertices + vertices <= bucketVertices)
+            if ((*it)->items < most && (*it)->vertices + vertices <= bucketVertices)
                 return *it;
         auto *bucket = new Bucket;
         bucket->place = square;
@@ -357,6 +386,8 @@ struct SceneNodes : QSGNode {
         bucket->layer = layerNode(square.layer);
         bucket->shapes.make(bucket->node);
         bucket->strokes.make(bucket->node);
+        for (Slot &level : bucket->diagram)
+            level.make(bucket->node);
         for (Slot &level : bucket->detail)
             level.make(bucket->node);
         bucket->images.make(bucket->node);
@@ -368,7 +399,12 @@ struct SceneNodes : QSGNode {
 
     void attach(quint32 id, Home &home, const ScenePlace &place) {
         Bucket *bucket = roomIn(squareOf(place), home.vertices);
-        const int at = qBound(0, int(place.part), partCount - 1);
+        // What is bigger than a square takes the first part that is free:
+        // roomIn() gave it a bucket with one.
+        int at = qBound(0, int(place.part), partCount - 1);
+        if (place.wide)
+            while (at + 1 < partCount && !bucket->parts[at].members.isEmpty())
+                ++at;
         Bucket::Part &part = bucket->parts[at];
         home.bucket = bucket;
         home.part = at;
@@ -376,9 +412,10 @@ struct SceneNodes : QSGNode {
             bucket->shapes.part(at)->appendChildNode(home.shapes);
         if (home.strokes)
             bucket->strokes.part(at)->appendChildNode(home.strokes);
+        Slot *levels = home.diagram ? bucket->diagram : bucket->detail;
         for (int level = 0; level < detailLevels; ++level)
             if (home.detail[level])
-                bucket->detail[level].part(at)->appendChildNode(home.detail[level]);
+                levels[level].part(at)->appendChildNode(home.detail[level]);
         if (home.image)
             bucket->images.part(at)->appendChildNode(home.image);
         for (const Home::Run &run : home.texts) {
@@ -393,8 +430,9 @@ struct SceneNodes : QSGNode {
         }
         part.members.insert(id);
         part.fixed += home.fixed;
+        Load *loads = home.diagram ? part.diagramLoad : part.detailLoad;
         for (int level = 0; level < detailLevels; ++level)
-            part.detailLoad[level] += home.detailLoad[level];
+            loads[level] += home.detailLoad[level];
         part.bounds |= home.bounds;
         bucket->bounds |= home.bounds;
         ++bucket->items;
@@ -437,8 +475,9 @@ struct SceneNodes : QSGNode {
         }
         part.members.remove(id);
         part.fixed -= home.fixed;
+        Load *loads = home.diagram ? part.diagramLoad : part.detailLoad;
         for (int level = 0; level < detailLevels; ++level)
-            part.detailLoad[level] -= home.detailLoad[level];
+            loads[level] -= home.detailLoad[level];
         part.stale = bucket->stale = true;
         --bucket->items;
         bucket->renderables -= home.renderables();
@@ -470,6 +509,8 @@ struct SceneNodes : QSGNode {
     }
 
     void removeItem(quint32 id) {
+        // Gone before it was built again, it needs nothing kept for it.
+        keptFor.remove(id);
         const auto home = homes.find(id);
         if (home == homes.end())
             return;
@@ -481,6 +522,7 @@ struct SceneNodes : QSGNode {
         for (auto home = homes.begin(); home != homes.end(); ++home)
             destroy(home.key(), *home);
         homes.clear();
+        keptFor.clear();
         for (QSGNode *layer : std::as_const(layers)) {
             items->removeChildNode(layer);
             delete layer;
@@ -488,6 +530,13 @@ struct SceneNodes : QSGNode {
         layers.clear();
         squares.clear();
         buckets.clear();
+    }
+
+    // Lets go of the pictures held only here, which nothing shows any more or
+    // is waiting to show, and says how many the GPU is left holding.
+    int letGoOfPictures() {
+        textures.removeIf([](QHash<qint64, std::shared_ptr<QSGTexture>>::iterator it) { return it->use_count() <= 1; });
+        return int(textures.size());
     }
 
     void move(quint32 id, QPointF position) {
@@ -531,7 +580,8 @@ struct SceneNodes : QSGNode {
         const auto home = homes.find(id);
         if (home == homes.end() || !home->bucket)
             return;
-        if (home->bucket->place == squareOf(place) && home->part == place.part)
+        // What is bigger than a square is in whichever part was free.
+        if (home->bucket->place == squareOf(place) && (place.wide || home->part == place.part))
             return;
         detach(id, *home);
         attach(id, *home, place);
@@ -556,9 +606,12 @@ struct SceneNodes : QSGNode {
 
     // Decides what of the board this frame draws: what is near `view` (in
     // units), in as much detail as shows at `scale` screen pixels to the
-    // unit, and no more than `budget` in all. `waiting` is set when there
-    // is something left to do that has to wait for the next frame.
-    SceneLoad apply(const QRectF &view, qreal scale, qint64 budget, bool everything, bool *waiting) {
+    // unit, and no more than `budget` in all. `pieces` are what a stroke
+    // still being drawn has put on the board so far (see
+    // CanvasView::carryOn()). `waiting` is set when there is something left
+    // to do that has to wait for the next frame.
+    SceneLoad apply(const QRectF &view, qreal scale, qint64 budget, bool everything, const QVector<quint32> &pieces,
+                    bool *waiting) {
         // A part of the board comes in when it nears the view, and stays
         // until it is clear of it: panning back and forth over its edge
         // does not keep putting it in and taking it out.
@@ -568,7 +621,7 @@ struct SceneNodes : QSGNode {
 
         SceneLoad load;
         load.buckets = int(buckets.size());
-        Load fixed, detail[detailLevels];
+        Load fixed, diagram[detailLevels], detail[detailLevels];
         QMap<qreal, Load> type; // by size
         for (Bucket *bucket : std::as_const(buckets)) {
             if (bucket->stale)
@@ -578,55 +631,138 @@ struct SceneNodes : QSGNode {
             for (Bucket::Part &part : bucket->parts) {
                 part.shown = near && !part.members.isEmpty() &&
                              (everything || part.bounds.intersects(part.shown ? around : nearby));
+                part.drawing = false;
                 if (!part.shown)
                     continue;
                 bucket->shown = true;
                 load.items += int(part.members.size());
                 fixed += part.fixed;
-                for (int level = 0; level < detailLevels; ++level)
+                for (int level = 0; level < detailLevels; ++level) {
+                    diagram[level] += part.diagramLoad[level];
                     detail[level] += part.detailLoad[level];
+                }
                 for (auto it = part.type.constBegin(); it != part.type.constEnd(); ++it)
                     type[sizeOf(it.key())] += *it;
+                // The part nearest the middle of the view is drawn whatever
+                // it holds (see below), and this one could be that: all that
+                // is always drawn of it, and its diagram at its plainest.
+                load.floor = qMax(load.floor, part.fixed.bytes + part.diagramLoad[detailLevels - 1].bytes);
             }
             if (bucket->shown)
                 ++load.shown;
         }
+        // The long strokes of the parts in view that the stroke being drawn
+        // has pieces in, its pieces and anything there with them, are kept
+        // apart from the rest: they are not hidden with them (see below).
+        // Those parts, in the order the pieces went down.
+        QVector<Bucket::Part *> drawingParts;
+        Load stroke[detailLevels];
+        for (quint32 id : pieces) {
+            const auto home = homes.constFind(id);
+            if (home == homes.constEnd() || !home->bucket)
+                continue;
+            Bucket::Part &part = home->bucket->parts[home->part];
+            if (!part.shown || part.drawing)
+                continue;
+            part.drawing = true;
+            drawingParts.append(&part);
+            for (int level = 0; level < detailLevels; ++level) {
+                detail[level] -= part.detailLoad[level];
+                stroke[level] += part.detailLoad[level];
+            }
+        }
 
         // What shows at this size on screen.
-        int level = 0;
-        while (level + 1 < detailLevels && scale < coarseBelow[level + 1])
-            ++level;
+        int shows = 0;
+        while (shows + 1 < detailLevels && scale < coarseBelow[shows + 1])
+            ++shows;
+        // The level the pen's strokes are drawn at, and the diagram's, which
+        // is never plainer.
+        int level = shows, diagramLevel = shows;
         qreal smallest = legibleText / qMax(scale, 1e-6);
+        // The type drawn: the sizes from `drawn` up, at first every size big
+        // enough to read.
+        const auto legible = std::as_const(type).lowerBound(smallest);
+        auto drawn = legible;
         bool hidden = false;
         auto total = [&] {
             Load sum = fixed;
+            sum += diagram[diagramLevel];
+            sum += stroke[level];
             if (!hidden)
                 sum += detail[level];
-            for (auto it = type.lowerBound(smallest); it != type.end(); ++it)
+            for (auto it = drawn; it != type.cend(); ++it)
                 sum += *it;
             return sum;
         };
 
         // And what a frame can hold. Over that, type goes first, the
         // smallest first, which is the least read; then the curves of the
-        // pen's strokes, a level at a time; then those strokes themselves.
+        // pen's strokes and of the diagram, a level at a time; then the pen's
+        // strokes themselves, but for the stroke being drawn, which whoever
+        // is drawing it sees whole for as long as the rest can make room. The
+        // diagram is drawn more plainly, but never left out on its own:
+        // without it, what is written on its shapes and the heads of its
+        // lines would be left with nothing around them.
         Load sum = total();
         if (sum.bytes > budget) {
             load.reduced = true;
-            for (auto it = type.lowerBound(smallest); it != type.end() && sum.bytes > budget; ++it) {
-                smallest = it.key() + 0.5;
+            while (sum.bytes > budget && drawn != type.cend()) {
+                ++drawn;
                 sum = total();
             }
-            while (sum.bytes > budget && level + 1 < detailLevels) {
-                ++level;
-                sum = total();
-            }
-            if (sum.bytes > budget && detail[level].triangles > 0) {
-                hidden = true;
-                sum = total();
-            }
-            // What is left is paper, lines and pictures, and a window only
-            // holds too much of those when they are piled thousands deep.
+            auto giveWay = [&] {
+                while (sum.bytes > budget && level + 1 < detailLevels) {
+                    diagramLevel = ++level;
+                    sum = total();
+                }
+                if (sum.bytes > budget && detail[level].triangles > 0) {
+                    hidden = true;
+                    sum = total();
+                }
+                // A level of the strokes, or all of them, is often far more
+                // than the frame was still over by once the type had gone.
+                // When all of them went, the room that leaves brings back the
+                // curves of the stroke being drawn first, which did not go
+                // with them, and the diagram's with its, as the diagram is
+                // never plainer...
+                while (hidden && level > shows && stroke[level].triangles > 0 &&
+                       sum.bytes - stroke[level].bytes - diagram[level].bytes + stroke[level - 1].bytes +
+                               diagram[level - 1].bytes <=
+                           budget) {
+                    diagramLevel = --level;
+                    sum = total();
+                }
+                // ...then the curves of the diagram, as they went after the
+                // type: a level at a time, as far as it goes...
+                while (diagramLevel > shows &&
+                       sum.bytes - diagram[diagramLevel].bytes + diagram[diagramLevel - 1].bytes <= budget) {
+                    --diagramLevel;
+                    sum = total();
+                }
+            };
+            giveWay();
+            // ...and then the type, the largest first, as far as what is left
+            // of the room goes. A level of the diagram that no longer fits is
+            // often far more than the frame was over by, too, so the type can
+            // come back when the diagram gives way, as it can when the strokes
+            // do.
+            auto giveBack = [&] {
+                auto next = drawn;
+                while (next != legible && sum.bytes + std::prev(next)->bytes <= budget) {
+                    --next;
+                    // A size all of which went with the parts it was in (see
+                    // below) is passed over, and not counted as drawn: there
+                    // is none of it left to draw.
+                    if (next->bytes > 0) {
+                        drawn = next;
+                        sum = total();
+                    }
+                }
+            };
+            giveBack();
+            // What is left is paper, shapes, lines and pictures, and a window
+            // only holds too much of those when they are piled thousands deep.
             // Then the parts furthest from the middle of the view go, so
             // that whatever else, a frame is never more than its budget.
             if (sum.bytes > budget) {
@@ -640,13 +776,70 @@ struct SceneNodes : QSGNode {
                     for (Bucket::Part &part : bucket->parts)
                         if (part.shown)
                             parts.append({QLineF(part.bounds.center(), view.center()).length(), bucket, &part});
-                std::sort(parts.begin(), parts.end(), [](const Far &a, const Far &b) { return a.distance > b.distance; });
-                // All but the nearest, which is drawn whatever it holds.
-                for (qsizetype i = 0; i + 1 < parts.size() && sum.bytes > budget; ++i) {
+                // The furthest first. Parts as far off as each other (those of
+                // the buckets that share a square can be) go in the same order
+                // every frame, so that a bucket made for something new, say a
+                // piece of a stroke being drawn, does not change which of them
+                // go and which come back.
+                std::sort(parts.begin(), parts.end(), [](const Far &a, const Far &b) {
+                    return a.distance != b.distance ? a.distance > b.distance
+                                                    : std::less<const Bucket::Part *>()(a.part, b.part);
+                });
+                // All but the nearest, which is drawn whatever it holds (of
+                // the board but for the stroke being drawn, when there is more
+                // to it), and those the stroke being drawn is in, which stay
+                // with it as long as they and the nearest fit at their
+                // plainest. Past that (a scribble long enough, over a part
+                // piled high enough), its oldest pieces give way first, as any
+                // long stroke does, and the parts they are in can go too.
+                const auto rest = std::find_if(parts.crbegin(), parts.crend(),
+                                               [](const Far &far) { return !far.part->drawing; });
+                const Bucket::Part *nearest = rest != parts.crend() ? rest->part : parts.constLast().part;
+                auto keeps = [nearest](const Bucket::Part &part) {
+                    Load kept;
+                    if (part.drawing || &part == nearest) {
+                        kept += part.fixed;
+                        kept += part.diagramLoad[detailLevels - 1];
+                    }
+                    if (part.drawing)
+                        kept += part.detailLoad[detailLevels - 1];
+                    return kept;
+                };
+                Load kept;
+                for (const Far &far : std::as_const(parts))
+                    kept += keeps(*far.part);
+                for (Bucket::Part *part : std::as_const(drawingParts)) {
+                    if (kept.bytes <= budget)
+                        break;
+                    kept -= keeps(*part);
+                    part->drawing = false;
+                    kept += keeps(*part);
+                    for (int at = 0; at < detailLevels; ++at) {
+                        stroke[at] -= part->detailLoad[at];
+                        detail[at] += part->detailLoad[at];
+                    }
+                    sum = total();
+                    giveWay();
+                }
+                // A part that goes takes its diagram, its strokes and its type
+                // with it. One with nothing in it that is still drawn by now
+                // (only type, or long strokes, which have gone already) would
+                // free nothing by going: it stays, and what follows decides
+                // what of it is drawn.
+                for (qsizetype i = 0; i < parts.size() && sum.bytes > budget; ++i) {
                     Bucket::Part &part = *parts[i].part;
+                    if (part.drawing || &part == nearest ||
+                        part.fixed.bytes + part.diagramLoad[diagramLevel].bytes == 0)
+                        continue;
                     part.shown = false;
                     load.items -= int(part.members.size());
                     fixed -= part.fixed;
+                    for (int at = 0; at < detailLevels; ++at) {
+                        diagram[at] -= part.diagramLoad[at];
+                        detail[at] -= part.detailLoad[at];
+                    }
+                    for (auto it = part.type.constBegin(); it != part.type.constEnd(); ++it)
+                        type[sizeOf(it.key())] -= *it;
                     sum = total();
                 }
                 for (Bucket *bucket : std::as_const(buckets)) {
@@ -657,8 +850,22 @@ struct SceneNodes : QSGNode {
                     if (!bucket->shown)
                         --load.shown;
                 }
+                // The last part to go can be far more than the frame was still
+                // over by, too. What is left is drawn as it would be were it
+                // all that was in view: its strokes and its diagram come back
+                // first, in as much detail as there is room for, and then its
+                // type.
+                level = diagramLevel = shows;
+                hidden = false;
+                sum = total();
+                giveWay();
+                giveBack();
             }
         }
+        // Type is left out below the smallest size drawn: from halfway past
+        // the largest that is not, as sizes are whole units.
+        if (drawn != legible)
+            smallest = std::prev(drawn).key() + 0.5;
 
         const bool attached = parent() != nullptr;
         for (Bucket *bucket : std::as_const(buckets)) {
@@ -670,16 +877,21 @@ struct SceneNodes : QSGNode {
             // What is inside first, so that a bucket coming in comes in
             // with only what it is going to show.
             bool changed = false;
-            auto show = [&](Slot &slot, bool whole) {
+            // A slot is shown in the parts that are when `whole`, and when
+            // `drawing`, in those of them the stroke being drawn is in.
+            auto show = [&](Slot &slot, bool whole, bool drawing = false) {
                 for (int i = 0; i < partCount; ++i)
                     if (slot.parts[i])
-                        changed |= place(slot.node, slot.parts[i], whole && bucket->parts[i].shown);
+                        changed |= place(slot.node, slot.parts[i],
+                                         (whole || (drawing && bucket->parts[i].drawing)) && bucket->parts[i].shown);
             };
             show(bucket->shapes, true);
             show(bucket->strokes, true);
             show(bucket->images, true);
-            for (int i = 0; i < detailLevels; ++i)
-                show(bucket->detail[i], !hidden && i == level);
+            for (int i = 0; i < detailLevels; ++i) {
+                show(bucket->diagram[i], i == diagramLevel);
+                show(bucket->detail[i], !hidden && i == level, i == level);
+            }
             for (Bucket::Style &style : bucket->styles)
                 show(style.slot, style.size >= smallest);
             changed |= place(bucket->layer, bucket->node, true);
@@ -707,6 +919,7 @@ struct SceneNodes : QSGNode {
         load.bytes = sum.bytes;
         load.strokeDetail = level;
         load.strokesHidden = hidden;
+        load.diagramDetail = diagramLevel;
         load.smallestText = smallest;
         return load;
     }
@@ -730,7 +943,13 @@ QColor CanvasView::colorFor(const QString &name, const QColor &neutral) const {
 }
 
 void CanvasView::requestFrame() {
-    polish();
+    // What measuring changes is seen to by the polish that is measuring,
+    // which asks for the next frame itself when anything is left to make
+    // ready. Asked for again from inside it, that polish would be run again
+    // before the frame is drawn, and again for as long as anything grew: the
+    // whole board made ready in one frame.
+    if (!m_measuring)
+        polish();
     update();
 }
 
@@ -745,10 +964,16 @@ void CanvasView::markDirty(quint32 id) {
 
 void CanvasView::markAllDirty() {
     m_dirty.clear();
+    m_waiting.clear();
     m_moved.clear();
+    m_unmeasured.clear();
+    m_unfitted.clear();
+    m_reaching.clear();
     if (m_board)
-        for (quint32 id : m_board->order())
+        for (quint32 id : m_board->order()) {
             m_dirty.insert(id);
+            markUnmeasured(id);
+        }
     m_chromeDirty = true;
     m_settledPending = true;
     emit pendingItemsChanged();
@@ -797,17 +1022,21 @@ std::unique_ptr<CanvasView::Prepared> CanvasView::prepare(const Item &item) {
         const Geo::Figure figure = Geo::figure(item.shape, inside);
         Geo::strokeFigure(p.strokes, figure, QPointF(0.5, 0.5), fill, border);
         // One with curves is many edges, and like a long stroke is cut
-        // again with fewer for when it is small on screen.
-        if (p.strokes.indices.size() / 3 >= heavyStroke)
+        // again with fewer for when it is small on screen. Unlike a stroke,
+        // it is part of the diagram (see Bucket): a full frame draws it more
+        // plainly, and never leaves it out on its own.
+        if (p.strokes.indices.size() / 3 >= heavyStroke) {
+            p.diagram = true;
             for (int level = 1; level < detailLevels; ++level)
                 Geo::strokeFigure(p.coarse[level - 1], Geo::simplified(figure, coarseTolerance[level]),
                                   QPointF(0.5, 0.5), fill, border);
+        }
         break;
     }
     case Item::Kind::Text:
         break;
     case Item::Kind::Stroke: {
-        const QVector<QPointF> curve = Geo::smooth(item.points, 0.1);
+        const QVector<QPointF> curve = Geo::smooth(item.points, Geo::strokeTolerance);
         const quint32 color = packColor(colorFor(item.color, m_palette.bright));
         Geo::strokePolyline(p.strokes, curve, {}, item.width / 2, color);
         // A long one is cut again with fewer points and plain corners, for
@@ -823,8 +1052,10 @@ std::unique_ptr<CanvasView::Prepared> CanvasView::prepare(const Item &item) {
         addConnector(item, -p.position, color, p.shapes, p.strokes);
         // A long dashed or dotted one is dashes by the hundred. They are
         // kept until they are too small on screen to tell apart, and from
-        // there it is drawn as the one line it then looks like.
+        // there it is drawn as the one line it then looks like. It is part
+        // of the diagram too.
         if (item.dash != Item::Dash::Solid && p.strokes.indices.size() / 3 >= heavyStroke) {
+            p.diagram = true;
             p.coarse[0] = p.strokes;
             Item plain = item;
             plain.dash = Item::Dash::Solid;
@@ -837,7 +1068,6 @@ std::unique_ptr<CanvasView::Prepared> CanvasView::prepare(const Item &item) {
     }
     case Item::Kind::Image:
         p.imageRect = box;
-        p.asset = item.asset;
         p.image = m_images->image(item.asset);
         if (p.image.isNull()) {
             // Still being read, or missing: say which.
@@ -890,11 +1120,11 @@ void CanvasView::prepareDecorations(Geo::ShapeMesh &shapes) {
         if (const Item *target = m_board->item(m_connectTarget))
             shapes.add(itemBoxOnScreen(*target), Geo::Outline::Rect, 0, 2, 0, accent);
 
-    if (m_selection.size() > outlineLimit) {
-        shapes.add(m_selectionBox, Geo::Outline::Rect, 0, 1, 0, accent);
+    if (selection().size() > outlineLimit) {
+        shapes.add(selectionBox(), Geo::Outline::Rect, 0, 1, 0, accent);
         return;
     }
-    for (quint32 id : std::as_const(m_selection)) {
+    for (quint32 id : selection()) {
         const Item *item = m_board->item(id);
         if (item && item->kind != Item::Kind::Connector)
             shapes.add(itemBoxOnScreen(*item), Geo::Outline::Rect, 0, 1, 0, accent);
@@ -920,9 +1150,9 @@ void CanvasView::prepareDraft(Geo::ShapeMesh &shapes, Geo::StrokeMesh &strokes) 
     const QColor dim = Theme::mix(m_palette.background, m_palette.foreground, .62);
     if (m_drag == Drag::Stroke) {
         // Smoothed as it will be once it is on the board, so letting go
-        // changes nothing.
-        Geo::strokePolyline(strokes, Geo::smooth(m_draftPoints, 0.1), {}, m_penWidth / 2,
-                            packColor(colorFor(m_penColor, m_palette.bright)));
+        // changes nothing that shows; and cut as it was drawn, a point at a
+        // time (see Geo::Pen).
+        strokes = m_pen.mesh();
     } else if (m_drag == Drag::Box) {
         const QRectF box = m_draftBox.normalized();
         if (m_tool == Tool::Frame) {
@@ -945,44 +1175,136 @@ void CanvasView::prepareDraft(Geo::ShapeMesh &shapes, Geo::StrokeMesh &strokes) 
     }
 }
 
+// The stroke being drawn is drawn whole, wherever it goes, so it is given a
+// quarter of what a frame may hold and the board keeps the rest. Or less,
+// where the board could not give way that far: it never leaves out what is
+// always drawn of the part of it nearest the middle of the view, which a
+// part piled high enough can make more than the rest of a frame (see
+// SceneLoad::floor, as of the last frame). Never less than a stroke the
+// board can leave out, though (see heavyStroke), or what it puts down would
+// only add to that.
+qsizetype CanvasView::strokeLimit() const {
+    const qint64 room = m_loadBudget - m_load.floor - m_load.editor - m_load.chrome;
+    return qsizetype(qMin(m_loadBudget / 4, qMax(room, qint64(heavyStroke) * strokeBytes)) / strokeBytes);
+}
+
 // Prepares every item on screen that is waiting to be, and then, while
-// there is time left in the frame, some of those that are not.
+// the canvas is polished and there is time left in the frame, some of those
+// that are not. Text is measured only while it is polished (`measure`).
 void CanvasView::prepareVisible(bool measure) {
     if (!m_board || m_dirty.isEmpty())
         return;
     m_polishTimer.start();
     auto ready = [this, measure](quint32 id) {
+        if (measure) {
+            m_unmeasured.remove(id);
+            m_unfitted.remove(id);
+            m_reaching.remove(id);
+        }
         const Item *item = m_board->item(id);
         if (!item)
             return;
         auto prepared = prepare(*item);
-        if (measure && item->kind == Item::Kind::Text && prepared->text) {
-            // Text is as big as its type makes it, whatever the file said.
-            const QSizeF measured = prepared->text->size();
-            const QSizeF size(item->wrap > 0 ? item->wrap : qMax(measured.width(), 2.0), measured.height());
-            if (size != item->rect.size()) {
-                m_measuring = true;
-                m_board->setMeasuredRect(id, QRectF(item->rect.topLeft(), size));
-                m_measuring = false;
+        if (measure && id != m_editing) {
+            // Text is as big as its type makes it, and a note or a shape as
+            // big as what is written on it needs, whatever the file said: as
+            // they are made when they are typed in. What is being typed in is
+            // made so as it is typed.
+            Item fitted = *item;
+            if (TextMetrics::fit(fitted, prepared->text.get())) {
+                // Telling the board places it again by its new box, and
+                // carries its connectors to its new edges, to be prepared
+                // again. Text need not be: its lines are set by where it
+                // wraps, not by its box, which only decides what it covers.
+                // A note's paper and a shape's outline are drawn again, at
+                // their new size.
+                m_measuring = id;
+                m_board->setMeasuredRect(id, fitted.rect);
+                m_measuring = 0;
+                // Whatever heard of that could have taken it off the board.
+                item = m_board->item(id);
+                if (!item)
+                    return;
+                if (item->kind == Item::Kind::Text)
+                    prepared->bounds = m_board->bounds(id);
+                else
+                    prepared = prepare(*item);
             }
         }
         m_ready.insert(id, std::shared_ptr<Prepared>(std::move(prepared)));
     };
 
-    // What is on screen has to be right in this frame.
+    // What is on screen has to be right in this frame: what is in the window,
+    // and as near it as the scene lets things in (see SceneNodes::apply()).
+    // Only that, however much of the board it leaves for the frames after.
+    // Text not measured yet is on the board at a guess of its size, a line to
+    // each paragraph, and a note or a shape not yet made big enough for what
+    // is written on it is at the size its file gave it. Either could be on
+    // screen far past where that ends: whatever could be is measured first,
+    // found by all it could cover (see placeUnmeasured()). So is anything at
+    // either end of a connector on screen, however far off it is, as the
+    // connector is drawn from where it ends. Then what is on screen, as it is
+    // now, is prepared.
     const QRectF area = visibleArea();
-    const qreal margin = qMax(area.width(), area.height()) * 0.25;
+    const qreal margin = qMax(area.width(), area.height()) * 0.05;
+    const QRectF nearby = area.adjusted(-margin, -margin, margin, margin);
     QVector<quint32> near;
-    m_board->itemsIn(area.adjusted(-margin, -margin, margin, margin), near);
+    if (measure && m_reaching.count() > 0) {
+        auto measureFirst = [&](quint32 id) {
+            if (m_unmeasured.contains(id) || m_unfitted.contains(id)) {
+                m_dirty.remove(id);
+                ready(id);
+            }
+        };
+        QVector<quint32> reaching;
+        m_reaching.query(nearby, reaching);
+        for (quint32 id : std::as_const(reaching))
+            measureFirst(id);
+        m_board->itemsIn(nearby, near);
+        for (quint32 id : std::as_const(near)) {
+            const Item *item = m_board->item(id);
+            if (!item || item->kind != Item::Kind::Connector)
+                continue;
+            const quint32 from = item->from, to = item->to;
+            measureFirst(from);
+            measureFirst(to);
+        }
+    }
+    m_board->itemsIn(nearby, near);
     for (quint32 id : std::as_const(near))
         if (m_dirty.remove(id))
             ready(id);
+    // While the scene graph synchronizes the board is not told anything, so
+    // that is all: what is on screen a polish has measured already, and text
+    // off screen may never have been, which waits for the next polish.
+    if (!measure)
+        return;
     // The rest a little each frame, so a board of any size opens at once
-    // and is all there before anyone pans to it.
+    // and is all there before anyone pans to it. Text not measured yet goes
+    // first: in type wider than its reach allows for, it could be on screen
+    // already. It is taken in turn from a line, made again whenever that runs
+    // out: the first of what is left of a set is found only by looking past
+    // every place emptied before it, which on a big board takes longer than
+    // preparing it.
     while (!m_dirty.isEmpty() && m_polishTimer.nsecsElapsed() < backgroundBudget) {
-        const quint32 id = *m_dirty.constBegin();
-        m_dirty.erase(m_dirty.constBegin());
-        ready(id);
+        if (m_waiting.isEmpty()) {
+            m_waiting = m_unmeasured.keys();
+            for (quint32 id : std::as_const(m_dirty))
+                if (!m_unmeasured.contains(id))
+                    m_waiting.append(id);
+        }
+        // What was prepared meanwhile, or taken off the board, is passed over.
+        const quint32 id = m_waiting.takeFirst();
+        if (m_dirty.remove(id) || m_unmeasured.contains(id))
+            ready(id);
+    }
+    // With all of it prepared, any text still to measure, or note or shape
+    // still to fit, was taken off the board first.
+    if (m_dirty.isEmpty()) {
+        m_waiting.clear();
+        m_unmeasured.clear();
+        m_unfitted.clear();
+        m_reaching.clear();
     }
 }
 
@@ -992,14 +1314,22 @@ ScenePlace CanvasView::placeFor(quint32 id, int layer) const {
     ScenePlace place;
     place.layer = layer;
     const QRectF bounds = m_board->bounds(id);
-    if (bounds.width() > cellSize || bounds.height() > cellSize) {
-        place.wide = true;
-        return place;
-    }
     // By its middle. However far out a board goes, the squares can be counted.
     const QPointF middle = bounds.center();
     place.column = qint32(qBound(-1e9, std::floor(middle.x() / cellSize), 1e9));
     place.row = qint32(qBound(-1e9, std::floor(middle.y() / cellSize), 1e9));
+    // Something bigger than a square is kept apart from smaller things, and
+    // has a part to itself (see SceneNodes::attach). In a part with anything
+    // else it would bring all of that into view wherever any of it came into
+    // view, and come into view itself wherever any of the rest did: long
+    // texts side by side would all be drawn while one was read, and a row
+    // of big frames while one was looked at. On its own it comes into view
+    // only where it is, and it still shares a bucket with things as big near
+    // it: a view of many of them is a few calls, not a call or two for each.
+    if (bounds.width() > cellSize || bounds.height() > cellSize) {
+        place.wide = true;
+        return place;
+    }
     const qreal partSize = cellSize / partsAcross;
     const int across = qBound(0, int((middle.x() - place.column * cellSize) / partSize), partsAcross - 1);
     const int down = qBound(0, int((middle.y() - place.row * cellSize) / partSize), partsAcross - 1);
@@ -1021,6 +1351,7 @@ void CanvasView::setLayer(quint32 id, int layer) {
 // highest thing under it that it overlaps.
 void CanvasView::relayerAll() {
     m_layersStale = false;
+    ++m_layerings;
     if (!m_board) {
         m_place.clear();
         return;
@@ -1052,22 +1383,74 @@ void CanvasView::relayerAll() {
     m_place = places;
 }
 
+// Text not measured yet, and a note or a shape not yet made big enough for
+// what is written on it, is placed by all it could cover from where it is
+// now: so whatever of it could be on screen is found by looking near the
+// screen, not at all of it, and is measured before it is drawn.
+void CanvasView::placeUnmeasured(quint32 id) {
+    QRectF reach;
+    if (m_unmeasured.contains(id))
+        reach = m_unmeasured.value(id);
+    else if (m_unfitted.contains(id))
+        reach = m_unfitted.value(id);
+    else
+        return;
+    if (m_board && m_board->item(id))
+        m_reaching.update(id, reach.translated(m_board->bounds(id).topLeft()));
+}
+
+// Text is measured as it is prepared, and a note or a shape made big enough
+// for what is written on it: until then each could be anywhere it reaches,
+// and is placed by all of that. Text comes onto the board at a guess of its
+// size however it comes (read from a file, pasted, put back by undo, changed
+// from outside), and a note or a shape at the size it came with.
+void CanvasView::markUnmeasured(quint32 id) {
+    const Item *item = m_board ? m_board->item(id) : nullptr;
+    if (!item)
+        return;
+    QRectF reach;
+    if (item->kind == Item::Kind::Text) {
+        reach = TextMetrics::reach(*item);
+        m_unmeasured.insert(id, reach);
+    } else if (item->kind == Item::Kind::Note || item->kind == Item::Kind::Shape) {
+        reach = TextMetrics::reach(*item);
+        if (reach.size() == item->rect.size())
+            return;
+        m_unfitted.insert(id, reach);
+    } else {
+        return;
+    }
+    m_reaching.update(id, reach.translated(m_board->bounds(id).topLeft()));
+}
+
 // One item's layer, after it moved or changed: worked out from what is
 // under it now, and then whatever is on top of it is kept on top of it.
 // That only ever pushes other things up, which is always right but not
 // always tidy; relayerAll() tidies, when a drag is over.
 void CanvasView::relayer(quint32 id) {
+    // Whatever it could reach moved with it.
+    placeUnmeasured(id);
     if (m_layersStale || !m_board || !m_board->item(id))
         return;
     const QRectF bounds = m_board->bounds(id);
-    const int depth = m_board->depth(id);
+    // On top of the stack, as whatever was just put down is, it is over
+    // everything it overlaps and under nothing. How deep each thing is need
+    // not be asked: after something is put down, the board would count out
+    // its whole stack again to say, and a paste puts down many.
+    const QVector<quint32> &order = m_board->order();
+    const bool onTop = !order.isEmpty() && order.constLast() == id;
+    if (!onTop)
+        ++m_depthsAsked;
+    const int depth = onTop ? int(order.size()) - 1 : m_board->depth(id);
     QVector<quint32> near;
     m_board->itemsIn(bounds, near);
     int layer = 0;
     for (quint32 other : std::as_const(near))
-        if (other != id && m_board->depth(other) < depth && m_board->bounds(other).intersects(bounds))
+        if (other != id && (onTop || m_board->depth(other) < depth) && m_board->bounds(other).intersects(bounds))
             layer = qMax(layer, m_place.value(other).layer + 1);
     setLayer(id, layer);
+    if (onTop)
+        return;
     for (quint32 other : std::as_const(near))
         if (other != id && m_board->depth(other) > depth && m_place.value(other).layer <= layer &&
             m_board->bounds(other).intersects(bounds))
@@ -1087,6 +1470,10 @@ void CanvasView::raiseLayer(quint32 id, int layer) {
 }
 
 void CanvasView::updatePolish() {
+    // The stroke being drawn, cut again for a view or a pen that has changed
+    // since: once a frame, however often they changed. First, as that can
+    // put a stroke on the board.
+    refreshPen();
     if (m_layersStale)
         relayerAll();
     if (m_board && !m_dirty.isEmpty()) {
@@ -1106,6 +1493,10 @@ void CanvasView::updatePolish() {
         prepareDecorations(m_chromeShapes);
         prepareDraft(m_draftShapes, m_draftStrokes);
     }
+    // The window is told what measuring did to the selection, and anything
+    // else of it not told yet, before the frame is drawn: what sits by the
+    // selection is drawn by it as it is in this frame, not the last.
+    tellSelection();
 }
 
 // --- Synchronizing ----------------------------------------------------------------
@@ -1127,11 +1518,14 @@ void CanvasView::buildItem(SceneNodes *scene, quint32 id, const Prepared &prepar
         home.fixed += Load::of(prepared.shapes.count() * 2, shapeBytes);
     }
     if (!prepared.image.isNull()) {
-        std::shared_ptr<QSGTexture> texture = scene->textures.value(prepared.asset).lock();
+        // Handed to the GPU the first time anything shows it, and shared
+        // from then on (see SceneNodes::textures).
+        std::shared_ptr<QSGTexture> &texture = scene->textures[prepared.image.cacheKey()];
         if (!texture) {
             // Mipmapped, so a photo zoomed far out is smooth, not sparkling.
             texture.reset(window()->createTextureFromImage(prepared.image, QQuickWindow::TextureHasMipmaps));
-            scene->textures.insert(prepared.asset, texture);
+            if (texture)
+                ++m_picturesUploaded;
         }
         if (texture) {
             home.image = window()->createImageNode();
@@ -1146,6 +1540,8 @@ void CanvasView::buildItem(SceneNodes *scene, quint32 id, const Prepared &prepar
             home.fixed += Load::of(2, imageBytes);
         }
     }
+    // Built, it holds the picture it shows itself: none is kept for it.
+    scene->keptFor.remove(id);
     if (!prepared.strokes.indices.isEmpty()) {
         auto node = [&](const Geo::StrokeMesh &mesh) {
             QSGGeometryNode *stroke = Nodes::stroke(mesh, &scene->strokeMaterial, prepared.position);
@@ -1158,7 +1554,9 @@ void CanvasView::buildItem(SceneNodes *scene, quint32 id, const Prepared &prepar
             home.strokes = node(prepared.strokes);
             home.fixed += loadOf(prepared.strokes);
         } else {
-            // A long stroke, at every level; the bucket lets one in.
+            // A long stroke or part of the diagram, at every level; the
+            // bucket lets one in.
+            home.diagram = prepared.diagram;
             home.detail[0] = node(prepared.strokes);
             home.detailLoad[0] = loadOf(prepared.strokes);
             for (int level = 1; level < detailLevels; ++level) {
@@ -1228,6 +1626,19 @@ QSGNode *CanvasView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *) {
 
     if (m_sceneReset) {
         scene->clear();
+        // All of the board is built again, what is on screen in this frame
+        // and the rest in the frames after. A picture the GPU has is kept for
+        // each thing on it that will show it, until that is built: let go of
+        // with this frame, those off screen would be handed to the GPU again
+        // as they are built. One that nothing on it shows is let go of with
+        // this frame, and so is one read anew, as another board's pictures
+        // are. (The GUI thread is waiting on this one, so the board and the
+        // pictures read are safe to look at.)
+        if (m_board)
+            for (quint32 id : m_board->order())
+                if (const Item *item = m_board->item(id); item->kind == Item::Kind::Image)
+                    if (auto texture = scene->textures.value(m_images->alreadyRead(item->asset).cacheKey()))
+                        scene->keptFor.insert(id, std::move(texture));
         m_gone.clear();
         m_moved.clear();
         m_rehome.clear();
@@ -1242,6 +1653,10 @@ QSGNode *CanvasView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *) {
         m_built.insert(it.key());
     }
     m_ready.clear();
+    // A picture nothing shows any more is let go of only now that every item
+    // of this frame is built: an item built again lets go of its picture as
+    // it starts over, and has it back by the end.
+    m_picturesHeld = scene->letGoOfPictures();
 
     // An item that only moved keeps its nodes: they are slid to where it is.
     for (quint32 id : std::as_const(m_moved))
@@ -1255,17 +1670,52 @@ QSGNode *CanvasView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *) {
         scene->rehome(id, m_place.value(id));
     m_rehome.clear();
 
-    // With the board as it now is: what of it this frame draws. The text
+    // What is being drawn, and the selection's chrome.
+    if (m_chromeReady) {
+        m_chromeReady = false;
+        setMesh(scene->draft, scene->draftShapes, m_draftShapes, &scene->shapeMaterial);
+        setMesh(scene->draft, scene->draftStrokes, m_draftStrokes, &scene->strokeMaterial);
+        setMesh(scene->chrome, scene->chromeShapes, m_chromeShapes, &scene->shapeMaterial);
+        scene->draftLoad = Load::of(m_draftShapes.count() * 2, shapeBytes);
+        scene->draftLoad += Load::of(m_draftStrokes.indices.size() / 3, strokeBytes);
+        scene->chromeLoad = Load::of(m_chromeShapes.count() * 2, shapeBytes);
+    }
+
+    // With the board as it now is: what of it this frame draws. What is
+    // being drawn is drawn whole, as is the selection's chrome, and the text
     // being written is drawn by the editor, every letter of it whether in
-    // view or not, so what that asks for comes out of what the board may.
+    // view or not, so what those ask for comes out of what the board may.
     bool waiting = false;
     const bool was = m_load.reduced;
     const Item *written = editing() && m_board ? m_board->item(m_editing) : nullptr;
     const qint64 editor = written ? qint64(written->text.size()) * 2 * glyphBytes : 0;
-    m_load = scene->apply(visibleArea(), m_zoom * devicePixels(), qMax<qint64>(0, m_loadBudget - editor),
-                          m_drawEverything, &waiting);
+    const qint64 draft = scene->draftLoad.bytes, chrome = scene->chromeLoad.bytes;
+    // A stroke that has gone on the board in pieces keeps all the room one
+    // may have until the pen is lifted: the board does not take back what
+    // each piece leaves it, only to give it up again as the next one grows,
+    // which would show and hide its detail over and over.
+    const qint64 drawing =
+        m_drag == Drag::Stroke && m_strokeGroup ? qMax(draft, qint64(strokeLimit()) * strokeBytes) : draft;
+    m_load = scene->apply(visibleArea(), m_zoom * devicePixels(),
+                          qMax<qint64>(0, m_loadBudget - editor - drawing - chrome), m_drawEverything,
+                          m_drag == Drag::Stroke ? m_strokePieces : QVector<quint32>(), &waiting);
+    // The board never leaves out the part of it nearest the middle of the
+    // view, so a view that has just come to a part piled higher than the
+    // stroke being drawn was cut to leave room for can leave it less than
+    // that. This frame goes without the stroke then, and it is put down
+    // before the next (see refreshPen()): it never makes a frame more than
+    // it may be.
+    const bool fits = m_drag != Drag::Stroke || m_load.bytes + editor + draft + chrome <= m_loadBudget;
+    place(scene->content, scene->draft, fits);
     m_load.editor = editor;
+    m_load.draft = fits ? draft : 0;
+    m_load.chrome = chrome;
     if (waiting)
+        QMetaObject::invokeMethod(this, &CanvasView::requestFrame, Qt::QueuedConnection);
+    // A stroke being drawn that is more than this frame turned out to leave
+    // room for is put down before the next (see refreshPen()), whether or
+    // not the pen moves on.
+    if (m_drag == Drag::Stroke && full(m_pen))
         QMetaObject::invokeMethod(this, &CanvasView::requestFrame, Qt::QueuedConnection);
     if (m_load.reduced != was)
         QMetaObject::invokeMethod(this, &CanvasView::loadChanged, Qt::QueuedConnection);
@@ -1286,34 +1736,10 @@ QSGNode *CanvasView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *) {
             scene->grid->markDirty(QSGNode::DirtyGeometry);
         }
 
-        // Two grids a factor of two apart; the finer fades out as zooming
-        // out crowds its dots.
-        qreal spacing = 24;
-        while (spacing * m_zoom < 16)
-            spacing *= 2;
-        while (spacing * m_zoom >= 32)
-            spacing /= 2;
         GridMaterial &grid = scene->gridMaterial;
-        grid.zoom = float(m_zoom);
-        grid.spacing = float(spacing);
-        grid.fade = float(qBound(0.0, (spacing * m_zoom - 16) / 8, 1.0));
-        grid.dpr = float(devicePixels());
-        grid.radius = grid.dpr;
+        grid.follow(matrix, m_zoom, devicePixels());
         grid.color = m_palette.selection;
-        // The canvas point at the corner, wrapped to the grid in double
-        // precision here so the shader's floats stay small and exact however
-        // far the board has been panned.
-        const qreal period = spacing * 2;
-        grid.origin = QVector2D(float(std::fmod(-matrix(0, 3) / m_zoom, period)),
-                                float(std::fmod(-matrix(1, 3) / m_zoom, period)));
         scene->grid->markDirty(QSGNode::DirtyMaterial);
-    }
-
-    if (m_chromeReady) {
-        m_chromeReady = false;
-        setMesh(scene->draft, scene->draftShapes, m_draftShapes, &scene->shapeMaterial);
-        setMesh(scene->draft, scene->draftStrokes, m_draftStrokes, &scene->strokeMaterial);
-        setMesh(scene->chrome, scene->chromeShapes, m_chromeShapes, &scene->shapeMaterial);
     }
     return scene;
 }

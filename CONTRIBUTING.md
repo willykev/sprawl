@@ -5,8 +5,9 @@ Bug reports, small improvements, and translations are welcome. Open an
 
 ## Build and test
 
-On Arch Linux, install `base-devel`, `qt6-base`, `qt6-declarative`, `qt6-svg`,
-and `qt6-wayland`. Sprawl also uses `xdg-desktop-portal` for file dialogs.
+On Arch Linux, install `base-devel`, `qt6-base`, `qt6-declarative`,
+`qt6-imageformats`, `qt6-svg`, and `qt6-wayland`. Sprawl also uses
+`xdg-desktop-portal` for file dialogs.
 
 ```sh
 bin/build
@@ -17,6 +18,9 @@ build/sprawl open
 The tests run offscreen with temporary data. Keep changes focused, add a
 regression test for a bug fix, and describe how you checked the result in
 your pull request. Follow the surrounding C++ and QML style.
+
+One test looks at exported PDFs with Qt's own PDF reader, which comes with
+`qt6-webengine`; where that is not installed, the test is skipped.
 
 The [full guide](docs/guide.md) covers the app's behavior and data format.
 Contributions use the project's [MIT license](LICENSE).

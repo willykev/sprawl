@@ -88,8 +88,9 @@ Rectangle {
                 }
 
                 Rectangle {
+                    objectName: "color-" + swatch.modelData
                     anchors.fill: parent
-                    color: bar.paper ? theme.note(swatch.modelData) : theme.swatch(swatch.modelData)
+                    color: bar.paper ? theme.notes[swatch.modelData] : theme.swatches[swatch.modelData]
                     radius: Math.min(2, theme.radius)
                     opacity: swatchArea.containsMouse || swatch.current ? 1 : 0.92
                 }

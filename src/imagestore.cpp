@@ -18,8 +18,10 @@ QImage ImageStore::read(const QString &path) {
     // Photos carry their rotation beside the pixels.
     reader.setAutoTransform(true);
     const QSize size = reader.size();
+    // Brought down to the longest side kept, a picture far longer than it is
+    // wide is still a pixel across: at none, it would not be read at all.
     if (size.isValid() && qMax(size.width(), size.height()) > longestSide)
-        reader.setScaledSize(size.scaled(longestSide, longestSide, Qt::KeepAspectRatio));
+        reader.setScaledSize(size.scaled(longestSide, longestSide, Qt::KeepAspectRatio).expandedTo(QSize(1, 1)));
     const QImage image = reader.read();
     // The format the GPU takes as it is.
     return image.isNull() ? image : image.convertToFormat(QImage::Format_RGBA8888_Premultiplied);

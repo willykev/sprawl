@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "geometry.h"
+#include "textlayout.h"
 
 namespace {
 
@@ -39,6 +40,57 @@ const QStringList dashNames{"solid", "dashed", "dotted"};
 // files short and stable.
 double rounded(qreal value) { return std::round(value * 100) / 100; }
 
+// The least a box (a note, a shape, a picture, a frame) is across and down.
+// Nothing smaller could be seen or picked, and Sprawl 0.1.0 opens no board
+// with a smaller box in it, so none is ever saved.
+const qreal smallestBox = 1;
+
+// A side less than that, or one that is no number at all, which a file has no
+// way to say either.
+bool tooShort(qreal side) { return !(side >= smallestBox); }
+
+// A box smaller than that, as a picture far wider than tall is once it is
+// brought down to a size to arrange.
+bool tooSmall(const Item &item) {
+    return item.isBox() && (tooShort(item.rect.width()) || tooShort(item.rect.height()));
+}
+
+// A point farther out than a file has anything, either way, or one that is
+// no number at all; and the nearest to it that a file can have.
+bool beyond(QPointF point) { return !(qAbs(point.x()) <= Item::farthest && qAbs(point.y()) <= Item::farthest); }
+QPointF within(QPointF point) {
+    const qreal far = Item::farthest;
+    return QPointF(qBound(-far, point.x(), far), qBound(-far, point.y(), far));
+}
+
+// An item with its corner out there, or an end of a connector, as one nudged,
+// dragged or pasted past the edge of the board would have.
+bool tooFar(const Item &item) {
+    return item.kind == Item::Kind::Connector ? beyond(item.p1) || beyond(item.p2) : beyond(item.rect.topLeft());
+}
+
+// The item as a board holds it, whatever it was given as: no more text than
+// an item holds, a box at least the smallest across and down, grown from its
+// top left corner as one read from a file is, and nothing farther out than a
+// file has anything, which would be saved as a board that could not be read
+// back.
+Item held(Item item) {
+    item.text = Item::fitted(item.text);
+    if (item.isBox()) {
+        if (tooShort(item.rect.width()))
+            item.rect.setWidth(smallestBox);
+        if (tooShort(item.rect.height()))
+            item.rect.setHeight(smallestBox);
+    }
+    if (item.kind == Item::Kind::Connector) {
+        item.p1 = within(item.p1);
+        item.p2 = within(item.p2);
+    } else {
+        item.rect.moveTo(within(item.rect.topLeft()));
+    }
+    return item;
+}
+
 Item::Shape outlineOf(const Item &item) { return item.kind == Item::Kind::Shape ? item.shape : Item::Shape::Rect; }
 
 // Everything the same except where the item is.
@@ -51,6 +103,73 @@ bool movedOnly(const Item &before, const Item &after) {
     return moved == before;
 }
 
+// An item as a file has it, less where the attached ends of a connector are:
+// those are worked out from what they are attached to, a little differently
+// by whatever measured its text. What one version of an item is told from
+// another by.
+QJsonObject asWritten(const Item &item) {
+    QJsonObject object = Board::itemToJson(item);
+    if (item.kind == Item::Kind::Connector) {
+        if (item.from) {
+            object.remove("x1");
+            object.remove("y1");
+        }
+        if (item.to) {
+            object.remove("x2");
+            object.remove("y2");
+        }
+    }
+    return object;
+}
+
+// A version of an item the history keeps, with what a file changed of the
+// item since the board last had it, from `was` to `now` (as asWritten() has
+// them), changed in it too. An item the file made another kind of thing is
+// what the file has.
+Item withChanges(const Item &version, const QJsonObject &was, const QJsonObject &now) {
+    QJsonObject object = now;
+    if (was.value("type") == now.value("type")) {
+        object = Board::itemToJson(version);
+        const QStringList keys = was.keys() + now.keys();
+        for (const QString &key : keys) {
+            if (was.value(key) == now.value(key))
+                continue;
+            if (now.contains(key))
+                object.insert(key, now.value(key));
+            else
+                object.remove(key);
+        }
+    }
+    Item item;
+    return Board::itemFromJson(object, item).isEmpty() ? item : version;
+}
+
+// The most an id can be, as a file says it.
+const quint32 mostId = 4000000000u;
+
+// The last id a file says it gave, to an item it has since taken away: a
+// whole number, as an id is. Said some other way, it is no help, and nothing
+// to refuse the file for.
+quint32 lastIdOf(const QJsonObject &root) {
+    const QJsonValue value = root.value("lastId");
+    const double read = value.toDouble(-1);
+    return value.isDouble() && read >= 0 && read <= mostId && read == std::floor(read) ? quint32(read) : 0;
+}
+
+// The id to give next: the one after `last`, the last id given, which it
+// then is. Past the most an id can be, which only a file that says it gave
+// ids that far brings about, a board could not be read back: there it is
+// the first id not among those `used` gives.
+quint32 nextId(quint32 &last, const std::function<QSet<quint32>()> &used) {
+    if (last < mostId)
+        return ++last;
+    const QSet<quint32> taken = used();
+    quint32 id = 1;
+    while (taken.contains(id))
+        ++id;
+    return id;
+}
+
 // A text item's size before its type has been measured: close for the
 // monospace type boards are written in.
 QSizeF estimatedTextSize(const Item &item) {
@@ -60,6 +179,25 @@ QSizeF estimatedTextSize(const Item &item) {
         longest = qMax(longest, line.size());
     const qreal width = item.wrap > 0 ? item.wrap : longest * item.fontSize * 0.6;
     return QSizeF(width, qMax<qsizetype>(1, lines.size()) * std::ceil(item.fontSize * 1.32));
+}
+
+// The most room a connector's label can take, for the board to say what the
+// connector covers without laying out its type. A letter of the board's
+// monospace type is a little over 0.6 of its size across once hinted to
+// whole pixels, so 0.7 is room enough, and a wide one (Chinese, Japanese,
+// Korean, an emoji) twice that: every character from where the wide ones
+// start is taken to be one. A line, in the scripts whose type is tallest, is
+// near three times the size.
+QSizeF mostLabelSize(const QString &text) {
+    qsizetype widest = 0, lines = 0;
+    for (const QStringView line : QStringView(text).split(u'\n')) {
+        qsizetype letters = 0;
+        for (const QChar c : line)
+            letters += !c.isSurrogate() && c.unicode() >= 0x1100 ? 2 : 1;
+        widest = qMax(widest, letters);
+        ++lines;
+    }
+    return QSizeF(widest * TextMetrics::small * 0.7, lines * TextMetrics::small * 3);
 }
 
 } // namespace
@@ -91,43 +229,56 @@ int Board::depth(quint32 id) const {
     return m_depths.value(id, -1);
 }
 
-QRectF Board::boundsFor(const Item &item) {
+QRectF Board::boundsFor(const Item &item, const QRectF &laidOut) {
     switch (item.kind) {
     case Item::Kind::Stroke: {
+        // What is drawn is the curve through its points (see Geo::smooth()),
+        // which can bend out past the box around them: round a corner given
+        // only once, as a file or a stroke drawn before corners were kept
+        // has them, and between the points of a bend.
         const qreal reach = item.width / 2 + 1;
-        return item.rect.adjusted(-reach, -reach, reach, reach);
+        const QRectF curve = Geo::boundsOf(Geo::smooth(item.points, Geo::strokeTolerance));
+        return (item.rect | curve.translated(item.rect.topLeft())).adjusted(-reach, -reach, reach, reach);
     }
     case Item::Kind::Connector: {
         // Room for what is at its ends, and for the label beside the middle.
         const qreal reach = 8 + 3 * item.width;
         QRectF bounds = item.rect.adjusted(-reach, -reach, reach, reach);
-        if (!item.text.isEmpty()) {
-            const qreal half = item.text.size() * 3.5 + 16;
-            const QPointF middle = item.rect.center();
-            bounds |= QRectF(middle.x() - half, middle.y() - 24, half * 2, 48);
+        if (!laidOut.isNull()) {
+            bounds |= laidOut;
+        } else if (!item.text.isEmpty()) {
+            // A guess at it: where the window puts a label as big as its text
+            // can make one, whichever way the line runs. A smaller one sits
+            // nearer the line, so it is where the window puts one of any size
+            // up to that, each corner rounded to a whole unit.
+            const QSizeF most = mostLabelSize(item.text);
+            for (const QSizeF size : {most, QSizeF(most.width(), 0), QSizeF(0, most.height())})
+                bounds |= QRectF(TextMetrics::connectorLabelCorner(item, size), size).adjusted(-1, -1, 1, 1);
         }
         return bounds;
     }
     case Item::Kind::Frame:
-        // The title sits on the top edge.
-        return item.rect.adjusted(-1, -10, 1, 1);
+        // The title sits on the top edge. One longer than the edge runs past
+        // its end, which only `laidOut` knows.
+        return item.rect.adjusted(-1, -10, 1, 1) | laidOut;
     default:
         return item.rect;
     }
 }
 
+// What each item covers was worked out as it was set (see bounds()).
 QRectF Board::contentBounds() const {
     QRectF all;
-    for (const Item &item : m_items)
-        all = all.isNull() ? boundsFor(item) : all | boundsFor(item);
+    for (auto it = m_items.cbegin(); it != m_items.cend(); ++it)
+        all = all.isNull() ? bounds(it.key()) : all | bounds(it.key());
     return all;
 }
 
 QRectF Board::contentBounds(const QVector<quint32> &ids) const {
     QRectF all;
     for (quint32 id : ids)
-        if (const Item *found = item(id))
-            all = all.isNull() ? boundsFor(*found) : all | boundsFor(*found);
+        if (item(id))
+            all = all.isNull() ? bounds(id) : all | bounds(id);
     return all;
 }
 
@@ -311,6 +462,7 @@ void Board::begin() {
     if (m_open)
         commit();
     m_open = true;
+    m_revisionBefore = m_revision;
 }
 
 void Board::touch(quint32 id) {
@@ -325,12 +477,17 @@ void Board::rememberOrder() {
     m_orderBefore = m_order;
 }
 
+void Board::hold(quint32 id) {
+    if (m_open && m_items.contains(id))
+        touch(id);
+}
+
 quint32 Board::add(Item item) {
     const bool alone = !m_open;
     if (alone)
         begin();
-    item.text = Item::fitted(item.text);
-    item.id = ++m_lastId;
+    item = held(item);
+    item.id = nextId(m_lastId, [this] { return idsInUse(); });
     m_created.insert(item.id);
     place(item);
     m_order.append(item.id);
@@ -338,17 +495,17 @@ quint32 Board::add(Item item) {
     const quint32 id = item.id;
     emit itemChanged(id, Change::Added);
     refreshConnector(id);
+    revise();
     if (alone)
         commit();
     return id;
 }
 
 void Board::set(const Item &item) {
-    if (item.text.size() > Item::longestText) {
-        // No more text than an item holds, whoever is asking.
-        Item fitted = item;
-        fitted.text = Item::fitted(item.text);
-        set(fitted);
+    if (item.text.size() > Item::longestText || tooSmall(item) || tooFar(item)) {
+        // No more text than an item holds, no box smaller than a file holds,
+        // and nothing farther out than it holds, whoever is asking.
+        set(held(item));
         return;
     }
     const auto found = m_items.find(item.id);
@@ -362,12 +519,18 @@ void Board::set(const Item &item) {
     unlink(before);
     *found = item;
     link(item);
-    m_grid.update(item.id, boundsFor(item));
+    // An item that only moved covers what it did, as far over. What a stroke
+    // covers takes its whole curve to work out, which is not done again on
+    // every move of a drag.
+    const bool moved = movedOnly(before, item);
+    m_grid.update(item.id, moved ? m_grid.bounds(item.id).translated(item.rect.topLeft() - before.rect.topLeft())
+                                 : boundsFor(item));
     m_lastGroup = qMax(m_lastGroup, item.group);
-    emit itemChanged(item.id, movedOnly(before, item) ? Change::Moved : Change::Edited);
+    emit itemChanged(item.id, moved ? Change::Moved : Change::Edited);
     refreshConnector(item.id);
     if (before.rect != item.rect || before.shape != item.shape)
         refreshConnectorsOf(item.id);
+    revise();
     if (alone)
         commit();
 }
@@ -393,6 +556,52 @@ void Board::remove(quint32 id) {
     m_order.removeOne(id);
     m_depthsStale = true;
     emit itemChanged(id, Change::Removed);
+    revise();
+    if (alone)
+        commit();
+}
+
+void Board::remove(const QVector<quint32> &ids) {
+    // What goes, in the order removing each in turn takes it: an item's
+    // connectors, then the item.
+    QVector<quint32> going;
+    QSet<quint32> gone;
+    auto take = [&](quint32 id) {
+        if (!gone.contains(id)) {
+            gone.insert(id);
+            going.append(id);
+        }
+    };
+    for (quint32 id : ids) {
+        if (!m_items.contains(id) || gone.contains(id))
+            continue;
+        const QVector<quint32> connectors = m_links.values(id);
+        for (quint32 connector : connectors)
+            if (m_items.contains(connector))
+                take(connector);
+        take(id);
+    }
+    if (going.isEmpty())
+        return;
+    const bool alone = !m_open;
+    if (alone)
+        begin();
+    for (quint32 id : std::as_const(going)) {
+        if (m_created.contains(id)) {
+            m_created.remove(id);
+        } else {
+            touch(id);
+            rememberOrder();
+        }
+        erase(id);
+    }
+    m_order.removeIf([&gone](quint32 id) { return gone.contains(id); });
+    m_depthsStale = true;
+    // Said once they are all gone, so that whoever hears of one finds the
+    // board as it is from now on.
+    for (quint32 id : std::as_const(going))
+        emit itemChanged(id, Change::Removed);
+    revise();
     if (alone)
         commit();
 }
@@ -421,6 +630,7 @@ void Board::restack(const QVector<quint32> &ids, bool toFront) {
         m_order = order;
         m_depthsStale = true;
         emit orderChanged();
+        revise();
     }
     if (alone)
         commit();
@@ -470,14 +680,19 @@ Board::Command Board::close() {
 bool Board::commit() {
     if (!m_open)
         return false;
+    // Empty text written as it was while the step was under way, and kept
+    // by it, is written as it is from now on: a change to what the file
+    // holds.
+    const bool standingIn = !writtenInstead().isEmpty();
     const Command command = close();
+    if (standingIn)
+        revise();
     if (command.isEmpty())
         return false;
     m_undo.append(command);
     if (m_undo.size() > historyLimit)
         m_undo.removeFirst();
     m_redo.clear();
-    changedSinceSave();
     emit historyChanged();
     return true;
 }
@@ -488,6 +703,12 @@ void Board::rollback() {
     const Command command = close();
     if (!command.isEmpty())
         apply(command, false);
+    // Back to just what it held when the step began, which is that revision
+    // again: a file written before the step still holds it.
+    if (m_revision != m_revisionBefore) {
+        m_revision = m_revisionBefore;
+        emit modified();
+    }
 }
 
 void Board::apply(const Command &command, bool forward) {
@@ -534,10 +755,15 @@ void Board::apply(const Command &command, bool forward) {
         m_order.insert(at < 0 ? m_order.size() : qMin<qsizetype>(at, m_order.size()), id);
     m_depthsStale = true;
 
-    // Connectors follow whatever moved under them.
+    // Connectors follow whatever moved under them. One still attached to an
+    // item that went was attached to it by no step of the history, but from
+    // outside (see merge()): it is let go of where it was, as it is when the
+    // file takes the item away.
     for (const Edit &edit : command) {
-        if (!existsTo(edit))
+        if (!existsTo(edit)) {
+            refreshConnectorsOf(edit.id);
             continue;
+        }
         refreshConnector(edit.id);
         refreshConnectorsOf(edit.id);
     }
@@ -561,7 +787,7 @@ void Board::undo() {
     const Command command = m_undo.takeLast();
     apply(command, false);
     m_redo.append(command);
-    changedSinceSave();
+    revise();
     emit historyChanged();
 }
 
@@ -571,13 +797,304 @@ void Board::redo() {
     const Command command = m_redo.takeLast();
     apply(command, true);
     m_undo.append(command);
-    changedSinceSave();
+    revise();
     emit historyChanged();
 }
 
-void Board::changedSinceSave() {
-    ++m_revision;
+// What it holds changed: a new revision, by a number it has never had before.
+void Board::revise() {
+    m_revision = ++m_lastRevision;
     emit modified();
+}
+
+// --- Changes from outside ---------------------------------------------------------
+
+// Every id the board has some use for: its items', the ones the step under
+// way and the history keep, and those their connectors' ends are on.
+QSet<quint32> Board::idsInUse() const {
+    QSet<quint32> ids;
+    auto use = [&ids](const Item &item) {
+        ids.insert(item.id);
+        ids.insert(item.from);
+        ids.insert(item.to);
+    };
+    for (const Item &item : m_items)
+        use(item);
+    for (const Item &item : m_before)
+        use(item);
+    for (quint32 id : m_created)
+        ids.insert(id);
+    for (const QVector<Command> *history : {&m_undo, &m_redo})
+        for (const Command &command : *history)
+            for (const Edit &edit : command) {
+                use(edit.before);
+                use(edit.after);
+            }
+    ids.remove(0);
+    return ids;
+}
+
+void Board::renumber(quint32 from, quint32 to) {
+    if (from == 0 || to == 0 || from == to || m_items.contains(to))
+        return;
+    auto swap = [from, to](quint32 &id) {
+        if (id == from)
+            id = to;
+    };
+    // A copy of any item, as anything keeps one: its own id, and the ids of
+    // what its ends are on.
+    auto swapIn = [&swap](Item &item) {
+        swap(item.id);
+        swap(item.from);
+        swap(item.to);
+    };
+
+    // The connectors attached to it, and it when it is one, are linked
+    // again under the new id.
+    QSet<quint32> joined;
+    for (quint32 connector : m_links.values(from))
+        joined.insert(connector);
+    const bool here = m_items.contains(from);
+    if (here && m_items.value(from).kind == Item::Kind::Connector)
+        joined.insert(from);
+    for (quint32 id : std::as_const(joined))
+        unlink(m_items.value(id));
+    if (here) {
+        Item item = m_items.take(from);
+        item.id = to;
+        m_items.insert(to, item);
+        m_grid.remove(from);
+        m_grid.insert(to, boundsFor(item));
+        std::replace(m_order.begin(), m_order.end(), from, to);
+        m_depthsStale = true;
+    }
+    QSet<quint32> connectors;
+    for (quint32 id : std::as_const(joined)) {
+        swap(id);
+        Item &connector = m_items[id];
+        swapIn(connector);
+        link(connector);
+        connectors.insert(id);
+    }
+
+    // The step under way, and the history, have it by its new id too.
+    if (m_before.contains(from))
+        m_before.insert(to, m_before.take(from));
+    for (Item &item : m_before)
+        swapIn(item);
+    if (m_created.remove(from))
+        m_created.insert(to);
+    if (m_restacked.remove(from))
+        m_restacked.insert(to);
+    std::replace(m_orderBefore.begin(), m_orderBefore.end(), from, to);
+    for (QVector<Command> *history : {&m_undo, &m_redo})
+        for (Command &command : *history)
+            for (Edit &edit : command) {
+                swap(edit.id);
+                swapIn(edit.before);
+                swapIn(edit.after);
+            }
+    m_lastId = qMax(m_lastId, to);
+
+    emit renumbered(from, to);
+    if (here) {
+        emit itemChanged(from, Change::Removed);
+        emit itemChanged(to, Change::Added);
+        emit orderChanged();
+    }
+    for (quint32 id : std::as_const(connectors))
+        if (id != to)
+            emit itemChanged(id, Change::Edited);
+    // What a step under way would go back to has the new id as well.
+    if (m_open)
+        m_revisionBefore = ++m_lastRevision;
+    revise();
+}
+
+Board::Merged Board::merge(const QVector<Item> &base, const QVector<Item> &theirs, quint32 lastId) {
+    Merged merged;
+    // Nothing made here is given an id the file gave, to an item it still
+    // has or one it took away again.
+    m_lastId = qMax(m_lastId, lastId);
+    // Each item as the file had it and has it now, by id, and in its order.
+    QHash<quint32, QJsonObject> was, now;
+    QHash<quint32, Item> incoming;
+    QVector<quint32> wasOrder, nowOrder;
+    for (const Item &item : base) {
+        was.insert(item.id, asWritten(item));
+        wasOrder.append(item.id);
+    }
+    quint32 highest = m_lastId;
+    for (const Item &item : theirs) {
+        now.insert(item.id, asWritten(item));
+        nowOrder.append(item.id);
+        incoming.insert(item.id, item);
+        highest = qMax(highest, item.id);
+    }
+
+    // The file's new items keep their ids. What the board has by one of them
+    // is numbered anew: nothing it made reached the file under that id.
+    // (Unless the file has it just as it is here: then it is no other item.)
+    QVector<quint32> fresh;
+    for (quint32 id : std::as_const(nowOrder))
+        if (!was.contains(id))
+            fresh.append(id);
+    const QSet<quint32> inUse = fresh.isEmpty() ? QSet<quint32>() : idsInUse();
+    for (quint32 id : std::as_const(fresh)) {
+        if (!inUse.contains(id))
+            continue;
+        const Item *mine = item(id);
+        if (mine && asWritten(*mine) == now.value(id))
+            continue;
+        renumber(id, nextId(highest, [&] { return idsInUse() + QSet<quint32>(nowOrder.cbegin(), nowOrder.cend()); }));
+    }
+
+    // What the board changed since the file was last read or written, and
+    // whatever the step under way is about.
+    auto changedHere = [&](quint32 id) {
+        if (m_before.contains(id) || m_created.contains(id))
+            return true;
+        const Item *mine = item(id);
+        const auto found = was.constFind(id);
+        if (!mine || found == was.constEnd())
+            return bool(mine) != (found != was.constEnd());
+        return asWritten(*mine) != *found;
+    };
+    // Everything the file has or had: the new in its order, then the gone.
+    QVector<quint32> ids = nowOrder;
+    for (quint32 id : std::as_const(wasOrder))
+        if (!now.contains(id))
+            ids.append(id);
+    // What the board takes of what the file changed: items it added, in its
+    // order; items it changed, and how; and items it took away.
+    QVector<quint32> arriving;
+    QHash<quint32, Change> replaced;
+    QSet<quint32> gone;
+    for (quint32 id : std::as_const(ids)) {
+        const auto before = was.constFind(id), after = now.constFind(id);
+        const bool had = before != was.constEnd(), has = after != now.constEnd();
+        if (had == has && (!has || *before == *after))
+            continue;
+        if (changedHere(id)) {
+            const Item *mine = item(id);
+            if (mine ? !has || asWritten(*mine) != *after : has)
+                ++merged.kept;
+            continue;
+        }
+        ++merged.taken;
+        if (!has) {
+            gone.insert(id);
+            erase(id);
+            continue;
+        }
+        Item target = incoming.value(id);
+        const auto found = m_items.find(id);
+        if (found == m_items.end()) {
+            arriving.append(id);
+            place(target);
+            continue;
+        }
+        const Item current = *found;
+        // Text set as it was here is as big as it was measured to be.
+        if (target.kind == Item::Kind::Text && current.kind == Item::Kind::Text && target.text == current.text &&
+            target.fontSize == current.fontSize && target.wrap == current.wrap && target.bold == current.bold)
+            target.rect.setSize(current.rect.size());
+        unlink(current);
+        *found = target;
+        link(target);
+        m_grid.update(id, boundsFor(target));
+        m_lastGroup = qMax(m_lastGroup, target.group);
+        replaced.insert(id, movedOnly(current, target) ? Change::Moved : Change::Edited);
+    }
+
+    // The stack: as it is here, less what the file took away, and with what
+    // it added on top. What all three have, the file restacked, and the
+    // board did not, takes the file's order, each in a place one of them had
+    // here.
+    QVector<quint32> order = m_order;
+    order.removeIf([&gone](quint32 id) { return gone.contains(id); });
+    QSet<quint32> shared;
+    for (quint32 id : std::as_const(wasOrder))
+        if (now.contains(id) && m_items.contains(id))
+            shared.insert(id);
+    auto sharedOf = [&shared](const QVector<quint32> &stack) {
+        QVector<quint32> found;
+        for (quint32 id : stack)
+            if (shared.contains(id))
+                found.append(id);
+        return found;
+    };
+    const QVector<quint32> there = sharedOf(nowOrder);
+    if (there != sharedOf(wasOrder) && sharedOf(order) == sharedOf(wasOrder)) {
+        auto next = there.constBegin();
+        for (quint32 &id : order)
+            if (shared.contains(id))
+                id = *next++;
+        merged.restacked = true;
+    }
+    order += arriving;
+    const bool restacked = order != m_order;
+    if (restacked) {
+        m_order = order;
+        m_depthsStale = true;
+    }
+    if (m_orderRemembered) {
+        m_orderBefore.removeIf([&gone](quint32 id) { return gone.contains(id); });
+        m_orderBefore += arriving;
+    }
+
+    // Said once the board is whole again. Connectors follow what moved under
+    // them, and one whose item went is left free where it was.
+    for (quint32 id : std::as_const(gone))
+        emit itemChanged(id, Change::Removed);
+    for (quint32 id : std::as_const(arriving))
+        emit itemChanged(id, Change::Added);
+    for (auto it = replaced.constBegin(); it != replaced.constEnd(); ++it)
+        emit itemChanged(it.key(), it.value());
+    if (restacked)
+        emit orderChanged();
+    for (quint32 id : std::as_const(gone))
+        refreshConnectorsOf(id);
+    for (const QVector<quint32> &changes : {arriving, replaced.keys()})
+        for (quint32 id : changes) {
+            refreshConnector(id);
+            refreshConnectorsOf(id);
+        }
+
+    // The history goes on undoing what was done here: what the file changed
+    // of an item is in every version of it the history keeps, and what the
+    // file took away is out of it.
+    bool shortened = false;
+    for (QVector<Command> *history : {&m_undo, &m_redo}) {
+        for (Command &command : *history) {
+            command.removeIf([&gone](const Edit &edit) { return gone.contains(edit.id); });
+            for (Edit &edit : command) {
+                if (!replaced.contains(edit.id))
+                    continue;
+                const QJsonObject &then = was[edit.id], &since = now[edit.id];
+                if (edit.existedBefore)
+                    edit.before = withChanges(edit.before, then, since);
+                if (edit.existsAfter)
+                    edit.after = withChanges(edit.after, then, since);
+            }
+        }
+        shortened |= history->removeIf([](const Command &command) { return command.isEmpty(); }) > 0;
+    }
+
+    if (!arriving.isEmpty() || !replaced.isEmpty() || !gone.isEmpty() || restacked) {
+        // What a step under way would go back to has the file's changes too.
+        if (m_open)
+            m_revisionBefore = ++m_lastRevision;
+        revise();
+    }
+    if (shortened)
+        emit historyChanged();
+
+    const QVector<Item> written = itemsToWrite();
+    merged.ahead = written.size() != nowOrder.size();
+    for (qsizetype i = 0; !merged.ahead && i < written.size(); ++i)
+        merged.ahead = written[i].id != nowOrder[i] || asWritten(written[i]) != now.value(nowOrder[i]);
+    return merged;
 }
 
 // --- Files --------------------------------------------------------------------
@@ -688,7 +1205,7 @@ QString Board::itemFromJson(const QJsonObject &object, Item &item) {
         if (value.isUndefined())
             return 0;
         const double read = value.toDouble(-1);
-        if (!value.isDouble() || read < 0 || read > 4e9 || read != std::floor(read)) {
+        if (!value.isDouble() || read < 0 || read > mostId || read != std::floor(read)) {
             if (problem.isEmpty())
                 problem = QString("\"%1\" must be a whole number").arg(key);
             return 0;
@@ -720,10 +1237,14 @@ QString Board::itemFromJson(const QJsonObject &object, Item &item) {
                           .arg(one, said(value.toString()), many, names.join(", "));
         return qMax(0, index);
     };
-    const double far = 1e9;
+    const double far = Item::farthest;
     auto box = [&](double width, double height) {
         const double x = number("x", true, 0, -far, far), y = number("y", true, 0, -far, far);
-        item.rect = QRectF(x, y, number("w", false, width, 1, far), number("h", false, height, 1, far));
+        // Less than the smallest box across or down is read as the smallest,
+        // as a board holds it: 0.1.0 saved pictures far wider than tall with
+        // no height at all, and then could not open their boards.
+        item.rect = QRectF(x, y, qMax(number("w", false, width, 0, far), smallestBox),
+                           qMax(number("h", false, height, 0, far), smallestBox));
     };
 
     item.id = identifier("id");
@@ -786,16 +1307,27 @@ QString Board::itemFromJson(const QJsonObject &object, Item &item) {
         item.points.reserve(values.size() / 2);
         for (int i = 0; i + 1 < values.size(); i += 2) {
             const double x = values[i].toDouble(std::nan("")), y = values[i + 1].toDouble(std::nan(""));
-            if ((!std::isfinite(x) || !std::isfinite(y) || std::abs(x) > far || std::abs(y) > far) && problem.isEmpty())
+            if ((!std::isfinite(x) || !std::isfinite(y)) && problem.isEmpty())
                 problem = "\"points\" must hold only numbers";
+            if ((std::abs(x) > far || std::abs(y) > far) && problem.isEmpty())
+                problem = QString("\"points\" must be between %1 and %2").arg(-far).arg(far);
             item.points.append(QPointF(x, y));
         }
-        // Points are kept relative to the corner of the box around them.
+        // Points are kept relative to the corner of the box around them, and
+        // written so, "x" and "y" being that corner: a box that starts further
+        // out than a file may say anything is, or is larger than it may say
+        // any box is, would be written as a board that could not be read back.
         const QPointF origin(number("x", false, 0, -far, far), number("y", false, 0, -far, far));
         const QRectF bounds = Geo::boundsOf(item.points);
         for (QPointF &point : item.points)
             point -= bounds.topLeft();
         item.rect = bounds.translated(origin);
+        if ((bounds.width() > far || bounds.height() > far) && problem.isEmpty())
+            problem = QString("the box around \"points\" must be at most %1 across and down").arg(far);
+        if ((std::abs(item.rect.x()) > far || std::abs(item.rect.y()) > far) && problem.isEmpty())
+            problem = QString("the box around \"points\", moved by \"x\" and \"y\", must start between %1 and %2")
+                          .arg(-far)
+                          .arg(far);
         break;
     }
     case Item::Kind::Connector:
@@ -823,7 +1355,7 @@ QStringList Board::parse(const QJsonObject &root, QVector<Item> &items) {
     const QJsonValue version = root.value("sprawl");
     if (!version.isDouble())
         return {"It is not a Sprawl board: there is no \"sprawl\" format number."};
-    if (version.toInt() > formatVersion)
+    if (newer(root))
         return {QString("It was made by a newer Sprawl (format %1, and this one reads up to %2).")
                     .arg(version.toInt())
                     .arg(formatVersion)};
@@ -870,6 +1402,34 @@ QStringList Board::parse(const QJsonObject &root, QVector<Item> &items) {
     return problems;
 }
 
+// Text being written that holds nothing yet, or nothing any more, is
+// written as it was before the step began. So a file is never given text
+// with nothing to see in it, and nothing is lost if the app ends in the
+// middle: emptied to be typed again, it is written as it was; made by the
+// step, it is not written at all, nor is anything attached to it, which
+// would point at nothing. Text that held nothing before the step is written
+// as it is, as the file has it already. By id, what is written in place of
+// each: the item as it was, or nothing.
+QHash<quint32, const Item *> Board::writtenInstead() const {
+    QHash<quint32, const Item *> instead;
+    if (!m_open)
+        return instead;
+    auto blank = [](const Item *item) {
+        return item && item->kind == Item::Kind::Text && item->text.trimmed().isEmpty();
+    };
+    for (auto it = m_before.constBegin(); it != m_before.constEnd(); ++it)
+        if (blank(item(it.key())) && !blank(&*it))
+            instead.insert(it.key(), &*it);
+    for (quint32 id : m_created) {
+        if (!blank(item(id)))
+            continue;
+        instead.insert(id, nullptr);
+        for (quint32 connector : m_links.values(id))
+            instead.insert(connector, nullptr);
+    }
+    return instead;
+}
+
 QVector<Item> Board::items() const {
     QVector<Item> items;
     items.reserve(m_order.size());
@@ -878,16 +1438,68 @@ QVector<Item> Board::items() const {
     return items;
 }
 
-QJsonObject Board::toJson(const QVector<Item> &items) {
-    QJsonArray array;
-    for (const Item &item : items)
-        array.append(itemToJson(item));
-    return {{"sprawl", formatVersion}, {"items", array}};
+QVector<Item> Board::itemsToWrite() const {
+    const QHash<quint32, const Item *> instead = writtenInstead();
+    if (instead.isEmpty())
+        return items();
+    QVector<Item> items;
+    items.reserve(m_order.size());
+    for (quint32 id : m_order) {
+        const auto found = instead.constFind(id);
+        if (found == instead.constEnd())
+            items.append(m_items.value(id));
+        else if (*found)
+            items.append(**found);
+    }
+    return items;
 }
 
-QStringList Board::fromJson(const QJsonObject &root) {
-    QVector<Item> items;
+QJsonObject Board::toJson(const QVector<Item> &items, quint32 lastId) {
+    QJsonArray array;
+    quint32 highest = 0;
+    for (const Item &item : items) {
+        array.append(itemToJson(item));
+        highest = qMax(highest, item.id);
+    }
+    QJsonObject root{{"sprawl", formatVersion}, {"items", array}};
+    // Only when the items do not say it themselves, so a board that never had
+    // its last item taken away is written as it always was.
+    if (lastId > highest)
+        root.insert("lastId", qint64(lastId));
+    return root;
+}
+
+QStringList Board::read(const QJsonObject &root, QVector<Item> &items, bool *numbered, quint32 *lastId) {
+    if (numbered)
+        *numbered = false;
     const QStringList problems = parse(root, items);
+    if (!problems.isEmpty())
+        return problems;
+    quint32 last = lastIdOf(root);
+    for (const Item &item : std::as_const(items))
+        last = qMax(last, item.id);
+    // An item written without an id (by hand, by an agent) gets one, and
+    // never one an item taken away had.
+    for (Item &item : items)
+        if (item.id == 0) {
+            item.id = nextId(last, [&items] {
+                QSet<quint32> ids;
+                for (const Item &each : items)
+                    ids.insert(each.id);
+                return ids;
+            });
+            if (numbered)
+                *numbered = true;
+        }
+    if (lastId)
+        *lastId = last;
+    return {};
+}
+
+QStringList Board::fromJson(const QJsonObject &root, bool *numbered) {
+    QVector<Item> items;
+    quint32 last = 0;
+    const QStringList problems = read(root, items, numbered, &last);
     if (!problems.isEmpty())
         return problems;
 
@@ -900,21 +1512,19 @@ QStringList Board::fromJson(const QJsonObject &root) {
     m_before.clear();
     m_created.clear();
     m_restacked.clear();
+    m_orderBefore.clear();
+    m_orderRemembered = false;
     m_open = false;
     m_lastId = m_lastGroup = 0;
-    for (const Item &item : std::as_const(items))
-        m_lastId = qMax(m_lastId, item.id);
-    for (Item &item : items) {
-        // An item written without an id (by hand, by an agent) gets one.
-        if (item.id == 0)
-            item.id = ++m_lastId;
+    for (const Item &item : std::as_const(items)) {
         place(item);
         m_order.append(item.id);
     }
+    m_lastId = qMax(m_lastId, last);
     m_depthsStale = true;
     for (quint32 id : std::as_const(m_order))
         refreshConnector(id);
-    ++m_revision;
+    m_revision = ++m_lastRevision;
     emit reset();
     emit historyChanged();
     return {};

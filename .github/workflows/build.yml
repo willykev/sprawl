@@ -24,11 +24,17 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed git python qt6-base qt6-declarative qt6-svg qt6-wayland xdg-desktop-portal ttf-dejavu
+      - name: Install tools
+        run: pacman -Syu --noconfirm --needed git python ttf-dejavu
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      # From the recipe itself, so the tests show that the package's own list
+      # is enough.
+      - name: Install dependencies
+        run: |
+          source pkgbuild/PKGBUILD
+          pacman -S --noconfirm --needed "${depends[@]}" "${makedepends[@]}"
       - name: Create build user
         run: |
           useradd --create-home builder

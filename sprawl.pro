@@ -17,8 +17,10 @@ HEADERS += \
     src/geometry.h \
     src/imagestore.h \
     src/item.h \
+    src/launch.h \
     src/library.h \
     src/materials.h \
+    src/measuring.h \
     src/offline.h \
     src/portalfilepicker.h \
     src/spatialgrid.h \

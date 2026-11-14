@@ -1,5 +1,6 @@
 #include "exporter.h"
 
+#include <QBuffer>
 #include <QHash>
 #include <QImage>
 #include <QImageWriter>
@@ -40,12 +41,75 @@ QPolygonF polygon(const QVector<QPointF> &points, QPointF offset = {}) {
     return shape;
 }
 
+// Where an item's text goes on the board, as the window puts it: a
+// connector's beside the middle of its line, any other's in its box.
+QPointF textCorner(const Item &item, const TextBlock &text) {
+    if (item.kind == Item::Kind::Connector)
+        return TextMetrics::connectorLabelCorner(item, text.size());
+    return item.rect.topLeft() + text.origin();
+}
+
+// What a block of text covers, from its corner: its lines, down to its foot.
+// Lines set across the middle of a box wider than they are, or wider than a
+// box too narrow for a single letter, are not where the block's size alone
+// would put them: one wider than its box reaches out past both its sides.
+QRectF covers(const TextBlock &text) {
+    QRectF covered;
+    for (const TextBlock::Paragraph &paragraph : text.paragraphs())
+        for (int i = 0; i < paragraph.layout->lineCount(); ++i)
+            covered |= paragraph.layout->lineAt(i).naturalTextRect().translated(0, paragraph.y);
+    covered.setBottom(qMax(covered.bottom(), text.size().height()));
+    return covered;
+}
+
+// The writer makes a page a whole number of points, and says how big it is
+// in the page's boxes: "/MediaBox [0 0 163.000000 113.000000]" and the like.
+// Each is made the size the page should be right here, in place, in no more
+// characters than were there (spaces make up the rest), so that nothing
+// after it moves and the file's index of where everything is stays true.
+void fitPage(QByteArray &pdf, QSize whole, QSizeF exact) {
+    const QByteArray from = "[0 0 " + QByteArray::number(qreal(whole.width()), 'f') + ' ' +
+                            QByteArray::number(qreal(whole.height()), 'f') + ']';
+    QByteArray to = "[0 0 " + QByteArray::number(exact.width(), 'g', 15) + ' ' +
+                    QByteArray::number(exact.height(), 'g', 15) + ']';
+    if (to.size() > from.size())
+        return;
+    to.insert(to.size() - 1, QByteArray(from.size() - to.size(), ' '));
+    for (const QByteArray &box : {QByteArrayLiteral("/MediaBox "), QByteArrayLiteral("/TrimBox ")}) {
+        const qsizetype at = pdf.indexOf(box + from);
+        if (at >= 0)
+            pdf.replace(at + box.size(), to.size(), to);
+    }
+}
+
 } // namespace
 
 QStringList formats() { return {"png", "svg", "pdf"}; }
 
 QRectF area(const Board &board, const QVector<quint32> &ids, qreal margin) {
-    const QRectF bounds = ids.isEmpty() ? board.contentBounds() : board.contentBounds(ids);
+    // Sizes of type do not depend on colors.
+    static const Palette palette;
+    QRectF bounds;
+    for (quint32 id : ids.isEmpty() ? board.order() : ids) {
+        const Item *found = board.item(id);
+        if (!found)
+            continue;
+        Item item = *found;
+        // A text item is as big as its type makes it, which the window may
+        // not have measured yet: until it has, the board has a guess.
+        if (item.kind == Item::Kind::Text)
+            TextMetrics::fit(item);
+        // And text is laid out here as it is drawn, where the board can only
+        // guess at it or it runs out of its item: a connector's label and a
+        // frame's title beside them, and more than a note or a shape holds.
+        QRectF text;
+        if (item.hasText() && !item.text.isEmpty()) {
+            const TextBlock block(item.text, TextMetrics::styleFor(item, palette));
+            text = covers(block).translated(textCorner(item, block));
+        }
+        const QRectF covered = Board::boundsFor(item, text) | text;
+        bounds = bounds.isNull() ? covered : bounds | covered;
+    }
     if (bounds.isNull())
         return {};
     // On whole units, so nothing sits between pixels.
@@ -75,11 +139,8 @@ void paint(QPainter &painter, const Board &board, const QVector<quint32> &ids, c
         painter.setBrush(Qt::NoBrush);
 
         std::unique_ptr<TextBlock> text;
-        QPointF textCorner;
-        if (item.hasText() && !item.text.isEmpty()) {
+        if (item.hasText() && !item.text.isEmpty())
             text = std::make_unique<TextBlock>(item.text, TextMetrics::styleFor(item, palette));
-            textCorner = text->origin();
-        }
 
         switch (item.kind) {
         case Item::Kind::Note:
@@ -116,7 +177,7 @@ void paint(QPainter &painter, const Board &board, const QVector<quint32> &ids, c
             break;
         case Item::Kind::Stroke: {
             const QColor color = colorFor(item.color, palette.bright);
-            const QVector<QPointF> curve = Geo::smooth(item.points, 0.1);
+            const QVector<QPointF> curve = Geo::smooth(item.points, Geo::strokeTolerance);
             if (curve.size() == 1) {
                 painter.setBrush(color);
                 painter.drawEllipse(curve[0], item.width / 2, item.width / 2);
@@ -150,8 +211,6 @@ void paint(QPainter &painter, const Board &board, const QVector<quint32> &ids, c
                     painter.drawPolygon(QPolygonF({at + head.axis * along, at - head.axis * along + across * half,
                                                    at - head.axis * along - across * half}));
             }
-            if (text)
-                textCorner = TextMetrics::connectorLabelCorner(item, text->size()) - origin;
             break;
         }
         case Item::Kind::Image: {
@@ -179,8 +238,9 @@ void paint(QPainter &painter, const Board &board, const QVector<quint32> &ids, c
         }
 
         if (text) {
-            // The layout's own origin is already in the block.
-            painter.translate(textCorner - text->origin());
+            // Where the window puts it; the layout's own origin is already in
+            // the block.
+            painter.translate(textCorner(item, *text) - item.rect.topLeft() - text->origin());
             text->draw(&painter, QPointF(0, 0));
         }
         painter.restore();
@@ -217,10 +277,15 @@ QString write(const QString &path, const Board &board, const QVector<quint32> &i
         if (!writer.write(image))
             return QString("Could not write %1: %2.").arg(path, writer.errorString());
     } else if (format == "svg") {
+        // A canvas unit to a CSS pixel, which is what a size with no unit is
+        // in. The generator writes a size in millimeters, which is never
+        // quite it, and a view box to six figures, which past a million units
+        // is not: so it is asked for neither, and both go in after, in whole
+        // units.
+        QBuffer svg;
+        svg.open(QIODevice::WriteOnly);
         QSvgGenerator generator;
-        generator.setOutputDevice(&file);
-        generator.setSize(bounds.size().toSize());
-        generator.setViewBox(QRectF(QPointF(0, 0), bounds.size()));
+        generator.setOutputDevice(&svg);
         generator.setTitle("Sprawl board");
         QPainter painter(&generator);
         if (options.background)
@@ -228,19 +293,47 @@ QString write(const QString &path, const Board &board, const QVector<quint32> &i
         painter.translate(-bounds.topLeft());
         paint(painter, board, ids, palette, assetFolder, options.radius);
         painter.end();
+        // They go into the root tag, after its name. The text before and
+        // after them is written out as it is, rather than copied to make
+        // room: a big board's SVG is big.
+        const QByteArray &written = svg.data();
+        const qsizetype root = written.indexOf("<svg");
+        const qsizetype split = root < 0 ? 0 : root + 4;
+        file.write(written.constData(), split);
+        if (root >= 0)
+            file.write(QString(" width=\"%1\" height=\"%2\" viewBox=\"0 0 %1 %2\"")
+                           .arg(qRound64(bounds.width()))
+                           .arg(qRound64(bounds.height()))
+                           .toLatin1());
+        file.write(written.constData() + split, written.size() - split);
     } else {
-        QPdfWriter writer(&file);
-        // One page the size of the board, a canvas unit to a CSS pixel.
-        writer.setResolution(96);
-        writer.setPageSize(QPageSize(bounds.size() * 0.75, QPageSize::Point));
+        // One page the size of the board, a canvas unit to a CSS pixel:
+        // three quarters of a point. The writer only makes pages a whole
+        // number of points, so it is given the next whole size up, and then
+        // the page is cut down to the board's size exactly. A page is
+        // measured from its bottom left, so that is the corner the board is
+        // painted in, in points (72 to the inch), with the canvas color over
+        // all of the page to reach every edge.
+        const QSizeF page = bounds.size() * 0.75;
+        const QSize whole(std::ceil(page.width()), std::ceil(page.height()));
+        QBuffer pdf;
+        pdf.open(QIODevice::WriteOnly);
+        QPdfWriter writer(&pdf);
+        writer.setResolution(72);
+        // That size exactly, not a paper size it is close to.
+        writer.setPageSize(QPageSize(QSizeF(whole), QPageSize::Point, QString(), QPageSize::ExactMatch));
         writer.setPageMargins(QMarginsF(0, 0, 0, 0));
         writer.setTitle("Sprawl board");
         QPainter painter(&writer);
         if (options.background)
-            painter.fillRect(QRectF(QPointF(0, 0), bounds.size()), palette.background);
+            painter.fillRect(QRectF(QPointF(0, 0), QSizeF(whole)), palette.background);
+        painter.translate(0, whole.height() - page.height());
+        painter.scale(0.75, 0.75);
         painter.translate(-bounds.topLeft());
         paint(painter, board, ids, palette, assetFolder, options.radius);
         painter.end();
+        fitPage(pdf.buffer(), whole, page);
+        file.write(pdf.data());
     }
     if (!file.commit())
         return QString("Could not write %1: %2.").arg(path, file.errorString());

@@ -21,6 +21,9 @@ public:
     // The picture, or a null image while it is still being read (`loaded`
     // follows) or when it cannot be (see failed()).
     QImage image(const QString &asset);
+    // The picture if it has been read, and a null image if not, without
+    // having it read.
+    QImage alreadyRead(const QString &asset) const { return m_entries.value(asset).image; }
     bool failed(const QString &asset) const { return m_entries.value(asset).failed; }
     // Whether any picture is still being read.
     bool loading() const;

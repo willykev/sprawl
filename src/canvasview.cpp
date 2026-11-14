@@ -8,6 +8,7 @@
 #include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QKeySequence>
 #include <QMimeData>
 #include <QNativeGestureEvent>
 #include <QQuickTextDocument>
@@ -27,9 +28,10 @@ const qreal minimumZoom = 0.1, maximumZoom = 8;
 const qreal zoomStops[] = {0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8};
 // The sizes text steps through.
 const qreal textSizes[] = {11, 12, 13, 16, 20, 28, 40, 56, 80};
-// The most points one stroke of the pen is given. A stroke that goes on past
-// that is put on the board and carried on as another, so that no single
-// stroke is ever more than the GPU is asked to draw at once.
+// The most points one stroke of the pen is given: every point of a stroke is
+// looked at to find it, to simplify it and to draw it. A stroke that goes on
+// past that is put on the board and carried on as another, as one is that
+// comes to more triangles than it may (see full()).
 const int longestStroke = 4096;
 const char *const clipboardFormat = "application/x-sprawl-items";
 const QStringList toolNames{"select", "pan", "note", "text", "shape", "pen", "connector", "frame"};
@@ -111,8 +113,12 @@ void CanvasView::setBoard(Board *board) {
     if (m_board) {
         connect(m_board, &Board::itemChanged, this, &CanvasView::onItemChanged);
         connect(m_board, &Board::orderChanged, this, &CanvasView::onOrderChanged);
+        connect(m_board, &Board::renumbered, this, &CanvasView::onRenumbered);
         connect(m_board, &Board::reset, this, &CanvasView::onReset);
         connect(m_board, &Board::historyChanged, this, &CanvasView::historyChanged);
+        // A step is over, an undo or a redo with it: whatever it did to the
+        // selection is told now, once.
+        connect(m_board, &Board::historyChanged, this, &CanvasView::tellSelection);
     }
     onReset();
     emit boardChanged();
@@ -159,7 +165,7 @@ void CanvasView::onThemeChanged() {
 }
 
 void CanvasView::setLoadBudget(qint64 bytes) {
-    m_loadBudget = qMax<qint64>(0, bytes);
+    m_loadBudget = qBound<qint64>(0, bytes, largestLoadBudget);
     requestFrame();
 }
 
@@ -191,7 +197,7 @@ void CanvasView::onReset() {
     m_drag = Drag::None;
     m_dragStarted = false;
     m_dragItems.clear();
-    m_draftPoints.clear();
+    m_pen = Geo::Pen();
     m_connectTarget = 0;
     if (m_editing) {
         m_editing = 0;
@@ -199,6 +205,7 @@ void CanvasView::onReset() {
     }
     m_selection.clear();
     m_selected.clear();
+    m_selectionHoles = false;
     m_ready.clear();
     m_built.clear();
     m_gone.clear();
@@ -207,14 +214,17 @@ void CanvasView::onReset() {
     m_layersStale = true;
     m_sceneReset = true;
     markAllDirty();
-    refreshSelectionBox();
-    emit selectionChanged();
+    m_selectionBoxStale = m_selectionNews = true;
+    tellSelection();
     emit busyChanged();
+    emit pressedChanged();
 }
 
 void CanvasView::onItemChanged(quint32 id, Board::Change change) {
+    const bool selected = m_selected.contains(id);
     switch (change) {
     case Board::Change::Added:
+        markUnmeasured(id);
         relayer(id);
         markDirty(id);
         break;
@@ -229,10 +239,11 @@ void CanvasView::onItemChanged(quint32 id, Board::Change change) {
             m_editing = 0;
             emit editingChanged();
         }
-        if (m_selected.contains(id)) {
-            QVector<quint32> rest = m_selection;
-            rest.removeOne(id);
-            setSelection(rest);
+        // No longer selected; the list of what is catches up when it is
+        // next read.
+        if (selected) {
+            m_selected.remove(id);
+            m_selectionHoles = true;
         }
         emit pendingItemsChanged();
         break;
@@ -243,19 +254,33 @@ void CanvasView::onItemChanged(quint32 id, Board::Change change) {
         relayer(id);
         break;
     case Board::Change::Edited:
-        // Its own measuring is not news to it.
-        if (!m_measuring)
+        // An item being made big enough for its text is being prepared at its
+        // new size already. Its connectors, carried to its new edges, are
+        // prepared again. So is anything else that changed, which as it now
+        // reads has not been measured (see markUnmeasured()).
+        if (id != m_measuring) {
+            markUnmeasured(id);
             markDirty(id);
+        }
         relayer(id);
         break;
     }
-    if (m_selected.contains(id)) {
+    if (selected) {
         m_chromeDirty = true;
-        refreshSelectionBox();
         // What the bar by the selection shows of it (its color, its shape)
-        // follows every change to it, an undo included.
-        if (change == Board::Change::Edited)
-            emit selectionChanged();
+        // follows every change to it but a move, an undo included, and the
+        // box around the selection follows it wherever it goes. Both are
+        // worked out, and told, once for all that changed: when the step is
+        // over, or once the events of the moment have been handled, as each
+        // move of a drag has been. Worked out as each thing changed, a step
+        // that changes all of a big selection would go through all of it
+        // again for every one. While things are only being moved, a
+        // connector that follows them is only moved too, though the board
+        // says it changed.
+        m_selectionBoxStale = true;
+        if (change != Board::Change::Moved && !m_moving)
+            m_selectionNews = true;
+        tellSelectionLater();
     }
     if (id == m_editing)
         refreshEditor();
@@ -268,6 +293,39 @@ void CanvasView::onOrderChanged() {
     requestFrame();
 }
 
+void CanvasView::onRenumbered(quint32 from, quint32 to) {
+    // An item made here has a new id, its old one taken by an item written
+    // from outside. It is still the item that is selected, being written in
+    // or dragged: all of that goes over to the new id before the board says
+    // the old one is gone, so none of it is let go of.
+    auto swap = [from, to](quint32 &id) {
+        if (id == from)
+            id = to;
+    };
+    for (quint32 &id : m_selection)
+        swap(id);
+    for (quint32 &id : m_marqueeBase)
+        swap(id);
+    swap(m_editing);
+    swap(m_connectFrom);
+    swap(m_connectTarget);
+    if (m_dragItems.contains(from))
+        m_dragItems.insert(to, m_dragItems.take(from));
+    for (Item &item : m_dragItems) {
+        swap(item.id);
+        swap(item.from);
+        swap(item.to);
+    }
+    // The window is told once for all of a selection given new ids, as for
+    // any other change to it: told for each, a big paste numbered anew would
+    // have it go through all of the selection again for every one.
+    if (m_selected.remove(from)) {
+        m_selected.insert(to);
+        m_selectionNews = true;
+        tellSelectionLater();
+    }
+}
+
 // --- The view ---------------------------------------------------------------------
 
 void CanvasView::viewMoved() {
@@ -278,7 +336,9 @@ void CanvasView::viewMoved() {
         m_pointer = pointer;
         emit pointerChanged();
     }
-    refreshSelectionBox();
+    // The selection is where it was on the board, and somewhere else on screen.
+    m_selectionBoxStale = true;
+    tellSelection();
     refreshEditor();
     emit viewChanged();
     requestFrame();
@@ -323,6 +383,11 @@ void CanvasView::animateTo(QPointF origin, qreal zoom) {
     m_animationZoomFrom = m_zoom;
     m_animationZoomTo = zoom;
     m_viewAnimation.start();
+    // The view is on its way from now, and is said to be now: its first step
+    // may be a frame away, and until then whatever follows the view (the
+    // window, putting it back for a canvas of another size) would take it
+    // for one nobody had moved.
+    emit viewChanged();
 }
 
 QPointF CanvasView::insertPoint() const {
@@ -386,7 +451,7 @@ void CanvasView::pointTo(QPointF itemPoint) { setPointer(itemPoint, contains(ite
 
 QVariantList CanvasView::selectedIds() const {
     QVariantList ids;
-    for (quint32 id : m_selection)
+    for (quint32 id : selection())
         ids.append(id);
     return ids;
 }
@@ -405,6 +470,9 @@ void CanvasView::itemChange(ItemChange change, const ItemChangeData &data) {
     if (change == ItemDevicePixelRatioHasChanged || change == ItemSceneChange) {
         m_viewDirty = true;
         m_chromeDirty = true;
+        // The box around the selection is on whole pixels of the screen.
+        m_selectionBoxStale = true;
+        tellSelectionLater();
         requestFrame();
     }
 }
@@ -420,40 +488,65 @@ void CanvasView::setSelection(QVector<quint32> ids) {
         seen.insert(id);
         return drop;
     });
-    if (ids == m_selection)
+    if (ids == selection())
         return;
     m_selection = ids;
     m_selected = QSet<quint32>(ids.constBegin(), ids.constEnd());
+    m_selectionHoles = false;
+    m_selectionBoxStale = m_selectionNews = true;
     m_chromeDirty = true;
-    refreshSelectionBox();
-    emit selectionChanged();
+    tellSelection();
     requestFrame();
 }
 
+const QVector<quint32> &CanvasView::selection() const {
+    // What has left the board since the list was last read leaves it now,
+    // all in one go.
+    if (m_selectionHoles) {
+        m_selectionHoles = false;
+        ++m_selectionPasses;
+        m_selection.removeIf([this](quint32 id) { return !m_selected.contains(id); });
+    }
+    return m_selection;
+}
+
 QVector<quint32> CanvasView::withGroups(const QVector<quint32> &ids) const {
+    // The members of every group asked for, found in one look through the
+    // board: a look for each group would go through all of it as many times
+    // as there are groups, and a marquee asks on every move of the mouse.
+    QHash<quint32, QVector<quint32>> members;
+    for (quint32 id : ids)
+        if (const Item *item = m_board->item(id); item && item->group)
+            members.insert(item->group, {});
+    if (!members.isEmpty()) {
+        ++m_selectionPasses;
+        for (quint32 id : m_board->order())
+            if (const auto group = members.find(m_board->item(id)->group); group != members.end())
+                group->append(id);
+    }
     QVector<quint32> all;
-    QSet<quint32> groups;
     for (quint32 id : ids) {
         const Item *item = m_board->item(id);
         if (!item)
             continue;
         if (item->group == 0) {
             all.append(id);
-        } else if (!groups.contains(item->group)) {
-            groups.insert(item->group);
-            all += m_board->membersOf(item->group);
+        } else if (const auto group = members.find(item->group); group != members.end()) {
+            // A group comes along once, however many of it were asked for.
+            all += *group;
+            members.erase(group);
         }
     }
     return all;
 }
 
 const Item *CanvasView::soleSelection() const {
-    return m_board && m_selection.size() == 1 ? m_board->item(m_selection.first()) : nullptr;
+    return m_board && selection().size() == 1 ? m_board->item(selection().first()) : nullptr;
 }
 
 QString CanvasView::selectionKind() const {
     QString kind;
-    for (quint32 id : m_selection) {
+    for (quint32 id : selection()) {
         const Item *item = m_board ? m_board->item(id) : nullptr;
         if (!item)
             continue;
@@ -468,7 +561,7 @@ QString CanvasView::selectionKind() const {
 QString CanvasView::selectionColor() const {
     QString color;
     bool first = true;
-    for (quint32 id : m_selection) {
+    for (quint32 id : selection()) {
         const Item *item = m_board ? m_board->item(id) : nullptr;
         if (!item)
             continue;
@@ -482,7 +575,7 @@ QString CanvasView::selectionColor() const {
 
 QString CanvasView::selectionShape() const {
     QString shape;
-    for (quint32 id : m_selection) {
+    for (quint32 id : selection()) {
         const Item *item = m_board ? m_board->item(id) : nullptr;
         if (!item)
             continue;
@@ -496,10 +589,24 @@ QString CanvasView::selectionShape() const {
     return shape;
 }
 
-void CanvasView::refreshSelectionBox() {
+QRectF CanvasView::selectionBox() const {
+    measureSelection();
+    return m_selectionBox;
+}
+
+QString CanvasView::selectionSize() const {
+    measureSelection();
+    return m_selectionSize;
+}
+
+void CanvasView::measureSelection() const {
+    if (!m_selectionBoxStale)
+        return;
+    m_selectionBoxStale = false;
+    ++m_selectionPasses;
     QRectF box, area;
     if (m_board)
-        for (quint32 id : std::as_const(m_selection)) {
+        for (quint32 id : selection()) {
             const Item *item = m_board->item(id);
             if (!item)
                 continue;
@@ -515,12 +622,36 @@ void CanvasView::refreshSelectionBox() {
         return;
     m_selectionBox = box;
     m_selectionSize = size;
-    emit selectionBoxChanged();
+    m_selectionBoxNews = true;
+}
+
+void CanvasView::tellSelection() {
+    measureSelection();
+    const bool box = m_selectionBoxNews, rest = m_selectionNews;
+    m_selectionBoxNews = m_selectionNews = false;
+    if (box)
+        emit selectionBoxChanged();
+    if (rest)
+        emit selectionChanged();
+}
+
+void CanvasView::tellSelectionLater() {
+    if (m_tellQueued)
+        return;
+    m_tellQueued = true;
+    QMetaObject::invokeMethod(
+        this,
+        [this] {
+            m_tellQueued = false;
+            tellSelection();
+        },
+        Qt::QueuedConnection);
 }
 
 QVector<CanvasView::HandleSpot> CanvasView::handleSpots() const {
     const Item *item = soleSelection();
-    if (!item)
+    // Nothing on a board that cannot be changed is there to take hold of.
+    if (!item || m_readOnly)
         return {};
     if (item->kind == Item::Kind::Connector)
         return {{0, toItem(item->p1)}, {1, toItem(item->p2)}};
@@ -561,6 +692,14 @@ int CanvasView::handleAt(QPointF itemPoint) const {
 
 // --- Tools ----------------------------------------------------------------------------
 
+// What everything that would change the board asks first. A board that could
+// not be read is there to be looked at, and nothing changes it. And from the
+// moment the mouse is pressed on the canvas until it lets go, the board is
+// that drag's: it holds on to what it took hold of and keeps all it does in
+// one step of undo, so nothing else changes the board, or opens or closes a
+// step, under it.
+bool CanvasView::mayChange() const { return m_board && !m_readOnly && m_drag == Drag::None; }
+
 QString CanvasView::tool() const { return toolNames.value(int(m_tool)); }
 
 void CanvasView::setTool(const QString &name) {
@@ -571,6 +710,10 @@ void CanvasView::setTool(const QString &name) {
 
 void CanvasView::setToolTo(Tool tool) {
     if (tool == m_tool)
+        return;
+    // A tool that makes things is taken up only when things may be made.
+    // Select and pan, which only look, are always to hand.
+    if (tool != Tool::Select && tool != Tool::Pan && !mayChange())
         return;
     if (editing())
         commitEdit();
@@ -728,7 +871,7 @@ QVariantMap CanvasView::selectionLine() const {
     // For each, the one they all have, or nothing when they differ.
     QVariantMap common;
     bool first = true;
-    for (quint32 id : m_selection) {
+    for (quint32 id : selection()) {
         const Item *item = m_board ? m_board->item(id) : nullptr;
         if (!item || item->kind != Item::Kind::Connector)
             continue;
@@ -787,10 +930,10 @@ void CanvasView::setLine(const QString &kind, const QString &name) {
 
 void CanvasView::setSelectionLine(const QString &kind, const QString &name) {
     const int index = kind == "shape" ? -1 : int(options(kind).indexOf(name));
-    if (!m_board || editing() || m_selection.isEmpty() || index < 0)
+    if (!mayChange() || editing() || selection().isEmpty() || index < 0)
         return;
     m_board->begin();
-    for (quint32 id : std::as_const(m_selection)) {
+    for (quint32 id : selection()) {
         Item item = *m_board->item(id);
         if (item.kind == Item::Kind::Connector && setPart(item, kind, index))
             m_board->set(item);
@@ -881,6 +1024,9 @@ void CanvasView::setPenColor(const QString &color) {
     if (color == m_penColor)
         return;
     m_penColor = color;
+    // A stroke being drawn takes it on in the next frame (see refreshPen()).
+    if (m_drag == Drag::Stroke)
+        requestFrame();
     emit penChanged();
 }
 
@@ -889,6 +1035,8 @@ void CanvasView::setPenWidth(qreal width) {
     if (width == m_penWidth)
         return;
     m_penWidth = width;
+    if (m_drag == Drag::Stroke)
+        requestFrame();
     emit penChanged();
 }
 
@@ -964,6 +1112,10 @@ QPointF CanvasView::freeCorner(QPointF corner, Item::Kind kind) const {
 }
 
 quint32 CanvasView::createItem(Item item, bool edit) {
+    // Whatever was being written is finished first, as a step of its own:
+    // a picture dropped on the board meanwhile does not take it along.
+    if (editing())
+        commitEdit();
     m_board->begin();
     const quint32 id = m_board->add(item);
     setSelection({id});
@@ -997,8 +1149,13 @@ void CanvasView::mousePressEvent(QMouseEvent *event) {
         m_drag = Drag::Pan;
         m_panOrigin = m_origin;
         updateCursor(at);
+        emit pressedChanged();
         return;
     }
+    // Every other tool makes something, and nothing is made on a board that
+    // may not be changed.
+    if (m_tool != Tool::Select && !mayChange())
+        return;
 
     switch (m_tool) {
     case Tool::Select: {
@@ -1014,24 +1171,33 @@ void CanvasView::mousePressEvent(QMouseEvent *event) {
         if (hit) {
             const QVector<quint32> group = withGroups({hit});
             if (shift) {
-                // Shift adds to the selection, or takes away from it.
-                QVector<quint32> next = m_selection;
+                // Shift adds to the selection, or takes away from it: a
+                // group all in one go, not a look through the selection for
+                // each thing in the group.
                 const bool had = m_selected.contains(hit);
-                for (quint32 id : group) {
-                    next.removeOne(id);
-                    if (!had)
-                        next.append(id);
-                }
+                const QSet<quint32> members(group.constBegin(), group.constEnd());
+                QVector<quint32> next = selection();
+                next.removeIf([&members](quint32 id) { return members.contains(id); });
+                if (!had)
+                    next += group;
                 setSelection(next);
                 if (had)
                     break;
             } else if (!m_selected.contains(hit)) {
                 setSelection(group);
             }
+            if (!mayChange()) {
+                // Nothing is moved on a board that may not be changed, so a
+                // press on something is all the click there will be: it
+                // picks just that, as letting go would.
+                if (!shift)
+                    setSelection(group);
+                break;
+            }
             m_drag = Drag::Move;
             m_connectFrom = hit; // remembered for a click that turns out not to be a drag
         } else {
-            m_marqueeBase = shift ? m_selection : QVector<quint32>();
+            m_marqueeBase = shift ? selection() : QVector<quint32>();
             if (!shift)
                 setSelection({});
             m_marquee = QRectF(at, QSizeF(0, 0));
@@ -1065,7 +1231,14 @@ void CanvasView::mousePressEvent(QMouseEvent *event) {
         m_drag = Drag::Box;
         break;
     case Tool::Pen:
-        m_draftPoints = {canvas};
+        // However many strokes it comes to (see carryOn()), what the pen
+        // draws before it is lifted is one step of undo, which endDrag()
+        // ends, and backing out of it takes all of it back.
+        m_board->begin();
+        m_pen = penInHand();
+        m_pen.add(canvas);
+        m_strokeGroup = 0;
+        m_strokePieces.clear();
         m_drag = Drag::Stroke;
         m_dragStarted = true;
         m_chromeDirty = true;
@@ -1081,6 +1254,8 @@ void CanvasView::mousePressEvent(QMouseEvent *event) {
     case Tool::Pan:
         break;
     }
+    if (m_drag != Drag::None)
+        emit pressedChanged();
 }
 
 void CanvasView::mouseMoveEvent(QMouseEvent *event) {
@@ -1096,10 +1271,20 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event) {
         if (m_drag != Drag::Pan && (at - m_pressItem).manhattanLength() < 4)
             return;
         m_dragStarted = true;
-        if (m_drag == Drag::Move)
+        if (m_drag == Drag::Move) {
             startMove();
-        else if (m_drag == Drag::Resize || m_drag == Drag::End)
+        } else if (m_drag == Drag::Resize || m_drag == Drag::End) {
             m_board->begin();
+            // From the item as it is now, which may have come in from outside
+            // since the press; and the step holds it from the start, whether
+            // or not the first step of the mouse changes it (see
+            // Board::hold()).
+            for (auto it = m_dragItems.begin(); it != m_dragItems.end(); ++it)
+                if (const Item *item = m_board->item(it.key())) {
+                    it.value() = *item;
+                    m_board->hold(it.key());
+                }
+        }
         m_chromeDirty = true;
         emit busyChanged();
     }
@@ -1121,17 +1306,9 @@ void CanvasView::mouseMoveEvent(QMouseEvent *event) {
     case Drag::End:
         dragEnd(canvas);
         break;
-    case Drag::Stroke: {
-        // Points closer than most of a screen pixel add nothing but weight.
-        const QPointF step = (canvas - m_draftPoints.last()) * m_zoom;
-        if (std::hypot(step.x(), step.y()) >= 0.75)
-            m_draftPoints.append(canvas);
-        if (m_draftPoints.size() >= longestStroke) {
-            finishStroke();
-            m_draftPoints = {canvas};
-        }
+    case Drag::Stroke:
+        drawTo(canvas);
         break;
-    }
     case Drag::Box:
         m_draftBox.setBottomRight(canvas);
         break;
@@ -1165,7 +1342,7 @@ void CanvasView::mouseReleaseEvent(QMouseEvent *event) {
     case Drag::Move:
         if (m_dragStarted) {
             m_board->commit();
-        } else if (!(event->modifiers() & Qt::ShiftModifier) && m_selection.size() > 1) {
+        } else if (!(event->modifiers() & Qt::ShiftModifier) && selection().size() > 1) {
             // A click on one of several selected items selects just that one.
             setSelection(withGroups({m_connectFrom}));
         }
@@ -1196,9 +1373,16 @@ void CanvasView::mouseDoubleClickEvent(QMouseEvent *event) {
     event->accept();
     if (!m_board || event->button() != Qt::LeftButton || m_tool != Tool::Select)
         return;
+    // A drag another button began (the middle one, moving the view) is not
+    // this double click's to end: like a click meanwhile, it does nothing.
+    if (m_drag != Drag::None && m_dragButton != event->button())
+        return;
     // The second press of a double click starts nothing of its own.
     cancelDrag();
     m_dragButton = Qt::NoButton;
+    // And what it does start, writing, is a change.
+    if (!mayChange())
+        return;
     const QPointF canvas = toCanvas(event->position());
     const quint32 hit = m_board->itemAt(canvas, slack());
     if (hit) {
@@ -1223,6 +1407,13 @@ void CanvasView::mouseUngrabEvent() {
     } else {
         cancelDrag();
     }
+}
+
+void CanvasView::keepStroke() {
+    if (m_drag != Drag::Stroke || !m_board)
+        return;
+    finishStroke();
+    endDrag();
 }
 
 void CanvasView::hoverEnterEvent(QHoverEvent *event) {
@@ -1274,11 +1465,18 @@ bool CanvasView::event(QEvent *event) {
 
 void CanvasView::startMove() {
     m_board->begin();
-    m_dragItems.clear();
-    QVector<quint32> moving = m_selection;
+    m_dragItems = carried();
+    // The step holds what is carried from the start, whether or not the
+    // first step of the mouse moves it (see Board::hold()).
+    for (auto it = m_dragItems.constBegin(); it != m_dragItems.constEnd(); ++it)
+        m_board->hold(it.key());
+}
+
+QHash<quint32, Item> CanvasView::carried() const {
+    QVector<quint32> moving = selection();
     // A frame carries what sits inside it.
     QVector<quint32> inside;
-    for (quint32 id : std::as_const(m_selection)) {
+    for (quint32 id : selection()) {
         const Item *frame = m_board->item(id);
         if (!frame || frame->kind != Item::Kind::Frame)
             continue;
@@ -1289,15 +1487,19 @@ void CanvasView::startMove() {
                 moving.append(other);
         }
     }
+    QHash<quint32, Item> items;
     for (quint32 id : std::as_const(moving))
         if (const Item *item = m_board->item(id))
-            m_dragItems.insert(id, *item);
+            items.insert(id, *item);
+    return items;
 }
 
-void CanvasView::dragMove(QPointF canvasPoint) {
-    // By whole units, so things stay on the pixel grid at 100%.
-    const QPointF delta = rounded(canvasPoint - m_pressCanvas);
-    for (auto it = m_dragItems.constBegin(); it != m_dragItems.constEnd(); ++it) {
+void CanvasView::moveBy(const QHash<quint32, Item> &items, QPointF delta) {
+    // Only where things are changes, and where the connectors that follow
+    // them are: nothing the bar by the selection shows, which is not told of
+    // it on every move of a drag.
+    m_moving = true;
+    for (auto it = items.constBegin(); it != items.constEnd(); ++it) {
         Item moved = it.value();
         moved.rect.translate(delta);
         if (moved.kind == Item::Kind::Connector) {
@@ -1306,6 +1508,12 @@ void CanvasView::dragMove(QPointF canvasPoint) {
         }
         m_board->set(moved);
     }
+    m_moving = false;
+}
+
+void CanvasView::dragMove(QPointF canvasPoint) {
+    // By whole units, so things stay on the pixel grid at 100%.
+    moveBy(m_dragItems, rounded(canvasPoint - m_pressCanvas));
 }
 
 void CanvasView::dragResize(QPointF canvasPoint, bool keepAspect) {
@@ -1317,48 +1525,80 @@ void CanvasView::dragResize(QPointF canvasPoint, bool keepAspect) {
     const bool right = handle == TopRight || handle == Right || handle == BottomRight;
     const bool top = handle == TopLeft || handle == Top || handle == TopRight;
     const bool bottom = handle == BottomLeft || handle == Bottom || handle == BottomRight;
-    const qreal least = start.kind == Item::Kind::Stroke ? 1 : Defaults::minimumSize;
-
-    // The edges the handle holds follow the mouse; the others stay.
-    qreal l = from.left() + (left ? delta.x() : 0), r = from.right() + (right ? delta.x() : 0);
-    qreal t = from.top() + (top ? delta.y() : 0), b = from.bottom() + (bottom ? delta.y() : 0);
-    if (left)
-        l = qMin(l, r - least);
-    if (right)
-        r = qMax(r, l + least);
-    if (top)
-        t = qMin(t, b - least);
-    if (bottom)
-        b = qMax(b, t + least);
-    l = std::round(l), r = std::round(r), t = std::round(t), b = std::round(b);
+    const bool stroke = start.kind == Item::Kind::Stroke;
+    const qreal farthest = Item::farthest;
 
     // Pictures and type keep their proportions; anything does with Shift.
-    const bool proportional = (keepAspect || start.kind == Item::Kind::Image ||
-                               (start.kind == Item::Kind::Text && isCorner(handle))) &&
+    // Type only by a corner: its sides set where it wraps, and its height is
+    // what its lines come to.
+    const bool proportional = (start.kind == Item::Kind::Text ? isCorner(handle)
+                                                               : keepAspect || start.kind == Item::Kind::Image) &&
                               from.width() > 0 && from.height() > 0;
+
+    // The least it is made across and down: as little as anything can be
+    // made, and a unit for a stroke. In proportion its width and height go
+    // together, and neither leaps to bring the other up to its least: what
+    // is already narrower or lower than that is made no less than it was,
+    // and a stroke, as often as not nearly level, keeps only its longer side
+    // to a unit, and that only if it was as long.
+    const qreal least = stroke ? 1 : Defaults::minimumSize;
+    QSizeF leastSize(least, least);
+    if (proportional && stroke)
+        leastSize = from.size() * qMin(1.0, least / qMax(from.width(), from.height()));
+    else if (proportional)
+        leastSize = QSizeF(qMin(least, from.width()), qMin(least, from.height()));
+
+    // The edges the handle holds follow the mouse; the others stay. All on
+    // whole units, so things stay on the pixel grid at 100%, but for a
+    // stroke: it is where the hand drew it, and rounded, one nearly level
+    // would come out flat.
+    qreal l = from.left() + (left ? delta.x() : 0), r = from.right() + (right ? delta.x() : 0);
+    qreal t = from.top() + (top ? delta.y() : 0), b = from.bottom() + (bottom ? delta.y() : 0);
+    if (!stroke)
+        l = std::round(l), r = std::round(r), t = std::round(t), b = std::round(b);
+
+    // The most is what a file holds across and down; and as a file holds no
+    // left or top edge farther out than that, either way, the one a handle
+    // holds goes no farther, and in proportion a side no handle holds grows
+    // or shrinks about its middle only as far as keeps its edge in. Where a
+    // side cannot have its least as well, at the very edge of the board,
+    // what a file holds comes first.
+    const QPointF middle = from.center();
+    qreal leastW = leastSize.width(), mostW = farthest, leastH = leastSize.height(), mostH = farthest;
+    if (left)
+        leastW = qMax(leastW, r - farthest), mostW = qMin(mostW, r + farthest);
+    else if (proportional && !right)
+        leastW = qMax(leastW, 2 * (middle.x() - farthest)), mostW = qMin(mostW, 2 * (middle.x() + farthest));
+    if (top)
+        leastH = qMax(leastH, b - farthest), mostH = qMin(mostH, b + farthest);
+    else if (proportional && !bottom)
+        leastH = qMax(leastH, 2 * (middle.y() - farthest)), mostH = qMin(mostH, 2 * (middle.y() + farthest));
+
+    qreal w = r - l, h = b - t;
     if (proportional) {
-        const qreal ratio = from.width() / from.height();
-        qreal w = r - l, h = b - t;
-        if (isCorner(handle)) {
-            if (w / ratio > h)
-                h = w / ratio;
-            else
-                w = h * ratio;
-            l = left ? r - w : l;
-            r = l + w;
-            t = top ? b - h : t;
-            b = t + h;
-        } else if (left || right) {
-            h = w / ratio;
-            t = from.center().y() - h / 2;
-            b = t + h;
-        } else {
-            w = h * ratio;
-            l = from.center().x() - w / 2;
-            r = l + w;
-        }
+        // One scale across and down: at a corner the larger side leads, at a
+        // side the side in hand, and only as far as both have room for.
+        const qreal across = w / from.width(), down = h / from.height();
+        const qreal scale = isCorner(handle) ? qMax(across, down) : left || right ? across : down;
+        const qreal smallest = qMax(leastW / from.width(), leastH / from.height());
+        const qreal largest = qMin(mostW / from.width(), mostH / from.height());
+        w = from.width() * qMin(largest, qMax(smallest, scale));
+        h = from.height() * qMin(largest, qMax(smallest, scale));
     }
-    const QRectF to(QPointF(l, t), QPointF(r, b));
+    // Each side that changes within its room, and not a hair out of it for
+    // how the proportion fell. Without proportion, a side no handle holds
+    // stays as it was.
+    if (proportional || left || right)
+        w = qMin(mostW, qMax(leastW, w));
+    if (proportional || top || bottom)
+        h = qMin(mostH, qMax(leastH, h));
+    // The edge opposite the handle stays where it was, and so does the
+    // middle of a side that follows in proportion.
+    l = left ? r - w : right || !proportional ? l : middle.x() - w / 2;
+    t = top ? b - h : bottom || !proportional ? t : middle.y() - h / 2;
+    // From its corner and its size, so that a side kept to the least is the
+    // least exactly, and not a hair under for where its middle fell.
+    const QRectF to(l, t, w, h);
 
     Item item = start;
     switch (start.kind) {
@@ -1366,8 +1606,10 @@ void CanvasView::dragResize(QPointF canvasPoint, bool keepAspect) {
         if (isCorner(handle)) {
             const qreal scale = to.height() / from.height();
             item.fontSize = qBound(6.0, std::round(start.fontSize * scale), 400.0);
+            // It wraps no wider than a file holds, though the type may grow
+            // more than the corner did: to whole points, and to 6 at least.
             if (start.wrap > 0)
-                item.wrap = std::round(start.wrap * item.fontSize / start.fontSize);
+                item.wrap = qMin(std::round(start.wrap * item.fontSize / start.fontSize), farthest);
         } else {
             item.wrap = qMax(24.0, to.width());
         }
@@ -1393,6 +1635,10 @@ void CanvasView::dragResize(QPointF canvasPoint, bool keepAspect) {
             item.rect.moveBottom(from.bottom());
         break;
     }
+    // And its corner where a file can have it, whatever its writing made of
+    // its size: at the very edge of the board, what grows to fit its text is
+    // pushed back in.
+    item.rect.moveTo(qBound(-farthest, item.rect.x(), farthest), qBound(-farthest, item.rect.y(), farthest));
     m_board->set(item);
 }
 
@@ -1422,11 +1668,91 @@ void CanvasView::dragMarquee(QPointF itemPoint) {
     setSelection(withGroups(touched));
 }
 
-void CanvasView::finishStroke() {
-    if (m_draftPoints.isEmpty())
+// The pen as it is set, for the view as it is: how wide it draws, in what
+// color, and how many screen pixels a unit is, which says how finely what it
+// draws is cut.
+Geo::Pen CanvasView::penInHand() const {
+    return Geo::Pen(m_penWidth / 2, Geo::packColor(colorFor(m_penColor, m_palette.bright)), m_zoom * devicePixels());
+}
+
+void CanvasView::drawTo(QPointF canvasPoint) {
+    refreshPen();
+    // Points closer than most of a screen pixel add nothing but weight.
+    const QPointF step = (canvasPoint - m_pen.points().last()) * m_zoom;
+    if (std::hypot(step.x(), step.y()) < 0.75)
         return;
-    // Keep the points the path needs to within a third of a screen pixel.
-    QVector<QPointF> points = Geo::simplify(m_draftPoints, 0.35 / m_zoom);
+    // Where the pen turned sharply it made a corner, which the line comes to
+    // a point at rather than rounding it off: that point is given twice (see
+    // Geo::smooth()). It can take a point more to tell where it was.
+    if (const Geo::Corner corner = Geo::cornerBefore(m_pen.points(), canvasPoint, 1 / m_zoom); !corner.points.isEmpty())
+        m_pen.redraw(corner.back, corner.points);
+    m_pen.add(canvasPoint);
+    if (full(m_pen))
+        carryOn();
+}
+
+// The stroke being drawn is cut for the pen and the view as they were when
+// it was: if either has changed since (a zoom, a wider pen, another color),
+// it is cut again, which can make it more triangles than it was. That waits
+// for the next point or the next frame, whichever comes first, so it is done
+// once however many times they changed in between. Either way a frame is on
+// its way (a point is drawn in one, and this is the start of making one
+// ready), so neither this nor carryOn() asks for one.
+void CanvasView::refreshPen() {
+    if (m_drag != Drag::Stroke)
+        return;
+    if (Geo::Pen pen = penInHand(); !pen.cutAlike(m_pen)) {
+        // Once it is past what it may be, it is put down as it is: the rest
+        // need not be cut to know that.
+        for (qsizetype i = 0; i < m_pen.points().size() && !full(pen); ++i)
+            pen.add(m_pen.points()[i]);
+        if (full(pen)) {
+            carryOn();
+            return;
+        }
+        m_pen = std::move(pen);
+        m_chromeDirty = true;
+    }
+    // How much it may be can have changed even so (see strokeLimit()).
+    if (full(m_pen))
+        carryOn();
+}
+
+// The stroke being drawn is drawn whole, however much of it is in view, so
+// it may only come to so many triangles, its share of a frame; and to only
+// so many points, as any stroke.
+bool CanvasView::full(const Geo::Pen &pen) const {
+    const qsizetype points = pen.points().size();
+    return points >= 2 && (points >= longestStroke || pen.triangles() > strokeLimit());
+}
+
+// Puts the stroke being drawn on the board as far as it has got, where it is
+// drawn as the board is, and carries on drawing from its last point as a
+// stroke of its own.
+void CanvasView::carryOn() {
+    // The pieces are one stroke to whoever picks it up: a group.
+    if (!m_strokeGroup)
+        m_strokeGroup = m_board->newGroup();
+    const QPointF last = m_pen.points().last();
+    m_strokePieces.append(finishStroke());
+    m_pen = penInHand();
+    m_pen.add(last);
+    m_chromeDirty = true;
+}
+
+// Puts the stroke being drawn on the board as far as it has got, and says
+// which item it is there: none, when there was nothing to put down.
+quint32 CanvasView::finishStroke() {
+    // One carried on from another and let go of before it went anywhere is
+    // only the end of that one, which is drawn already: not a dot of its own.
+    if (m_pen.points().isEmpty() || (m_strokeGroup && m_pen.points().size() == 1)) {
+        m_pen = Geo::Pen();
+        return 0;
+    }
+    // Keep the points its curve needs to stay within a third of a screen
+    // pixel of the curve that was drawn, corners and all: letting go of it
+    // changes nothing that shows.
+    QVector<QPointF> points = Geo::simplifyCurve(m_pen.points(), 0.35 / m_zoom);
     const QRectF bounds = Geo::boundsOf(points);
     for (QPointF &point : points)
         point -= bounds.topLeft();
@@ -1436,8 +1762,9 @@ void CanvasView::finishStroke() {
     stroke.points = points;
     stroke.width = m_penWidth;
     stroke.color = m_penColor;
-    m_draftPoints.clear();
-    m_board->add(stroke);
+    stroke.group = m_strokeGroup;
+    m_pen = Geo::Pen();
+    return m_board->add(stroke);
 }
 
 void CanvasView::finishBox(QPointF canvasPoint) {
@@ -1482,7 +1809,8 @@ void CanvasView::finishConnect(QPointF canvasPoint) {
 void CanvasView::cancelDrag() {
     if (m_drag == Drag::None)
         return;
-    if (m_dragStarted && m_board && (m_drag == Drag::Move || m_drag == Drag::Resize || m_drag == Drag::End))
+    if (m_dragStarted && m_board &&
+        (m_drag == Drag::Move || m_drag == Drag::Resize || m_drag == Drag::End || m_drag == Drag::Stroke))
         m_board->rollback();
     if (m_drag == Drag::Marquee)
         setSelection(m_marqueeBase);
@@ -1490,12 +1818,16 @@ void CanvasView::cancelDrag() {
 }
 
 void CanvasView::endDrag() {
+    // What the pen drew is kept, as the one step it began, however it came
+    // to be lifted. Backing out of it has rolled that back already.
+    if (m_drag == Drag::Stroke && m_board)
+        m_board->commit();
     const bool was = m_dragStarted;
     m_drag = Drag::None;
     m_dragStarted = false;
     m_dragItems.clear();
     m_dragHandle = -1;
-    m_draftPoints.clear();
+    m_pen = Geo::Pen();
     m_connectFrom = m_connectTarget = 0;
     m_chromeDirty = true;
     if (was) {
@@ -1504,8 +1836,9 @@ void CanvasView::endDrag() {
         m_layersStale = true;
         emit busyChanged();
     }
+    // Every press that was followed ends here, whatever it came to.
+    emit pressedChanged();
     updateCursor(m_pointerItem);
-    refreshSelectionBox();
     requestFrame();
 }
 
@@ -1520,6 +1853,8 @@ void CanvasView::attachEditor(QQuickTextDocument *document) {
 }
 
 void CanvasView::editSelection() {
+    if (!mayChange())
+        return;
     if (const Item *item = soleSelection())
         beginEdit(item->id, false);
 }
@@ -1533,9 +1868,11 @@ void CanvasView::beginEdit(quint32 id, bool isNew) {
     }
     if (editing())
         commitEdit();
-    // Everything typed is one step of undo.
+    // Everything typed is one step of undo, and is about this item from the
+    // start, typed in yet or not.
     if (!m_board->isOpen())
         m_board->begin();
+    m_board->hold(id);
     m_editing = id;
     m_editingNew = isNew;
     m_editorText = item->text;
@@ -1608,7 +1945,7 @@ void CanvasView::commitEdit() {
 // --- Doing things --------------------------------------------------------------------------
 
 void CanvasView::newNote() {
-    if (!m_board || editing())
+    if (!mayChange() || editing())
         return;
     Item note;
     note.kind = Item::Kind::Note;
@@ -1621,16 +1958,13 @@ void CanvasView::newNote() {
 }
 
 void CanvasView::insertImage(const QString &asset, QSize naturalSize, int position) {
-    if (!m_board || asset.isEmpty() || naturalSize.isEmpty())
+    if (!mayChange() || asset.isEmpty() || naturalSize.isEmpty())
         return;
-    // A screenful of photo is too much: start it at a size to arrange.
-    QSizeF size = naturalSize;
-    if (size.width() > 420 || size.height() > 320)
-        size.scale(420, 320, Qt::KeepAspectRatio);
+    // Neither a screenful nor a sliver: a size to arrange and to see.
+    const QSizeF size = Defaults::pictureSize(naturalSize);
     Item image;
     image.kind = Item::Kind::Image;
     image.asset = asset;
-    size = QSizeF(std::round(size.width()), std::round(size.height()));
     image.rect = QRectF(freeCorner(rounded(insertPoint() - QPointF(size.width(), size.height()) / 2 +
                                            QPointF(24, 24) * position),
                                    Item::Kind::Image),
@@ -1640,7 +1974,7 @@ void CanvasView::insertImage(const QString &asset, QSize naturalSize, int positi
 }
 
 void CanvasView::insertText(const QString &text) {
-    if (!m_board || text.trimmed().isEmpty())
+    if (!mayChange() || text.trimmed().isEmpty())
         return;
     Item item;
     item.kind = Item::Kind::Text;
@@ -1663,28 +1997,48 @@ void CanvasView::insertText(const QString &text) {
 }
 
 void CanvasView::selectAll() {
-    if (!m_board || editing())
+    // Selecting changes nothing on the board, but while the mouse is down
+    // what is selected is what the press moves, and the tool in hand is what
+    // it draws with: neither changes under it.
+    if (!m_board || editing() || pressed())
         return;
     setToolTo(Tool::Select);
     setSelection(m_board->order());
 }
 
-void CanvasView::clearSelection() { setSelection({}); }
+void CanvasView::clearSelection() {
+    // Nor is the selection emptied under a press.
+    if (!pressed())
+        setSelection({});
+}
 
 void CanvasView::setReadOnly(bool readOnly) {
     if (readOnly == m_readOnly)
         return;
     m_readOnly = readOnly;
+    if (m_readOnly) {
+        // From now on the board is only looked at. What was being written
+        // stays as it was written, what the mouse was in the middle of is
+        // put back, and a tool that makes things is put down.
+        if (editing())
+            commitEdit();
+        cancelDrag();
+        if (m_tool != Tool::Select && m_tool != Tool::Pan)
+            setToolTo(Tool::Select);
+    }
+    // The handles come and go with it.
+    m_chromeDirty = true;
+    updateCursor(m_pointerItem);
+    requestFrame();
     emit readOnlyChanged();
 }
 
 void CanvasView::deleteSelection() {
-    if (!m_board || editing() || m_selection.isEmpty())
+    if (!mayChange() || editing() || selection().isEmpty())
         return;
-    const QVector<quint32> ids = m_selection;
+    const QVector<quint32> ids = selection();
     m_board->begin();
-    for (quint32 id : ids)
-        m_board->remove(id);
+    m_board->remove(ids);
     m_board->commit();
 }
 
@@ -1718,7 +2072,7 @@ QVector<quint32> CanvasView::addCopies(const QVector<Item> &items, QPointF offse
     for (const Item &item : items)
         if (item.id)
             originals.insert(item.id);
-    // A copied connector, and what its ends were on that is being copied too.
+    // A copied connector, and what its ends were on that is copied after it.
     struct Join {
         quint32 connector, from, to;
     };
@@ -1737,18 +2091,26 @@ QVector<quint32> CanvasView::addCopies(const QVector<Item> &items, QPointF offse
         }
         Join join{0, 0, 0};
         if (item.kind == Item::Kind::Connector) {
-            // A copied connector joins the copies of what it joined, once
-            // they are all there: until then those ends are on nothing, as
-            // the board would have it of an end whose item it cannot find.
-            // One that came along with something it joins keeps its other
-            // end on the original. One copied on its own is on nothing: a
-            // line where it was put, not a second one exactly over the first.
+            // A copied connector joins the copies of what it joined. It goes
+            // down joined to those already down, under it: drawn after what
+            // it joins, as most are, it goes down as it is to be, and is not
+            // changed again to be joined, one more change for the window to
+            // catch up with. An end whose copy is not down yet is on nothing
+            // until they all are, as the board would have it of an end whose
+            // item it cannot find, and is joined then. One that came along
+            // with something it joins keeps its other end on the original.
+            // One copied on its own is on nothing: a line where it was put,
+            // not a second one exactly over the first.
             const bool cameAlong = originals.contains(item.from) || originals.contains(item.to);
             for (const auto &[end, copied] : {std::pair{&item.from, &join.from}, std::pair{&item.to, &join.to}}) {
-                if (originals.contains(*end))
+                if (originals.contains(*end) && ids.contains(*end)) {
+                    *end = ids.value(*end);
+                } else if (originals.contains(*end)) {
                     *copied = *end;
-                if (*copied || !(cameAlong && m_board->item(*end)))
                     *end = 0;
+                } else if (!(cameAlong && m_board->item(*end))) {
+                    *end = 0;
+                }
             }
         }
         const quint32 id = m_board->add(item);
@@ -1772,9 +2134,9 @@ QVector<quint32> CanvasView::addCopies(const QVector<Item> &items, QPointF offse
 }
 
 void CanvasView::duplicateSelection() {
-    if (!m_board || editing() || m_selection.isEmpty())
+    if (!mayChange() || editing() || selection().isEmpty())
         return;
-    QVector<quint32> ordered = m_selection;
+    QVector<quint32> ordered = selection();
     std::sort(ordered.begin(), ordered.end(),
               [this](quint32 a, quint32 b) { return m_board->depth(a) < m_board->depth(b); });
     QVector<Item> items;
@@ -1784,13 +2146,13 @@ void CanvasView::duplicateSelection() {
 }
 
 void CanvasView::copy() {
-    if (!m_board || editing() || m_selection.isEmpty())
+    if (!m_board || editing() || selection().isEmpty())
         return;
     auto *data = new QMimeData;
-    data->setData(clipboardFormat, serialize(m_selection));
+    data->setData(clipboardFormat, serialize(selection()));
     // And as plain text, for pasting what was written into anything else.
     QStringList texts;
-    for (quint32 id : std::as_const(m_selection))
+    for (quint32 id : selection())
         if (const Item *item = m_board->item(id); item && !item->text.isEmpty())
             texts << item->text;
     if (!texts.isEmpty())
@@ -1799,20 +2161,106 @@ void CanvasView::copy() {
 }
 
 void CanvasView::cut() {
+    // What may not be taken away is not copied either.
+    if (!mayChange())
+        return;
     copy();
     deleteSelection();
 }
 
+namespace {
+
+// What can be pasted of the items on the clipboard, back to front. They are
+// read as a board's file is, but anything could have put them there (Sprawl
+// 0.1.0, for one), and what is wrong with one item leaves out that item, not
+// the rest. A connector's end with nothing among them to be on is where it
+// was, and on nothing, as copying it without what it is on leaves it; and a
+// connector that does not say where that is has nowhere to be, so is left
+// out. Text from before an item held only so much is cut to what one holds,
+// and `shortened` says so; `leftOut` says that something was left out, and
+// it is all of it when the clipboard is not one this Sprawl reads.
+QVector<Item> pasteable(const QJsonObject &root, bool &shortened, bool &leftOut) {
+    // As in a file: a format this Sprawl reads, and the items in a list.
+    const QJsonValue version = root.value("sprawl"), list = root.value("items");
+    if (!version.isDouble() || version.toInt() > Board::formatVersion || (!list.isUndefined() && !list.isArray())) {
+        leftOut = true;
+        return {};
+    }
+    // Each item that could be read, and what it was read from.
+    struct Read {
+        Item item;
+        QJsonObject object;
+        bool shortened;
+    };
+    QVector<Read> read;
+    // The ids given, and those of the things a connector can be on.
+    QSet<quint32> ids, attachable;
+    const QJsonArray array = list.toArray();
+    for (const QJsonValue &value : array) {
+        if (!value.isObject())
+            continue;
+        QJsonObject object = value.toObject();
+        const QString text = object.value("text").toString();
+        if (text.size() > Item::longestText)
+            object["text"] = Item::fitted(text);
+        Item item;
+        if (!Board::itemFromJson(object, item).isEmpty())
+            continue;
+        // An id given twice is the first one's: the second is wrong, as it
+        // would be in a file.
+        if (item.id) {
+            if (ids.contains(item.id))
+                continue;
+            ids.insert(item.id);
+            if (Board::canAttach(item))
+                attachable.insert(item.id);
+        }
+        const bool fitted = item.hasText() && text.size() > Item::longestText;
+        read.append({std::move(item), std::move(object), fitted});
+    }
+    QVector<Item> items;
+    items.reserve(read.size());
+    for (Read &each : read) {
+        if (each.item.kind == Item::Kind::Connector) {
+            // Its ends with nothing to be on come off, and it is read again
+            // as what it is then: a free end has to say where it is.
+            const bool from = each.item.from && !attachable.contains(each.item.from);
+            const bool to = each.item.to && !attachable.contains(each.item.to);
+            if (from)
+                each.object.remove("from");
+            if (to)
+                each.object.remove("to");
+            if ((from || to) && !Board::itemFromJson(each.object, each.item).isEmpty())
+                continue;
+        }
+        shortened = shortened || each.shortened;
+        items.append(std::move(each.item));
+    }
+    // Each on the clipboard is pasted, or left out.
+    leftOut = items.size() < array.size();
+    return items;
+}
+
+} // namespace
+
 bool CanvasView::paste() {
-    if (!m_board || editing())
+    if (!mayChange() || editing())
         return true;
     const QMimeData *data = QGuiApplication::clipboard()->mimeData();
     if (!data || !data->hasFormat(clipboardFormat))
         return false;
     const QJsonObject root = QJsonDocument::fromJson(data->data(clipboardFormat)).object();
-    QVector<Item> items;
-    if (!Board::parse(root, items).isEmpty() || items.isEmpty())
-        return true;
+    bool shortened = false, leftOut = false;
+    QVector<Item> items = pasteable(root, shortened, leftOut);
+    if (items.isEmpty()) {
+        // With nothing at all to paste, the window pastes the clipboard as
+        // anything else would: as the text of what was copied, if there is
+        // any. That none of it could be is said once that is done, so that
+        // nothing said of the text is said over it.
+        if (leftOut)
+            QMetaObject::invokeMethod(this, &CanvasView::itemsLeftOut, Qt::QueuedConnection);
+        return false;
+    }
 
     // Pictures copied from another board come along with their files. The
     // clipboard only says where to look for them, and anything running can
@@ -1837,15 +2285,22 @@ bool CanvasView::paste() {
     offset += freeCorner(first.rect.topLeft() + offset, first.kind) - (first.rect.topLeft() + offset);
     setToolTo(Tool::Select);
     setSelection(addCopies(items, offset));
+    // What was left out is said, or else text that was cut short, once all
+    // the rest is down: a notice is up for only so long, and a big paste
+    // takes a while.
+    if (leftOut)
+        emit itemsLeftOut();
+    else if (shortened)
+        emit textLeftOut();
     return true;
 }
 
 void CanvasView::groupSelection() {
-    if (!m_board || m_selection.size() < 2)
+    if (!mayChange() || editing() || selection().size() < 2)
         return;
     const quint32 group = m_board->newGroup();
     m_board->begin();
-    for (quint32 id : std::as_const(m_selection)) {
+    for (quint32 id : selection()) {
         Item item = *m_board->item(id);
         item.group = group;
         m_board->set(item);
@@ -1854,10 +2309,10 @@ void CanvasView::groupSelection() {
 }
 
 void CanvasView::ungroupSelection() {
-    if (!m_board || m_selection.isEmpty())
+    if (!mayChange() || editing() || selection().isEmpty())
         return;
     m_board->begin();
-    for (quint32 id : std::as_const(m_selection)) {
+    for (quint32 id : selection()) {
         Item item = *m_board->item(id);
         item.group = 0;
         m_board->set(item);
@@ -1866,38 +2321,40 @@ void CanvasView::ungroupSelection() {
 }
 
 void CanvasView::bringToFront() {
-    if (m_board && !m_selection.isEmpty())
-        m_board->restack(m_selection, true);
+    if (mayChange() && !selection().isEmpty())
+        m_board->restack(selection(), true);
 }
 
 void CanvasView::sendToBack() {
-    if (m_board && !m_selection.isEmpty())
-        m_board->restack(m_selection, false);
+    if (mayChange() && !selection().isEmpty())
+        m_board->restack(selection(), false);
 }
 
 void CanvasView::nudge(qreal dx, qreal dy) {
-    if (!m_board || editing() || m_selection.isEmpty())
+    if (!mayChange() || editing() || selection().isEmpty())
         return;
-    m_pressCanvas = QPointF(0, 0);
-    startMove();
-    dragMove(QPointF(dx, dy));
+    // What a drag would take along, moved as a drag moves it, in a step of
+    // its own; nothing of a drag's own is borrowed for it.
+    m_board->begin();
+    moveBy(carried(), rounded(QPointF(dx, dy)));
     m_board->commit();
-    m_dragItems.clear();
 }
 
 void CanvasView::setSelectionColor(const QString &color) {
     if (!color.isEmpty() && !Item::colorNames().contains(color))
         return;
-    if (!m_board || m_selection.isEmpty()) {
+    if (!m_board || selection().isEmpty()) {
         // Nothing selected: it is the pen's color that is being picked.
         setPenColor(color == m_penColor ? QString() : color);
         return;
     }
+    if (!mayChange() || editing())
+        return;
     // Picking the color everything already has takes it off again, back to
     // the kind's own neutral. Notes are always some color.
     const bool clear = selectionColor() == color;
     m_board->begin();
-    for (quint32 id : std::as_const(m_selection)) {
+    for (quint32 id : selection()) {
         Item item = *m_board->item(id);
         if (item.kind == Item::Kind::Image)
             continue;
@@ -1916,14 +2373,14 @@ void CanvasView::setSelectionColor(const QString &color) {
 }
 
 void CanvasView::setSelectionShape(const QString &name) {
-    if (!m_board || editing() || m_selection.isEmpty())
+    if (!mayChange() || editing() || selection().isEmpty())
         return;
     const int index = int(Board::shapes().indexOf(name));
     if (index < 0)
         return;
     const Item::Shape shape = Item::Shape(index);
     m_board->begin();
-    for (quint32 id : std::as_const(m_selection)) {
+    for (quint32 id : selection()) {
         Item item = *m_board->item(id);
         if (item.kind != Item::Kind::Shape || item.shape == shape)
             continue;
@@ -1938,16 +2395,16 @@ void CanvasView::setSelectionShape(const QString &name) {
 }
 
 void CanvasView::toggleBold() {
-    if (!m_board || m_selection.isEmpty())
+    if (!mayChange() || selection().isEmpty())
         return;
     bool anyPlain = false;
-    for (quint32 id : std::as_const(m_selection))
+    for (quint32 id : selection())
         if (const Item *item = m_board->item(id); item && item->kind == Item::Kind::Text && !item->bold)
             anyPlain = true;
     const bool wasOpen = m_board->isOpen();
     if (!wasOpen)
         m_board->begin();
-    for (quint32 id : std::as_const(m_selection)) {
+    for (quint32 id : selection()) {
         Item item = *m_board->item(id);
         if (item.kind != Item::Kind::Text)
             continue;
@@ -1960,12 +2417,12 @@ void CanvasView::toggleBold() {
 }
 
 void CanvasView::resizeText(int direction) {
-    if (!m_board || m_selection.isEmpty())
+    if (!mayChange() || selection().isEmpty())
         return;
     const bool wasOpen = m_board->isOpen();
     if (!wasOpen)
         m_board->begin();
-    for (quint32 id : std::as_const(m_selection)) {
+    for (quint32 id : selection()) {
         Item item = *m_board->item(id);
         if (item.kind != Item::Kind::Text)
             continue;
@@ -1993,21 +2450,30 @@ void CanvasView::resizeText(int direction) {
 }
 
 void CanvasView::undo() {
-    if (!m_board)
+    if (!mayChange())
         return;
     if (editing())
         commitEdit();
-    cancelDrag();
     m_board->undo();
 }
 
 void CanvasView::redo() {
-    if (!m_board)
+    if (!mayChange())
         return;
     if (editing())
         commitEdit();
-    cancelDrag();
     m_board->redo();
+}
+
+QVariantList CanvasView::redoKeys() const { return redoKeysWith(QKeySequence::keyBindings(QKeySequence::Redo)); }
+
+QVariantList CanvasView::redoKeysWith(const QList<QKeySequence> &desktop) {
+    // Some desktops count Ctrl+Y among their own. Named again, it would be
+    // ambiguous, and an ambiguous shortcut never fires.
+    QVariantList keys{int(QKeySequence::Redo)};
+    if (!desktop.contains(QKeySequence(Qt::CTRL | Qt::Key_Y)))
+        keys.append(QStringLiteral("Ctrl+Y"));
+    return keys;
 }
 
 bool CanvasView::escape() {
@@ -2023,7 +2489,7 @@ bool CanvasView::escape() {
         setToolTo(Tool::Select);
         return true;
     }
-    if (!m_selection.isEmpty()) {
+    if (!selection().isEmpty()) {
         setSelection({});
         return true;
     }

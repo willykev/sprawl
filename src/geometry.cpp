@@ -2,8 +2,11 @@
 
 #include <QColor>
 #include <QLineF>
+#include <QtMath>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <optional>
 
 namespace Geo {
 
@@ -16,11 +19,29 @@ inline qreal cross(QPointF a, QPointF b) { return a.x() * b.y() - a.y() * b.x();
 // An arc is drawn as one triangle per this many radians: fine enough that a
 // thick stroke's cap stays round when zoomed all the way in.
 const qreal arcStep = M_PI / 10;
+// How far a line cut for one size on screen strays from true, at most, in
+// screen pixels: a quarter of one, which its soft edge hides.
+const qreal pixelTolerance = 0.25;
+
+// How much of an arc one triangle may take, for a line with this half width
+// seen at `scale` screen pixels to the unit: as much as keeps its rim within
+// a quarter of a pixel of round, and never less than arcStep. The shader
+// widens a line to at least a pixel, and half a pixel more for its soft
+// edge, so a rim is never nearer the middle than a pixel; and that near, a
+// whole disc is round enough in five triangles.
+qreal arcStepFor(qreal halfWidth, qreal scale) {
+    if (scale <= 0)
+        return arcStep;
+    const qreal rim = qMax(halfWidth * scale, 0.5) + 0.5;
+    return qMax(arcStep, 2 * std::acos(1 - pixelTolerance / rim));
+}
 
 struct Builder {
     StrokeMesh &mesh;
     float halfWidth;
     quint32 color;
+    // How much of an arc one triangle takes.
+    qreal step = arcStep;
 
     quint32 vertex(QPointF center, QPointF normal, float side) {
         StrokeVertex v;
@@ -46,7 +67,7 @@ struct Builder {
 
     // A wedge of a disc around `center`, from angle `from` sweeping `sweep`.
     void fan(QPointF center, qreal from, qreal sweep) {
-        const int steps = qMax(1, int(std::ceil(std::abs(sweep) / arcStep)));
+        const int steps = qMax(1, int(std::ceil(std::abs(sweep) / step)));
         const quint32 middle = vertex(center, QPointF(1, 0), 0);
         quint32 previous = vertex(center, QPointF(std::cos(from), std::sin(from)), 1);
         for (int i = 1; i <= steps; ++i) {
@@ -58,12 +79,9 @@ struct Builder {
     }
 };
 
-} // namespace
-
-QVector<QPointF> simplify(const QVector<QPointF> &points, qreal tolerance) {
+// Which of the points a path needs (see simplify()), of three or more.
+QVector<bool> needed(const QVector<QPointF> &points, qreal tolerance) {
     const int count = points.size();
-    if (count < 3 || tolerance <= 0)
-        return points;
     QVector<bool> keep(count, false);
     keep[0] = keep[count - 1] = true;
     QVector<QPair<int, int>> stack{{0, count - 1}};
@@ -84,6 +102,16 @@ QVector<QPointF> simplify(const QVector<QPointF> &points, qreal tolerance) {
             stack.append({index, last});
         }
     }
+    return keep;
+}
+
+} // namespace
+
+QVector<QPointF> simplify(const QVector<QPointF> &points, qreal tolerance) {
+    const int count = points.size();
+    if (count < 3 || tolerance <= 0)
+        return points;
+    const QVector<bool> keep = needed(points, tolerance);
     QVector<QPointF> kept;
     for (int i = 0; i < count; ++i)
         if (keep[i])
@@ -91,37 +119,397 @@ QVector<QPointF> simplify(const QVector<QPointF> &points, qreal tolerance) {
     return kept;
 }
 
+namespace {
+
+// The stretch of the smooth curve from points[i] to points[i + 1], handed to
+// `each` a point at a time, all but the first. It bends with the points
+// either side as well, so it is only settled once there is a point after
+// the next.
+template <class Each> void curveBetween(const QVector<QPointF> &points, int i, qreal tolerance, Each each) {
+    const int count = points.size();
+    const QPointF p0 = points[qMax(i - 1, 0)], p1 = points[i], p2 = points[i + 1], p3 = points[qMin(i + 2, count - 1)];
+    // Centripetal: the knots are spaced by the square root of the distance
+    // between points.
+    const qreal d1 = std::sqrt(length(p1 - p0)), d2 = std::sqrt(length(p2 - p1)), d3 = std::sqrt(length(p3 - p2));
+    if (d2 < 1e-6)
+        return;
+    // The cubic Bezier between p1 and p2 that the spline is there.
+    const QPointF b1 = d1 < 1e-6 ? p1 + (p2 - p1) / 3
+                                 : (d1 * d1 * p2 - d2 * d2 * p0 + (2 * d1 * d1 + 3 * d1 * d2 + d2 * d2) * p1) /
+                                       (3 * d1 * (d1 + d2));
+    const QPointF b2 = d3 < 1e-6 ? p2 - (p2 - p1) / 3
+                                 : (d3 * d3 * p1 - d2 * d2 * p3 + (2 * d3 * d3 + 3 * d3 * d2 + d2 * d2) * p2) /
+                                       (3 * d3 * (d3 + d2));
+    // Wang's bound on how many segments keep a cubic within tolerance.
+    const qreal bend = qMax(length(p1 - 2 * b1 + b2), length(b1 - 2 * b2 + p2));
+    const int steps = qBound(1, int(std::ceil(std::sqrt(0.75 * bend / qMax(tolerance, 1e-3)))), 32);
+    for (int step = 1; step <= steps; ++step) {
+        const qreal t = qreal(step) / steps, u = 1 - t;
+        each(u * u * u * p1 + 3 * u * u * t * b1 + 3 * u * t * t * b2 + t * t * t * p2);
+    }
+}
+
+} // namespace
+
 QVector<QPointF> smooth(const QVector<QPointF> &points, qreal tolerance) {
     const int count = points.size();
     if (count < 3)
         return points;
-    tolerance = qMax(tolerance, 1e-3);
     QVector<QPointF> curve;
     curve.reserve(count * 4);
     curve.append(points[0]);
+    for (int i = 0; i + 1 < count; ++i)
+        curveBetween(points, i, tolerance, [&curve](QPointF point) { curve.append(point); });
+    return curve;
+}
+
+namespace {
+
+// A line that turns by 75 degrees or more comes to a point: the corner of a
+// box, the head of an arrow, the points of a zigzag. One that turns by 40 or
+// more does too where it runs straight either side. A curve drawn by hand
+// turns as sharply only where it was drawn with too few points to tell it
+// from a corner, and runs straight either side of a turn only where it was
+// drawn with too few to tell it from a polygon.
+const qreal sharpTurn = 75, gentleTurn = 40;
+// How far, in screen pixels, the pen has to go either side of a sharp turn
+// for it to be a corner. Nearer, the turn can be the pixels it moves on: a
+// line drawn a pixel at a time steps across them, a right angle at every
+// step.
+const qreal cornerReach = 3;
+// How far it has to go either side of a turn split between two points, for
+// where the lines either side meet to be told apart from how the pixels
+// under them fall.
+const qreal splitReach = 8;
+// Rounded off, a corner bulges out by about a thirteenth of the shorter of
+// the stretches either side of it times the sine of its turn: a gentle turn
+// is only a corner where that would show, half a pixel or more.
+const qreal roundingShows = 6.7;
+// The pen moves over whole pixels, so where it went is up to half a pixel's
+// diagonal off, and which way it went by that over each stretch.
+const qreal pixelOff = 0.7;
+// How far, in screen pixels, a point can be from the line through the points
+// either side of it for the line to run straight there. The pixels put the
+// point off one way and those either side as much the other, so a line
+// straight on the screen can bend at a point by a pixel or more. Into a
+// sharp corner it may bend by a pixel, as how fast the hand went by the
+// corner tells a round one from a sharp one (see cornerPace). Either side of
+// a gentle turn, where the way round a curve is all but as long as the way by
+// a corner and only how straight the line runs tells them apart, by less.
+const qreal sharpRunOff = 1, gentleRunOff = 0.8;
+// A hand goes round a corner no faster than it goes either side of it: the
+// way by a corner between two points is no more than a tenth longer than
+// the stretches either side, and as much as where the corner is can be off.
+// Further, it went round a curve that cut the corner short.
+const qreal cornerPace = 1.1;
+
+// How far a line turns going along `in` and then along `out`, in degrees to
+// the left or to the right.
+qreal turnFrom(QPointF in, QPointF out) { return qRadiansToDegrees(std::atan2(cross(in, out), dot(in, out))); }
+
+// Where a hand that went along `in` and then along `out` went round a
+// corner, on its way from the end of the one to the start of the other:
+// where the two meet, ahead of the one and behind the other, by a way that
+// keeps its pace, a point every `pace` (see cornerPace). None where they do
+// not meet like that. `pixel` is how long a screen pixel is.
+std::optional<QPointF> wentRound(const QLineF &in, const QLineF &out, qreal pace, qreal pixel) {
+    QPointF corner;
+    if (in.intersects(out, &corner) == QLineF::NoIntersection)
+        return std::nullopt;
+    const QPointF along = in.p2() - in.p1(), onwards = out.p2() - out.p1();
+    const qreal ahead = dot(corner - in.p2(), along) / in.length(),
+                behind = dot(out.p1() - corner, onwards) / out.length();
+    // Each line is as far off as the points it goes through (see pixelOff),
+    // which puts where they meet further off the more nearly head on they
+    // meet: the sharper the corner, the more.
+    const qreal half = qDegreesToRadians(180 - std::abs(turnFrom(along, onwards))) / 2;
+    const qreal slack = qMin(pixelOff * pixel / std::tan(half), pace);
+    if (ahead < 0 || behind < 0 || ahead + behind > cornerPace * pace + slack)
+        return std::nullopt;
+    return corner;
+}
+
+// The line nearest all of `run`, from where the first of its points is on it
+// to where the last is: the line through them, if there are two. Through a
+// few of the pen's points it is nearer true than the line through any two of
+// them, as the pixels put some of them one way and some the other.
+QLineF fitted(const QVector<QPointF> &run) {
+    if (run.size() < 3)
+        return QLineF(run.first(), run.last());
+    QPointF middle;
+    for (const QPointF &point : run)
+        middle += point;
+    middle /= run.size();
+    // Which way they spread most (least squares, across the line).
+    qreal xx = 0, xy = 0, yy = 0;
+    for (const QPointF &point : run) {
+        const QPointF from = point - middle;
+        xx += from.x() * from.x();
+        xy += from.x() * from.y();
+        yy += from.y() * from.y();
+    }
+    const qreal angle = std::atan2(2 * xy, xx - yy) / 2;
+    QPointF along(std::cos(angle), std::sin(angle));
+    if (dot(along, run.last() - run.first()) < 0)
+        along = -along;
+    return QLineF(middle + along * dot(run.first() - middle, along), middle + along * dot(run.last() - middle, along));
+}
+
+// How far `point` is from the line through `count` points from `line`.
+qreal distanceTo(const QPointF *line, int count, QPointF point) {
+    if (count == 1)
+        return length(point - line[0]);
+    qreal nearest = std::numeric_limits<qreal>::max();
+    for (int i = 0; i + 1 < count; ++i)
+        nearest = qMin(nearest, distanceToSegment(point, line[i], line[i + 1]));
+    return nearest;
+}
+
+// How far apart two lines are: as far as any point of either is from the
+// other. Measured only until that is past `enough`: how far past does not
+// matter.
+qreal apart(const QPointF *one, int ones, const QPointF *other, int others, qreal enough) {
+    qreal furthest = 0;
+    for (int i = 0; i < ones && furthest <= enough; ++i)
+        furthest = qMax(furthest, distanceTo(other, others, one[i]));
+    for (int i = 0; i < others && furthest <= enough; ++i)
+        furthest = qMax(furthest, distanceTo(one, ones, other[i]));
+    return furthest;
+}
+
+} // namespace
+
+Corner cornerBefore(const QVector<QPointF> &points, QPointF next, qreal pixel) {
+    // The end of the line, the newest first and a corner's two points as
+    // one: `next`, the last point, the one before it and so on, each with
+    // where it is in `points`, whether the line comes to a point there and
+    // whether it starts there.
+    struct End {
+        QPointF at;
+        int index = -1;
+        bool corner = false, start = false;
+    };
+    std::array<End, 7> end;
+    end[0].at = next;
+    int count = 1;
+    for (int i = int(points.size()) - 1; i >= 0 && count < int(end.size()); ++count) {
+        End &point = end[count];
+        point.at = points[i];
+        point.corner = i > 0 && points[i - 1] == points[i];
+        point.index = point.corner ? i - 1 : i;
+        point.start = point.index == 0;
+        i = point.index - 1;
+    }
+    if (count < 3 || end[1].corner)
+        return {};
+    // The line from the point k + 1 back to the kth, in screen pixels...
+    auto stretch = [&](int k) { return length(end[k].at - end[k + 1].at) / pixel; };
+    // ...the way it turns at the kth...
+    auto turn = [&](int k) { return turnFrom(end[k].at - end[k + 1].at, end[k - 1].at - end[k].at); };
+    // ...and as much as that can be, by the point and those either side of it
+    // being `by` screen pixels off across it.
+    auto off = [&](int k, qreal by = pixelOff) { return qRadiansToDegrees(by / stretch(k) + by / stretch(k - 1)); };
+    // Whether it runs straight through the kth point next to a turn of
+    // `turned`: turns there by no more than a third of that, nor than its
+    // points `by` off make it.
+    auto straight = [&](int k, qreal turned, qreal by) { return std::abs(turn(k)) <= qMin(turned / 3, off(k, by)); };
+    // The line straight into the kth point, its points oldest first: as far
+    // back as it runs straight, two points more at most, or to where it
+    // starts or comes to a point (`whole`).
+    struct Run {
+        QVector<QPointF> points;
+        int straight = 0;
+        bool whole = false;
+    };
+    auto runInto = [&](int k, qreal turned, qreal by) {
+        Run run{{end[k + 1].at, end[k].at}};
+        for (int j = k + 1; j < k + 3; ++j) {
+            if (end[j].start || end[j].corner || j + 1 >= count) {
+                run.whole = true;
+                break;
+            }
+            if (!straight(j, turned, by))
+                break;
+            run.points.prepend(end[j + 1].at);
+            ++run.straight;
+        }
+        return run;
+    };
+    // How far the hand went from one point to the next, by the stretches
+    // either side of a corner: only the one after it where the one before
+    // starts where the line did or came to a point, as only part of a
+    // stretch's way was gone by then.
+    auto pace = [&](const Run &run, int k, const QLineF &out) {
+        return run.whole && run.straight == 0 ? out.length() : qMin(stretch(k) * pixel, out.length());
+    };
+    const qreal last = turn(1);
+    // A sharp turn split between the last two points, after a straight run:
+    // the hand went fast by a corner between them, which is where the run
+    // and the way on from the last point meet. That can be past a point the
+    // pen took for the corner, as it turned sharply where the hand had all
+    // but reached it. A run from where the line starts or comes to a point
+    // can be a single stretch: the stroke of a tick goes into its corner
+    // with a point or two.
+    if (count >= 4 && !end[2].start) {
+        const qreal before = turn(2);
+        const Run run = runInto(2, std::abs(before + last), sharpRunOff);
+        const QLineF in = fitted(run.points), out(end[1].at, end[0].at);
+        if (before * last > 0 && stretch(2) >= splitReach && stretch(0) >= splitReach && std::abs(last) > off(1) &&
+            std::abs(before) > off(2) && (run.straight >= 2 || run.whole) &&
+            std::abs(turnFrom(in.p2() - in.p1(), out.p2() - out.p1())) >= sharpTurn)
+            if (const std::optional<QPointF> corner = wentRound(in, out, pace(run, 2, out), pixel))
+                return {int(points.size()) - end[2].index - 1, {*corner, *corner, end[1].at}};
+    }
+    // A gentle turn at the point before last, the line straight either side
+    // of it, which would show rounded off.
+    if (count >= 4 && !end[2].start && !end[2].corner) {
+        const qreal turned = std::abs(turn(2));
+        const Run run = runInto(2, turned, gentleRunOff);
+        if (turned >= gentleTurn &&
+            qMin(stretch(2), stretch(1)) * std::sin(qDegreesToRadians(turned)) >= roundingShows &&
+            (run.straight >= 2 || (run.straight >= 1 && run.whole)) && straight(1, turned, gentleRunOff))
+            return {1, {end[2].at, end[1].at}};
+    }
+    // A gentle turn split between the two points before that, the line
+    // straight either side of them.
+    if (count >= 5 && !end[3].start && !end[3].corner && !end[2].corner) {
+        const qreal first = turn(3), second = turn(2), both = std::abs(first + second);
+        const Run run = runInto(3, both, gentleRunOff);
+        const QLineF in = fitted(run.points), out(end[2].at, end[1].at);
+        const qreal turned = std::abs(turnFrom(in.p2() - in.p1(), out.p2() - out.p1()));
+        if (first * second > 0 && stretch(3) >= splitReach && stretch(1) >= splitReach && std::abs(first) > off(3) &&
+            std::abs(second) > off(2) && (run.straight >= 2 || (run.straight >= 1 && run.whole)) &&
+            straight(1, both, gentleRunOff) && turned >= gentleTurn &&
+            qMin(stretch(3), stretch(1)) * std::sin(qDegreesToRadians(turned)) >= roundingShows)
+            if (const std::optional<QPointF> corner = wentRound(in, out, pace(run, 3, out), pixel))
+                return {2, {*corner, *corner, end[2].at, end[1].at}};
+    }
+    // A sharp turn at the last point, the line coming from the start or
+    // another corner, or straight into it: at the point before it turns by
+    // no more than a third as much, even as far off as the pixels can put
+    // that, and at the two before by no more than that together. The foot of
+    // a loop drawn small turns at all three, if by little at one of them, and
+    // so does a hand that shakes.
+    auto ranStraight = [&] {
+        if (end[2].start || end[2].corner)
+            return true;
+        if (std::abs(turn(2)) + off(2) > std::abs(last) / 3)
+            return false;
+        return end[3].start || end[3].corner || count < 5 || std::abs(turn(2) + turn(3)) <= std::abs(last) / 3;
+    };
+    if (std::abs(last) >= sharpTurn && stretch(1) >= cornerReach && stretch(0) >= cornerReach && ranStraight())
+        return {0, {end[1].at}};
+    return {};
+}
+
+QVector<QPointF> simplifyCurve(const QVector<QPointF> &points, qreal tolerance) {
+    const int count = points.size();
+    if (count < 3 || tolerance <= 0)
+        return points;
+    // Both curves are cut into pieces within a sixteenth of `tolerance` of
+    // them to be measured against each other, so they can be an eighth of it
+    // further apart than they measure: they may measure what is left. Cut
+    // less finely, a line that waves by a little less than `tolerance` would
+    // measure as waving by more, and be kept wave by wave.
+    const qreal fine = tolerance / 16, near = tolerance - 2 * fine;
+    // The curve through every point, and where on it each point is.
+    QVector<QPointF> whole{points[0]};
+    QVector<int> at(count, 0);
     for (int i = 0; i + 1 < count; ++i) {
-        const QPointF p0 = points[qMax(i - 1, 0)], p1 = points[i], p2 = points[i + 1], p3 = points[qMin(i + 2, count - 1)];
-        // Centripetal: the knots are spaced by the square root of the
-        // distance between points.
-        const qreal d1 = std::sqrt(length(p1 - p0)), d2 = std::sqrt(length(p2 - p1)), d3 = std::sqrt(length(p3 - p2));
-        if (d2 < 1e-6)
+        curveBetween(points, i, fine, [&whole](QPointF point) { whole.append(point); });
+        at[i + 1] = int(whole.size()) - 1;
+    }
+    // From the points the path needs on to those the curve needs. A point
+    // drawn twice is a corner (see smooth()), and is kept twice or not at all.
+    QVector<bool> keep = needed(points, tolerance);
+    for (int i = 1; i < count; ++i)
+        if (points[i] == points[i - 1] && keep[i] != keep[i - 1])
+            keep[i] = keep[i - 1] = true;
+    // The points kept, each with the one kept before it and after it, and the
+    // stretches of curve from one to the next still to look at, by where they
+    // start.
+    QVector<int> before(count, -1), after(count, -1), waiting;
+    for (int i = 0, kept = -1; i < count; ++i)
+        if (keep[i]) {
+            before[i] = kept;
+            if (kept >= 0) {
+                after[kept] = i;
+                waiting.append(kept);
+            }
+            kept = i;
+        }
+    // Keeps the ith point, which is between the kept points `from` and `to`,
+    // and with it the other of a corner's two. A stretch of curve bends with
+    // the points either side of it, so those it bends are looked at again.
+    auto keepAt = [&](int i, int from, int to) {
+        int first = i, last = i;
+        while (first > from + 1 && points[first - 1] == points[i])
+            --first;
+        while (last < to - 1 && points[last + 1] == points[i])
+            ++last;
+        for (int j = first; j <= last; ++j) {
+            keep[j] = true;
+            before[j] = j == first ? from : j - 1;
+            after[j] = j == last ? to : j + 1;
+        }
+        after[from] = first;
+        before[to] = last;
+        for (const int start : {before[from], from, first, last, to})
+            if (start >= 0 && after[start] >= 0)
+                waiting.append(start);
+    };
+    // The stretch of curve from one point kept to the next bends with the
+    // points kept either side of it, and is only looked at again once one of
+    // those is another.
+    QVector<std::array<int, 3>> matched(count, {-1, -1, -1});
+    QVector<QPointF> stretch;
+    for (qsizetype next = 0; next < waiting.size(); ++next) {
+        const int a = waiting[next], b = after[a];
+        const std::array<int, 3> around{before[a], b, after[b]};
+        if (matched[a] == around)
             continue;
-        // The cubic Bezier between p1 and p2 that the spline is there.
-        const QPointF b1 = d1 < 1e-6 ? p1 + (p2 - p1) / 3
-                                     : (d1 * d1 * p2 - d2 * d2 * p0 + (2 * d1 * d1 + 3 * d1 * d2 + d2 * d2) * p1) /
-                                           (3 * d1 * (d1 + d2));
-        const QPointF b2 = d3 < 1e-6 ? p2 - (p2 - p1) / 3
-                                     : (d3 * d3 * p1 - d2 * d2 * p3 + (2 * d3 * d3 + 3 * d3 * d2 + d2 * d2) * p2) /
-                                           (3 * d3 * (d3 + d2));
-        // Wang's bound on how many segments keep a cubic within tolerance.
-        const qreal bend = qMax(length(p1 - 2 * b1 + b2), length(b1 - 2 * b2 + p2));
-        const int steps = qBound(1, int(std::ceil(std::sqrt(0.75 * bend / tolerance))), 32);
-        for (int step = 1; step <= steps; ++step) {
-            const qreal t = qreal(step) / steps, u = 1 - t;
-            curve.append(u * u * u * p1 + 3 * u * u * t * b1 + 3 * u * t * t * b2 + t * t * t * p2);
+        // From one point to the next, bent by the points either side of them,
+        // it is the curve as drawn.
+        if (b == a + 1 && around[0] == a - 1 && around[2] == (b + 1 < count ? b + 1 : -1)) {
+            matched[a] = around;
+            continue;
+        }
+        const QVector<QPointF> bending{points[around[0] >= 0 ? around[0] : a], points[a], points[b],
+                                       points[around[2] >= 0 ? around[2] : b]};
+        stretch = {points[a]};
+        curveBetween(bending, 1, fine, [&stretch](QPointF point) { stretch.append(point); });
+        if (apart(stretch.constData(), int(stretch.size()), whole.constData() + at[a], at[b] - at[a] + 1, near) <=
+            near) {
+            matched[a] = around;
+            continue;
+        }
+        // Too far from the curve as drawn: the point between it strays
+        // furthest from puts that right, of those at least a quarter of the
+        // way from either end, so that a long stretch is cut well short each
+        // time and looked at again only a few times. With none between, the
+        // points either side that bend it.
+        const int from = b - a > 4 ? a + (b - a) / 4 : a + 1, to = b - a > 4 ? b - (b - a) / 4 : b - 1;
+        int furthest = -1;
+        qreal most = -1;
+        for (int i = from; i <= to; ++i)
+            if (const qreal off = distanceTo(stretch.constData(), int(stretch.size()), points[i]); off > most) {
+                most = off;
+                furthest = i;
+            }
+        if (furthest >= 0) {
+            keepAt(furthest, a, b);
+        } else {
+            if (a > 0 && !keep[a - 1])
+                keepAt(a - 1, before[a], a);
+            if (b + 1 < count && !keep[b + 1])
+                keepAt(b + 1, b, after[b]);
         }
     }
-    return curve;
+    QVector<QPointF> kept;
+    for (int i = 0; i < count; ++i)
+        if (keep[i])
+            kept.append(points[i]);
+    return kept;
 }
 
 QRectF boundsOf(const QVector<QPointF> &points) {
@@ -145,87 +533,139 @@ quint32 packColor(const QColor &color, qreal opacity) {
 }
 
 void strokePolyline(StrokeMesh &mesh, const QVector<QPointF> &source, QPointF offset, qreal halfWidth, quint32 color,
-                    Cap cap, Join join) {
+                    Cap cap, Join join, qreal scale) {
+    StrokeLine line(halfWidth, color, cap, join, scale);
+    for (const QPointF &point : source)
+        line.add(mesh, point + offset);
+    line.end(mesh);
+}
+
+StrokeLine::StrokeLine(qreal halfWidth, quint32 color, Cap cap, Join join, qreal scale)
+    : m_halfWidth(float(halfWidth)), m_color(color), m_cap(cap), m_join(join), m_step(arcStepFor(halfWidth, scale)) {}
+
+// The two vertices across the line at a point of it.
+StrokeLine::Pair StrokeLine::pairAt(StrokeMesh &mesh, QPointF center, QPointF normal) const {
+    Builder build{mesh, m_halfWidth, m_color, m_step};
+    return Pair{build.vertex(center, normal, 1), build.vertex(center, normal, -1)};
+}
+
+void StrokeLine::add(StrokeMesh &mesh, QPointF point) {
     // Points on top of each other have no direction to draw along.
-    QVector<QPointF> points;
-    points.reserve(source.size());
-    for (const QPointF &p : source) {
-        const QPointF moved = p + offset;
-        if (points.isEmpty() || length(moved - points.last()) > 1e-4)
-            points.append(moved);
-    }
-    if (points.isEmpty())
+    if (m_count > 0 && length(point - m_last) <= 1e-4)
         return;
-
-    Builder build{mesh, float(halfWidth), color};
-    const int count = points.size();
-    if (count == 1) {
-        // A tap of the pen is a dot.
-        build.fan(points[0], 0, 2 * M_PI);
+    if (++m_count == 1) {
+        m_first = m_last = point;
         return;
     }
-
-    const int segments = count - 1;
-    QVector<QPointF> directions(segments), normals(segments);
-    for (int i = 0; i < segments; ++i) {
-        const QPointF delta = points[i + 1] - points[i];
-        directions[i] = delta / length(delta);
-        normals[i] = QPointF(-directions[i].y(), directions[i].x());
+    const QPointF delta = point - m_last;
+    const QPointF direction = delta / length(delta), normal(-direction.y(), direction.x());
+    if (m_count == 2) {
+        m_start = pairAt(mesh, m_last, normal);
+        // Half a disc behind the first point.
+        if (m_cap == Cap::Round)
+            Builder{mesh, m_halfWidth, m_color, m_step}.fan(m_first, std::atan2(normal.y(), normal.x()), M_PI);
+    } else {
+        corner(mesh, direction, normal);
     }
+    m_direction = direction;
+    m_normal = normal;
+    m_last = point;
+}
 
-    // Each segment is a quad between a pair of vertices at its start and a
-    // pair at its end. Where the path bends gently the two segments share a
-    // pair, mitered; where it turns sharply each keeps its own and a wedge
-    // fills the outside of the corner.
-    struct Pair {
-        quint32 left, right;
-    };
-    auto pairAt = [&build](QPointF center, QPointF normal) {
-        return Pair{build.vertex(center, normal, 1), build.vertex(center, normal, -1)};
-    };
-    Pair start = pairAt(points[0], normals[0]);
-    for (int i = 0; i < segments; ++i) {
-        Pair end, nextStart{};
-        if (i + 1 < segments) {
-            const qreal bend = dot(directions[i], directions[i + 1]);
-            // A miter is as long as the corner is sharp, so past a point it
-            // is cut off, as a bevel is from the start.
-            const bool mitered = join == Join::Miter ? bend > -0.9 : join == Join::Bevel ? bend > 0.5 : bend > 0.9;
-            if (mitered) {
-                const QPointF sum = normals[i] + normals[i + 1];
-                const QPointF miter = sum / length(sum);
-                // The miter reaches further than the stroke is wide by the
-                // inverse cosine of half the turn.
-                end = nextStart = pairAt(points[i + 1], miter / dot(miter, normals[i]));
-            } else {
-                end = pairAt(points[i + 1], normals[i]);
-                nextStart = pairAt(points[i + 1], normals[i + 1]);
-                // The outside of the corner is away from the turn.
-                const bool leftOutside = cross(directions[i], directions[i + 1]) <= 0;
-                if (join == Join::Round) {
-                    const qreal outside = leftOutside ? 1 : -1;
-                    const QPointF from = outside * normals[i], to = outside * normals[i + 1];
-                    const qreal sweep = std::atan2(cross(from, to), dot(from, to));
-                    build.fan(points[i + 1], std::atan2(from.y(), from.x()), sweep);
-                } else {
-                    build.triangle(build.vertex(points[i + 1], QPointF(1, 0), 0), leftOutside ? end.left : end.right,
-                                   leftOutside ? nextStart.left : nextStart.right);
-                }
-            }
+// Each segment is a quad between a pair of vertices at its start and a pair
+// at its end. Where the path bends gently the two segments share a pair,
+// mitered; where it turns sharply each keeps its own and a wedge fills the
+// outside of the corner. This is the corner at the last point, between the
+// segment that ends there and the one that starts there, and with it the
+// first of those, which it settles.
+void StrokeLine::corner(StrokeMesh &mesh, QPointF direction, QPointF normal) {
+    Builder build{mesh, m_halfWidth, m_color, m_step};
+    Pair end, next;
+    const qreal bend = dot(m_direction, direction);
+    // A miter is as long as the corner is sharp, so past a point it is cut
+    // off, as a bevel is from the start.
+    const bool mitered = m_join == Join::Miter ? bend > -0.9 : m_join == Join::Bevel ? bend > 0.5 : bend > 0.9;
+    if (mitered) {
+        const QPointF sum = m_normal + normal;
+        const QPointF miter = sum / length(sum);
+        // The miter reaches further than the stroke is wide by the inverse
+        // cosine of half the turn.
+        end = next = pairAt(mesh, m_last, miter / dot(miter, m_normal));
+    } else {
+        end = pairAt(mesh, m_last, m_normal);
+        next = pairAt(mesh, m_last, normal);
+        // The outside of the corner is away from the turn.
+        const bool leftOutside = cross(m_direction, direction) <= 0;
+        if (m_join == Join::Round) {
+            const qreal outside = leftOutside ? 1 : -1;
+            const QPointF from = outside * m_normal, to = outside * normal;
+            const qreal sweep = std::atan2(cross(from, to), dot(from, to));
+            build.fan(m_last, std::atan2(from.y(), from.x()), sweep);
         } else {
-            end = pairAt(points[i + 1], normals[i]);
+            build.triangle(build.vertex(m_last, QPointF(1, 0), 0), leftOutside ? end.left : end.right,
+                           leftOutside ? next.left : next.right);
         }
-        build.triangle(start.left, start.right, end.left);
-        build.triangle(start.right, end.right, end.left);
-        start = nextStart;
     }
+    build.triangle(m_start.left, m_start.right, end.left);
+    build.triangle(m_start.right, end.right, end.left);
+    m_start = next;
+}
 
-    if (cap == Cap::Round) {
-        // Half a disc behind the first point and ahead of the last.
-        const QPointF first = normals[0], last = -normals[segments - 1];
-        build.fan(points[0], std::atan2(first.y(), first.x()), M_PI);
-        build.fan(points[count - 1], std::atan2(last.y(), last.x()), M_PI);
+void StrokeLine::end(StrokeMesh &mesh) const {
+    Builder build{mesh, m_halfWidth, m_color, m_step};
+    if (m_count == 1) {
+        // A tap of the pen is a dot.
+        build.fan(m_first, 0, 2 * M_PI);
+    } else if (m_count > 1) {
+        const Pair end = pairAt(mesh, m_last, m_normal);
+        build.triangle(m_start.left, m_start.right, end.left);
+        build.triangle(m_start.right, end.right, end.left);
+        // Half a disc ahead of the last point.
+        if (m_cap == Cap::Round) {
+            const QPointF ahead = -m_normal;
+            build.fan(m_last, std::atan2(ahead.y(), ahead.x()), M_PI);
+        }
     }
+}
+
+Pen::Pen(qreal halfWidth, quint32 color, qreal scale)
+    : m_halfWidth(halfWidth), m_color(color), m_scale(scale),
+      m_tolerance(qMax(strokeTolerance, pixelTolerance / qMax(scale, 1e-6))),
+      m_line(halfWidth, color, Cap::Round, Join::Round, scale) {}
+
+void Pen::add(QPointF point) {
+    m_points.append(point);
+    if (m_points.size() == 1)
+        m_line.add(m_mesh, point);
+    cut();
+}
+
+void Pen::redraw(int back, const QVector<QPointF> &points) {
+    // No more than the last two, and never the first: the line before them
+    // is settled (see cut()).
+    back = qBound(0, back, int(qMin<qsizetype>(2, m_points.size() - 1)));
+    m_points.resize(m_points.size() - back);
+    m_points += points;
+    cut();
+}
+
+void Pen::cut() {
+    const int count = int(m_points.size());
+    // Back to where the line is settled: what was cut after that was only
+    // for as long as the points after it had not come.
+    m_mesh.vertices.resize(m_vertices);
+    m_mesh.indices.resize(m_indices);
+    // On through the stretches of curve that no point to come will bend,
+    // nor taking back the last two (see redraw())...
+    for (; m_settled + 4 < count; ++m_settled)
+        curveBetween(m_points, m_settled, m_tolerance, [this](QPointF at) { m_line.add(m_mesh, at); });
+    m_vertices = m_mesh.vertices.size();
+    m_indices = m_mesh.indices.size();
+    // ...and the rest as it is for now, to the end of the line.
+    StrokeLine rest = m_line;
+    for (int i = m_settled; i + 1 < count; ++i)
+        curveBetween(m_points, i, m_tolerance, [this, &rest](QPointF at) { rest.add(m_mesh, at); });
+    rest.end(m_mesh);
 }
 
 void ShapeMesh::add(const QRectF &rect, Outline outline, qreal radius, qreal borderWidth, quint32 fill, quint32 border) {

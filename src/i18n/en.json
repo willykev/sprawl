@@ -6,5 +6,9 @@
   "%n connectors": { "one": "%n connector", "other": "%n connectors" },
   "%n pictures": { "one": "%n picture", "other": "%n pictures" },
   "%n frames": { "one": "%n frame", "other": "%n frames" },
-  "%n selected": { "one": "%n selected", "other": "%n selected" }
+  "%n selected": { "one": "%n selected", "other": "%n selected" },
+  "Updated %1 from outside, but kept %n items as they are here": {
+    "one": "Updated %1 from outside, but kept %n item as it is here",
+    "other": "Updated %1 from outside, but kept %n items as they are here"
+  }
 }
