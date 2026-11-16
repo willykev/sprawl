@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Redraw the README's pictures into screenshots/.
+
+Every picture is drawn by Sprawl itself, off screen, from the example board
+in examples/weekend-trip. No window opens, and nothing of your own is read or
+shown: the boards, the theme and the settings all come from a scratch folder
+that goes away afterwards, and the theme is Omarchy's as it ships.
+
+Run it after changing how Sprawl looks, and before a release. A picture that
+looks the same as the one already there is left alone, so only what changed
+shows up in git. It needs a Wayland session, ImageMagick, ffmpeg, and
+Omarchy's themes for themes.png.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+APP = ROOT / "build/sprawl"
+OUT = ROOT / "screenshots"
+EXAMPLE = ROOT / "examples/weekend-trip"
+BOARD = "weekend-trip"
+# Boards that only fill the list in boards.png.
+OTHER_BOARDS = ["garden-plan", "kitchen-remodel", "product-launch", "reading-list"]
+THEMES = ["tokyo-night", "catppuccin-latte", "gruvbox", "rose-pine"]
+# The window sizes, in the pixels of a screen at normal scale. Pictures are
+# drawn at twice that, so they stay sharp where GitHub scales them down; the
+# four in themes.png at 1.6 times, which makes each as wide as WHOLE.
+WHOLE = "1280x800"
+CLOSE = "960x600"
+TILE = "800x500"
+# Where the close-ups look: the board's x and y at the canvas's top left
+# corner, and the zoom.
+FLOWCHART = (524, -12, 1.45)
+SKETCH = (548, 345, 1.45)
+
+
+def pixels(picture):
+    """A PNG's width and height."""
+    with open(picture, "rb") as file:
+        return struct.unpack(">II", file.read(24)[16:24])
+
+
+class Stage:
+    """A scratch home with the example board in it, and Sprawl drawing there."""
+
+    def __init__(self, scratch):
+        self.scratch = Path(scratch)
+        self.library = self.scratch / "sprawl"
+        self.board_file = self.library / "boards" / BOARD / "board.json"
+        shutil.copytree(EXAMPLE, self.board_file.parent)
+        (self.scratch / "home").mkdir()
+        self.env = {
+            "PATH": os.environ["PATH"],
+            "HOME": str(self.scratch / "home"),
+            "LANG": "C.UTF-8",
+            "SPRAWL_HOME": str(self.library),
+        }
+        for name in ("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY"):
+            if name in os.environ:
+                self.env[name] = os.environ[name]
+        self.items = json.loads(self.board_file.read_text())
+        for name in OTHER_BOARDS:
+            self.sprawl("new", name)
+        # What this screen's scale is, so pictures come out the same on any.
+        self.screen = 1
+        probe = self.scratch / "probe.png"
+        self.draw(probe, "100x100", scale=1)
+        self.screen = pixels(probe)[0] / 100
+
+    def sprawl(self, *args, env=None):
+        subprocess.run([str(APP), *map(str, args)], env=env or self.env, check=True,
+                       stdout=subprocess.DEVNULL)
+
+    def draw(self, picture, size, *options, view=None, theme=None, moved=None, scale=2):
+        """One picture of the example board: the whole of it, or the part
+        `view` looks at; with some of its items moved to where `moved` says.
+        It is `scale` times the window's size in pixels: twice, unless said."""
+        board = json.loads(json.dumps(self.items))
+        for item in board["items"]:
+            if moved and item["id"] in moved:
+                item["x"], item["y"] = moved[item["id"]]
+        self.board_file.write_text(json.dumps(board, indent=2) + "\n")
+        views = {}
+        if view:
+            views[str(self.board_file)] = dict(zip(("x", "y", "zoom"), view))
+        (self.library / "state.json").write_text(json.dumps({"last": BOARD, "views": views}))
+        look = ["--theme", theme] if theme else ["--default-theme"]
+        env = dict(self.env, QT_SCALE_FACTOR=f"{scale / self.screen:g}")
+        self.sprawl("open", BOARD, *look, "--size", size, "--screenshot", picture, *options, env=env)
+
+
+def eased(start, end, steps):
+    """Places from start to end that set off and arrive gently."""
+    for step in range(1, steps + 1):
+        t = step / steps
+        t = t * t * (3 - 2 * t)
+        yield round(start + (end - start) * t, 1)
+
+
+def connectors(stage, picture):
+    """A loop: one shape of the flowchart moves, and its lines follow."""
+    box = next(item for item in stage.items["items"] if item.get("text") == "Museum + coffee")
+    home, y = box["x"], box["y"]
+    path = [home] * 10
+    for start, end in ((home, home + 128), (home + 128, home)):
+        path += list(eased(start, end, 20)) + [end] * 10
+    frames = stage.scratch / "frames"
+    frames.mkdir()
+    for number, x in enumerate(path):
+        stage.draw(frames / f"{number:03}.png", CLOSE, view=FLOWCHART, moved={box["id"]: (x, y)})
+    width = CLOSE.split("x")[0]
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-framerate", "15", "-i", str(frames / "%03d.png"),
+         "-vf", f"scale={width}:-1:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];"
+                "[b][p]paletteuse=dither=none:diff_mode=rectangle",
+         "-loop", "0", str(picture)], check=True)
+
+
+def themes(stage, picture):
+    """The same board in four themes, two by two."""
+    tiles = []
+    for theme in THEMES:
+        tiles.append(stage.scratch / f"{theme}.png")
+        stage.draw(tiles[-1], TILE, theme=theme, scale=1.6)
+    subprocess.run(["magick", "montage", *map(str, tiles), "-tile", "2x2", "-geometry", "+12+12",
+                    "-background", "none", "-depth", "8", "-strip", str(picture)], check=True)
+
+
+def settle(drawn, kept, scratch):
+    """Put a newly drawn picture in place, unless the one already there looks
+    the same: the GPU does not draw a frame the same bit for bit twice, and a
+    loop's colors are picked afresh each time. Says whether it changed."""
+    if kept.exists():
+        pair = [kept, drawn]
+        tolerance = 0
+        if kept.suffix == ".gif":
+            # Every frame of each, one under the other.
+            pair = [scratch / "kept.png", scratch / "drawn.png"]
+            for loop, frames in zip((kept, drawn), pair):
+                subprocess.run(["magick", str(loop), "-coalesce", "-append", str(frames)], check=True)
+            tolerance = 5e-5
+        result = subprocess.run(["magick", "compare", "-metric", "AE", "-fuzz", "2%",
+                                 *map(str, pair), "null:"], capture_output=True, text=True)
+        differing = re.search(r"\(([^)]+)\)", result.stderr)
+        if result.returncode in (0, 1) and differing and float(differing.group(1)) <= tolerance:
+            return False
+    shutil.move(drawn, kept)
+    return True
+
+
+def main():
+    for tool in ("magick", "ffmpeg"):
+        if not shutil.which(tool):
+            sys.exit(f"screenshots: {tool} is needed, and is not installed")
+    if "WAYLAND_DISPLAY" not in os.environ:
+        sys.exit("screenshots: Sprawl draws these on the GPU, so run this in a Wayland session")
+    subprocess.run([str(ROOT / "bin/build")], check=True, stdout=subprocess.DEVNULL)
+    OUT.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="sprawl-screenshots-") as scratch:
+        stage = Stage(scratch)
+        drawn = stage.scratch / "drawn"
+        drawn.mkdir()
+        stage.draw(drawn / "hero.png", WHOLE)
+        connectors(stage, drawn / "connectors.gif")
+        stage.draw(drawn / "pen.png", CLOSE, "--tool", "pen", view=SKETCH)
+        stage.draw(drawn / "boards.png", CLOSE, "--show", "boards")
+        themes(stage, drawn / "themes.png")
+        for picture in sorted(drawn.iterdir()):
+            kept = OUT / picture.name
+            changed = settle(picture, kept, stage.scratch)
+            print(f"{kept.relative_to(ROOT)}  {kept.stat().st_size // 1024} KB  "
+                  f"{'redrawn' if changed else 'unchanged'}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as error:
+        sys.exit(f"screenshots: {error}")

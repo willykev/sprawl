@@ -1,5 +1,5 @@
 pkgname=sprawl
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc='An infinite canvas for the Omarchy desktop: notes, shapes, connectors, pen strokes and pictures'
 arch=('x86_64' 'aarch64')

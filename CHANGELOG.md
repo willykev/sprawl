@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.2 — 2026-11-16
+
+A new README and a fuller example. Sprawl itself is unchanged.
+
+- The README shows Sprawl at work: a whole board, lines following a shape
+  as it moves, the pen, the board switcher, and one board in four themes.
+  It adds a short tour, measured performance, and how to update and remove
+  Sprawl.
+- The weekend-trip example gains a dashed connector and a pen sketch.
+- `bin/screenshots` redraws the README's pictures from the example board,
+  off screen and in Omarchy's default theme.
+
 ## 0.1.1 — 2026-11-14
 
 Fixes from a full code and security review.

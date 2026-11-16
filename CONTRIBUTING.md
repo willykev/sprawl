@@ -22,6 +22,11 @@ your pull request. Follow the surrounding C++ and QML style.
 One test looks at exported PDFs with Qt's own PDF reader, which comes with
 `qt6-webengine`; where that is not installed, the test is skipped.
 
+`bin/screenshots` redraws the README's pictures from the example board, off
+screen and in Omarchy's default theme. Run it after changing how Sprawl
+looks, and commit the pictures with the change. It needs a Wayland session,
+ImageMagick and ffmpeg.
+
 The [full guide](docs/guide.md) covers the app's behavior and data format.
 Contributions use the project's [MIT license](LICENSE).
 
