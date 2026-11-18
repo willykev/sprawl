@@ -15136,7 +15136,8 @@ private slots:
         QVERIFY(!QFile::exists(desk.home.filePath("chosen.png")));
         const QString gone = "Nothing was exported: what was selected is no longer on the board.";
         QCOMPARE(desk.backend.problem(), gone);
-        // Taken away once the dialog is asking where to save it: nothing.
+        // Taken away once the dialog is asking where to save it: nothing,
+        // as anExportAsksNothingWhenThereIsNothingToExport() has it.
         desk.backend.dismissProblem();
         const quint32 again = desk.add(note(100, 100, "Again"));
         desk.picker.target.clear();
@@ -15145,7 +15146,7 @@ private slots:
         desk.board().remove(again);
         emit desk.picker.exportSelected(QUrl::fromLocalFile(desk.home.filePath("again.png")), "png");
         QVERIFY(!QFile::exists(desk.home.filePath("again.png")));
-        QCOMPARE(desk.backend.problem(), gone);
+        QCOMPARE(desk.backend.problem(), QString("There is nothing on the board to export."));
         // What was selected and is still there is what is exported.
         desk.backend.dismissProblem();
         const quint32 left = desk.add(note(100, 100, "Left"));

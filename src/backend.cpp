@@ -982,13 +982,9 @@ QString Backend::selectionGone() const {
 }
 
 void Backend::writeExport(const QString &path, const QString &format) {
-    // The same once it has been given a name: what of it is left is
-    // exported, and when nothing is, nothing.
-    if (!m_exportIds.isEmpty() &&
-        std::none_of(m_exportIds.cbegin(), m_exportIds.cend(), [this](quint32 id) { return m_board.item(id); })) {
-        setProblem(selectionGone());
-        return;
-    }
+    // Gone once it has been given a name, what was asked for is not
+    // exported either: ids none of which is on the board cover nothing, and
+    // the exporter says there is nothing to export.
     const QString problem = exportTo(path, format, m_exportIds);
     if (problem.isEmpty())
         setNotice(tr("Exported to %1").arg(homeRelative(path)));
