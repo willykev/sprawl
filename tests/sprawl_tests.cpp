@@ -15139,7 +15139,7 @@ private slots:
         // Taken away once the dialog is asking where to save it: nothing.
         desk.backend.dismissProblem();
         const quint32 again = desk.add(note(100, 100, "Again"));
-        desk.picker.target = {};
+        desk.picker.target.clear();
         desk.backend.exportBoard("png", {QVariant(again)});
         QCOMPARE(desk.picker.asked, 1);
         desk.board().remove(again);
