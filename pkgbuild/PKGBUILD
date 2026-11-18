@@ -8,7 +8,7 @@ license=('MIT')
 options=('!debug')
 # Qt reads WebP pictures with a plugin from qt6-imageformats. Nothing links
 # to it, so this list is all that says it is needed.
-depends=('qt6-base' 'qt6-declarative' 'qt6-imageformats' 'qt6-svg' 'qt6-wayland' 'xdg-desktop-portal')
+depends=('qt6-base' 'qt6-declarative' 'qt6-imageformats' 'qt6-svg' 'qt6-wayland' 'xdg-desktop-portal' 'zlib')
 # AVIF, HEIC and JPEG XL pictures take two packages each: kimageformats has
 # the plugins, and each reads only where its library is installed, which
 # kimageformats leaves optional.

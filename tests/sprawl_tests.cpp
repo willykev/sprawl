@@ -1,3 +1,4 @@
+#include <QBuffer>
 #include <QClipboard>
 #include <QDir>
 #include <QElapsedTimer>
@@ -34,6 +35,7 @@
 #include <qpa/qwindowsysteminterface.h>
 #include <sys/stat.h>
 #include <typeinfo>
+#include <zlib.h>
 
 #include "backend.h"
 #include "board.h"
@@ -111,6 +113,21 @@ QString picture(const QString &path, QSize size, const QColor &color = QColor("#
     image.fill(color);
     image.save(path);
     return path;
+}
+
+// What `bytes` are, gzipped, as an .svgz file holds them.
+QByteArray gzipped(const QByteArray &bytes) {
+    z_stream stream{};
+    deflateInit2(&stream, Z_BEST_COMPRESSION, Z_DEFLATED, 16 + MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
+    QByteArray packed(int(deflateBound(&stream, uLong(bytes.size()))), '\0');
+    stream.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(bytes.constData()));
+    stream.avail_in = uInt(bytes.size());
+    stream.next_out = reinterpret_cast<Bytef *>(packed.data());
+    stream.avail_out = uInt(packed.size());
+    deflate(&stream, Z_FINISH);
+    packed.resize(qsizetype(stream.total_out));
+    deflateEnd(&stream);
+    return packed;
 }
 
 // The canvas, keeping the box around each thing it last drew in its own
@@ -14760,6 +14777,432 @@ private slots:
         desk.backend.addFiles({QUrl::fromLocalFile(pipe)});
         QVERIFY2(desk.backend.problem().contains("not a picture"), qPrintable(desk.backend.problem()));
         QCOMPARE(desk.all(Item::Kind::Image).size(), 2);
+        QCOMPARE(desk.warnings, QStringList());
+    }
+
+    void aBoardShowsOnlyThePicturesItsOwnFolderHolds() {
+        // A board from somewhere else, and beside it a picture the person
+        // keeps to themselves, in red.
+        QTemporaryDir dir;
+        const QString secret = picture(dir.filePath("secret.png"), QSize(10, 10), Qt::red);
+        QVERIFY(QDir(dir.path()).mkpath("board/assets"));
+        const QString assets = dir.filePath("board/assets");
+        picture(assets + "/own.png", QSize(10, 10), Qt::blue);
+        QCOMPARE(ImageStore::read(assets, "own.png").pixelColor(5, 5), QColor(Qt::blue));
+        // A picture of the board that is a link to it is not read, nor one
+        // in an assets folder that is itself a link to where it is, nor a
+        // way out of the folder, nor a pipe, which is not waited on.
+        QVERIFY(QFile::link(secret, assets + "/linked.png"));
+        QVERIFY(ImageStore::read(assets, "linked.png").isNull());
+        QVERIFY(QDir(dir.path()).mkpath("other"));
+        QVERIFY(QFile::link(dir.path(), dir.filePath("other/assets")));
+        QVERIFY(ImageStore::read(dir.filePath("other/assets"), "secret.png").isNull());
+        QVERIFY(ImageStore::read(assets, "../../secret.png").isNull());
+        QCOMPARE(mkfifo(QFile::encodeName(assets + "/pipe.png").constData(), 0600), 0);
+        QVERIFY(ImageStore::read(assets, "pipe.png").isNull());
+
+        // An SVG that draws the picture into itself by its path, however it
+        // says so, packed or not: Qt would show it, so it is not shown.
+        auto svg = [](const QString &attribute, const QString &href, const QByteArray &before = {}) {
+            return before + QString("<svg xmlns='http://www.w3.org/2000/svg' "
+                                    "xmlns:xlink='http://www.w3.org/1999/xlink' width='10' height='10'>"
+                                    "<image x='0' y='0' width='10' height='10' %1='%2'/></svg>")
+                                .arg(attribute, href)
+                                .toUtf8();
+        };
+        const QList<QByteArray> drawingIn{
+            svg("xlink:href", secret),
+            svg("href", secret),
+            svg("xlink:href", "../../secret.png"),
+            svg("href", "  " + secret),
+            svg("href", "data/../../secret.png"),
+            svg("xlink:href", "&where;", "<!DOCTYPE svg [<!ENTITY where '" + secret.toUtf8() + "'>]>"),
+            svg("xlink:href", "data:image/png;base64,AAAA",
+                "<?xml-stylesheet type='text/css' href='" + dir.filePath("style.css").toUtf8() + "'?>"),
+        };
+        write(assets + "/shown.svg", drawingIn.first());
+        QCOMPARE(QImage(assets + "/shown.svg").pixelColor(5, 5), QColor(Qt::red));
+        for (qsizetype i = 0; i < drawingIn.size(); ++i) {
+            const QString name = QString("drawing%1.svg").arg(i);
+            write(assets + "/" + name, drawingIn[i]);
+            QVERIFY2(ImageStore::read(assets, name).isNull(), drawingIn[i].constData());
+            // Whatever it is called.
+            write(assets + "/" + name + ".png", drawingIn[i]);
+            QVERIFY2(ImageStore::read(assets, name + ".png").isNull(), drawingIn[i].constData());
+        }
+        write(assets + "/packed.svgz", gzipped(drawingIn.first()));
+        QVERIFY(ImageStore::read(assets, "packed.svgz").isNull());
+        // One that holds its picture itself is shown, packed or not.
+        QByteArray png;
+        QBuffer buffer(&png);
+        buffer.open(QIODevice::WriteOnly);
+        QImage blue(10, 10, QImage::Format_RGB32);
+        blue.fill(Qt::blue);
+        blue.save(&buffer, "PNG");
+        const QByteArray holding = svg("xlink:href", "data:image/png;base64," + QString::fromLatin1(png.toBase64()));
+        write(assets + "/holding.svg", holding);
+        QCOMPARE(ImageStore::read(assets, "holding.svg").pixelColor(5, 5), QColor(Qt::blue));
+        write(assets + "/holding.svgz", gzipped(holding));
+        QCOMPARE(ImageStore::read(assets, "holding.svgz").pixelColor(5, 5), QColor(Qt::blue));
+
+        // An export of the board shows each as missing, with none of the red.
+        Board board;
+        int x = 0;
+        for (const QString &asset : {QString("linked.png"), QString("drawing0.svg"), QString("packed.svgz")}) {
+            Item image;
+            image.kind = Item::Kind::Image;
+            image.rect = QRectF(x, 0, 40, 40);
+            image.asset = asset;
+            board.add(image);
+            x += 60;
+        }
+        Exporter::Options options;
+        options.scale = 1;
+        options.margin = 0;
+        QCOMPARE(Exporter::write(dir.filePath("out.png"), board, {}, Palette::fallback(), assets, options), QString());
+        const QImage out(dir.filePath("out.png"));
+        QVERIFY(!out.isNull());
+        for (int y = 0; y < out.height(); ++y)
+            for (int x = 0; x < out.width(); ++x)
+                QVERIFY(out.pixelColor(x, y) != QColor(Qt::red));
+
+        // Nor is such an SVG taken in as a picture, from a file or a board.
+        QTemporaryDir other;
+        QString error;
+        QCOMPARE(Library::importFile(other.path(), assets + "/drawing0.svg", &error), QString());
+        QVERIFY2(error.contains("not a picture"), qPrintable(error));
+        QCOMPARE(Library::importAsset(other.path(), assets, "drawing0.svg"), QString());
+        QCOMPARE(Library::importAsset(other.path(), assets, "linked.png"), QString());
+        QVERIFY(!Library::importFile(other.path(), assets + "/holding.svg").isEmpty());
+        QCOMPARE(QDir(other.path()).entryList(QDir::Files).size(), 1);
+    }
+
+    void picturesNoLongerOnTheBoardAreLetGoOf() {
+        QTemporaryDir dir;
+        const QStringList names{"a.png", "b.png", "c.png", "d.png"};
+        for (const QString &name : names)
+            picture(dir.filePath(name), QSize(100, 100));
+        const qint64 one = 100 * 100 * 4;
+        ImageStore store;
+        store.setFolder(dir.path());
+        store.setUnusedBudget(2 * one);
+        // On the board, they are all kept, whatever the budget.
+        store.setInUse(QSet<QString>(names.cbegin(), names.cend()));
+        for (const QString &name : names)
+            store.image(name);
+        QTRY_VERIFY(!store.loading());
+        QCOMPARE(store.bytesHeld(), 4 * one);
+        QCOMPARE(store.unusedBytesHeld(), qint64(0));
+        // Taken off it, as many are kept as the budget has room for.
+        store.setInUse({"a.png"});
+        QCOMPARE(store.unusedBytesHeld(), 2 * one);
+        QCOMPARE(store.bytesHeld(), 3 * one);
+        QVERIFY(!store.alreadyRead("a.png").isNull());
+        // The one just taken off is the last to go.
+        store.setInUse({});
+        QCOMPARE(store.bytesHeld(), 2 * one);
+        QVERIFY(!store.alreadyRead("a.png").isNull());
+        store.setUnusedBudget(0);
+        QCOMPARE(store.bytesHeld(), qint64(0));
+        // Put back, a picture is read again.
+        store.setInUse({"b.png"});
+        QVERIFY(store.image("b.png").isNull());
+        QTRY_VERIFY(!store.alreadyRead("b.png").isNull());
+        QCOMPARE(store.bytesHeld(), one);
+        // And one read while it is on nothing goes once it has been read.
+        store.image("c.png");
+        QTRY_VERIFY(!store.loading());
+        QCOMPARE(store.bytesHeld(), one);
+        QVERIFY(store.alreadyRead("c.png").isNull());
+    }
+
+    void groupsMadeApartAreKeptApart() {
+        // Four notes, open in two places.
+        Board start;
+        for (int i = 0; i < 4; ++i)
+            start.add(note(i * 200, 0, QString::number(i + 1)));
+        const QJsonObject file = start.toJson();
+        QVector<Item> base;
+        QCOMPARE(Board::read(file, base), QStringList());
+        auto groupOf = [](Board &board, const QVector<quint32> &ids) {
+            const quint32 group = board.newGroup();
+            board.begin();
+            for (quint32 id : ids) {
+                Item item = *board.item(id);
+                item.group = group;
+                board.set(item);
+            }
+            board.commit();
+            return group;
+        };
+        auto members = [](const Board &board, quint32 group) {
+            QVector<quint32> found = board.membersOf(group);
+            std::sort(found.begin(), found.end());
+            return found;
+        };
+        // There, the first two are grouped; here, the other two, and both
+        // come to the same number for their group.
+        Board theirs, mine;
+        QCOMPARE(theirs.fromJson(file), QStringList());
+        QCOMPARE(mine.fromJson(file), QStringList());
+        const quint32 group = groupOf(theirs, {1, 2});
+        QCOMPARE(groupOf(mine, {3, 4}), group);
+        mine.merge(base, theirs.items(), theirs.lastId());
+        QCOMPARE(members(mine, group), (QVector<quint32>{1, 2}));
+        const quint32 own = mine.item(3)->group;
+        QVERIFY(own != 0 && own != group);
+        QCOMPARE(members(mine, own), (QVector<quint32>{3, 4}));
+        QVERIFY(mine.newGroup() > own);
+        // Undone and done again, what was grouped here is that group still.
+        mine.undo();
+        QCOMPARE(mine.item(3)->group, quint32(0));
+        QCOMPARE(members(mine, group), (QVector<quint32>{1, 2}));
+        mine.redo();
+        QCOMPARE(members(mine, own), (QVector<quint32>{3, 4}));
+        // Written and read back: two groups of two.
+        Board again;
+        QCOMPARE(again.fromJson(mine.toJson()), QStringList());
+        QCOMPARE(members(again, again.item(1)->group), (QVector<quint32>{1, 2}));
+        QCOMPARE(members(again, again.item(3)->group), (QVector<quint32>{3, 4}));
+
+        // The same two grouped in both places are one group.
+        Board there, here;
+        QCOMPARE(there.fromJson(file), QStringList());
+        QCOMPARE(here.fromJson(file), QStringList());
+        groupOf(there, {1, 2});
+        groupOf(here, {1, 2});
+        here.merge(base, there.items(), there.lastId());
+        QVERIFY(here.item(1)->group != 0);
+        QCOMPARE(members(here, here.item(1)->group), (QVector<quint32>{1, 2}));
+    }
+
+    void groupsMadeInTwoWindowsAtOnceStayApart() {
+        QTemporaryDir home;
+        Library library(home.path());
+        QVERIFY(QDir(home.path()).mkpath("boards/desk"));
+        write(library.boardFile("desk"), R"({"sprawl": 1, "items": [
+            {"id": 1, "type": "note", "x": 0, "y": 0}, {"id": 2, "type": "note", "x": 200, "y": 0},
+            {"id": 3, "type": "note", "x": 400, "y": 0}, {"id": 4, "type": "note", "x": 600, "y": 0}]})");
+        FakePicker picker;
+        Theme theme(home.path(), nullptr, {}, home.filePath("shell.toml"));
+        Backend first(&library, &picker, &theme), second(&library, &picker, &theme);
+        first.openInitial("desk");
+        second.openInitial("desk");
+        auto groupOf = [](Board &board, const QVector<quint32> &ids) {
+            const quint32 group = board.newGroup();
+            board.begin();
+            for (quint32 id : ids) {
+                Item item = *board.item(id);
+                item.group = group;
+                board.set(item);
+            }
+            board.commit();
+        };
+        groupOf(*first.board(), {1, 2});
+        groupOf(*second.board(), {3, 4});
+        QVERIFY(first.flush());
+        QVERIFY(second.flush());
+        QJsonObject root;
+        QCOMPARE(Library::read(library.boardFile("desk"), root), QString());
+        Board reopened;
+        QCOMPARE(reopened.fromJson(root), QStringList());
+        QVERIFY(reopened.item(1)->group != 0);
+        QCOMPARE(reopened.item(2)->group, reopened.item(1)->group);
+        QVERIFY(reopened.item(3)->group != 0);
+        QCOMPARE(reopened.item(4)->group, reopened.item(3)->group);
+        QVERIFY(reopened.item(1)->group != reopened.item(3)->group);
+    }
+
+    void aBoardRenamedInAnotherWindowIsFollowed() {
+        QTemporaryDir home;
+        Library library(home.path());
+        QCOMPARE(library.create("desk"), QString());
+        FakePicker picker;
+        Theme theme(home.path(), nullptr, {}, home.filePath("shell.toml"));
+        Backend first(&library, &picker, &theme), second(&library, &picker, &theme);
+        first.openInitial("desk");
+        second.openInitial("desk");
+        auto items = [&library](const QString &name) {
+            QJsonObject root;
+            Library::read(library.boardFile(name), root);
+            QStringList texts;
+            for (const QJsonValue &item : root.value("items").toArray())
+                texts << item.toObject().value("text").toString();
+            return texts;
+        };
+        // Renamed in the first window, and written in the second, which
+        // was not told: what it writes goes to the board it has open, and
+        // the old name is not made again for it.
+        QVERIFY(first.renameBoard("renamed"));
+        second.board()->add(note(0, 0, "Second"));
+        QTRY_COMPARE(second.saveState(), QString("saved"));
+        QVERIFY(!QFileInfo::exists(library.boardFolder("desk")));
+        QCOMPARE(second.boardName(), QString("renamed"));
+        QCOMPARE(second.assetFolder(), library.assetsFolder("renamed"));
+        QCOMPARE(items("renamed"), QStringList{"Second"});
+        QTRY_COMPARE(first.board()->count(), 1);
+        // Renamed again, and written at once, as on quitting.
+        QVERIFY(first.renameBoard("again"));
+        second.board()->add(note(300, 0, "Quitting"));
+        QVERIFY(second.flush());
+        QVERIFY(!QFileInfo::exists(library.boardFolder("renamed")));
+        QCOMPARE(second.boardName(), QString("again"));
+        QCOMPARE(items("again"), (QStringList{"Second", "Quitting"}));
+        // Taken away for good, it is made again with what it had, as before.
+        QVERIFY(QDir(library.boardFolder("again")).removeRecursively());
+        second.board()->add(note(600, 0, "Kept"));
+        QVERIFY(second.flush());
+        QCOMPARE(items("again"), (QStringList{"Second", "Quitting", "Kept"}));
+    }
+
+    void aBoardTrashedRightAfterAnEditTakesTheEditWithIt() {
+        QTemporaryDir home;
+        Library library(home.path());
+        QCOMPARE(library.create("last-edit"), QString());
+        FakePicker picker;
+        Theme theme(home.path(), nullptr, {}, home.filePath("shell.toml"));
+        Backend backend(&library, &picker, &theme);
+        backend.openInitial("last-edit");
+        backend.board()->add(note(0, 0, "Just now"));
+        QCOMPARE(backend.saveState(), QString("unsaved"));
+        QVERIFY(backend.deleteBoard());
+        QVERIFY(!library.exists("last-edit"));
+        const QDir trash(qEnvironmentVariable("XDG_DATA_HOME") + "/Trash/files");
+        const QStringList trashed = trash.entryList({"last-edit*"}, QDir::Dirs);
+        QCOMPARE(trashed.size(), 1);
+        QJsonObject root;
+        QCOMPARE(Library::read(trash.filePath(trashed.first() + "/board.json"), root), QString());
+        const QJsonArray items = root.value("items").toArray();
+        QCOMPARE(items.size(), 1);
+        QCOMPARE(items.first().toObject().value("text").toString(), QString("Just now"));
+    }
+
+    void aCopyOfABoardHasOnlyThePicturesOnIt() {
+        QTemporaryDir dir;
+        qputenv("SPRAWL_HOME", dir.path().toUtf8());
+        const auto unset = qScopeGuard([] { qunsetenv("SPRAWL_HOME"); });
+        const Library library(dir.path());
+        const QString kept = picture(dir.filePath("kept.png"), QSize(20, 20), Qt::blue);
+        const QString gone = picture(dir.filePath("gone.png"), QSize(20, 20), Qt::red);
+        QCOMPARE(runCli({"sprawl", "new", "trip"}), 0);
+        QCOMPARE(runCli({"sprawl", "add", "trip", "image", "--file", kept}), 0);
+        QCOMPARE(runCli({"sprawl", "add", "trip", "image", "--file", gone}), 0);
+        QCOMPARE(runCli({"sprawl", "remove", "trip", "2"}), 0);
+        // The board's own folder keeps the picture taken off it, for a window
+        // that can still undo that.
+        const QDir assets(library.assetsFolder("trip"));
+        QCOMPARE(assets.entryList(QDir::Files).size(), 2);
+        // A copy to give away has only the one on the board.
+        const QString copy = dir.filePath("to-give/trip");
+        QCOMPARE(runCli({"sprawl", "copy", "trip", copy}), 0);
+        const QStringList copied = QDir(copy + "/assets").entryList(QDir::Files);
+        QCOMPARE(copied.size(), 1);
+        QCOMPARE(read(copy + "/assets/" + copied.first()), read(kept));
+        QCOMPARE(runCli({"sprawl", "check", copy}), 0);
+        QJsonObject root;
+        QCOMPARE(Library::read(copy + "/board.json", root), QString());
+        QCOMPARE(root.value("items").toArray().size(), 1);
+        QCOMPARE(assets.entryList(QDir::Files).size(), 2);
+        // Never over what is there already.
+        QCOMPARE(runCli({"sprawl", "copy", "trip", copy}), 1);
+        QCOMPARE(QDir(copy + "/assets").entryList(QDir::Files), copied);
+        // A picture of the board that is a link to somewhere else is not
+        // copied from there.
+        QVERIFY(QFile::remove(assets.filePath(copied.first())));
+        QVERIFY(QFile::link(gone, assets.filePath(copied.first())));
+        const QString linked = dir.filePath("linked");
+        QCOMPARE(runCli({"sprawl", "copy", "trip", linked}), 0);
+        QVERIFY(!QFile::exists(linked + "/assets/" + copied.first()));
+        QCOMPARE(runCli({"sprawl", "check", linked}), 1);
+    }
+
+    void anExportOfWhatWasSelectedIsNeverOfTheWholeBoard() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        const quint32 chosen = desk.add(note(100, 100, "Chosen"));
+        desk.add(note(500, 400, "Not to be shown"));
+        desk.click(QPointF(150, 150));
+        QCOMPARE(desk.canvas->selectionCount(), 1);
+        // The formats are up when the note is taken away elsewhere, by
+        // another window or a command: what was selected is gone, and so is
+        // the selection.
+        desk.picker.target = QUrl::fromLocalFile(desk.home.filePath("chosen.png"));
+        desk.key(Qt::Key_E, Qt::ControlModifier);
+        QCOMPARE(desk.panel(), QString("export"));
+        desk.board().remove(chosen);
+        desk.key(Qt::Key_Return);
+        QCOMPARE(desk.panel(), QString());
+        QCOMPARE(desk.picker.asked, 0);
+        QVERIFY(!QFile::exists(desk.home.filePath("chosen.png")));
+        const QString gone = "Nothing was exported: what was selected is no longer on the board.";
+        QCOMPARE(desk.backend.problem(), gone);
+        // Taken away once the dialog is asking where to save it: nothing,
+        // as anExportAsksNothingWhenThereIsNothingToExport() has it.
+        desk.backend.dismissProblem();
+        const quint32 again = desk.add(note(100, 100, "Again"));
+        desk.picker.target.clear();
+        desk.backend.exportBoard("png", {QVariant(again)});
+        QCOMPARE(desk.picker.asked, 1);
+        desk.board().remove(again);
+        emit desk.picker.exportSelected(QUrl::fromLocalFile(desk.home.filePath("again.png")), "png");
+        QVERIFY(!QFile::exists(desk.home.filePath("again.png")));
+        QCOMPARE(desk.backend.problem(), QString("There is nothing on the board to export."));
+        // What was selected and is still there is what is exported.
+        desk.backend.dismissProblem();
+        const quint32 left = desk.add(note(100, 100, "Left"));
+        desk.click(QPointF(150, 150));
+        desk.picker.target = QUrl::fromLocalFile(desk.home.filePath("left.png"));
+        desk.key(Qt::Key_E, Qt::ControlModifier);
+        desk.key(Qt::Key_Return);
+        QCOMPARE(desk.backend.problem(), QString());
+        QCOMPARE(QImage(desk.home.filePath("left.png")).size(),
+                 (Exporter::area(desk.board(), {left}, 32).size() * 2).toSize());
+        QCOMPARE(desk.warnings, QStringList());
+    }
+
+    void aPicturePastedFromAnotherBoardIsTheOneThatWasCopied() {
+        // Two boards with a picture called the same, and different: red on
+        // the one copied from, blue on the one pasted onto.
+        Desk desk("blue", [](const QString &home) {
+            const QByteArray board = R"({"sprawl": 1, "items": [
+                {"id": 1, "type": "image", "x": 0, "y": 0, "w": 20, "h": 20, "asset": "photo.png"}]})";
+            for (const QString &name : {QString("red"), QString("blue")}) {
+                QDir(home).mkpath("boards/" + name + "/assets");
+                picture(home + "/boards/" + name + "/assets/photo.png", QSize(20, 20), QColor(name));
+                write(home + "/boards/" + name + "/board.json", board);
+            }
+        });
+        QVERIFY(desk.ready());
+        const QByteArray red = read(desk.library.assetsFolder("red") + "/photo.png");
+        const QByteArray blue = read(desk.library.assetsFolder("blue") + "/photo.png");
+        QVERIFY(desk.backend.openBoard("red"));
+        desk.canvas->selectAll();
+        desk.canvas->copy();
+        QVERIFY(desk.backend.openBoard("blue"));
+        desk.hover(QPointF(400, 300));
+        QVERIFY(desk.canvas->paste());
+        QCOMPARE(desk.all(Item::Kind::Image).size(), 2);
+        const QString pasted = desk.last()->asset;
+        QVERIFY(pasted != "photo.png");
+        const QDir assets(desk.backend.assetFolder());
+        QCOMPARE(read(assets.filePath(pasted)), red);
+        QCOMPARE(read(assets.filePath("photo.png")), blue);
+        // Pasted again, it is the same picture, kept once.
+        QVERIFY(desk.canvas->paste());
+        QCOMPARE(desk.last()->asset, pasted);
+        QCOMPARE(assets.entryList(QDir::Files).size(), 2);
+        // Where it was copied from, it is now a link to somewhere else: it
+        // cannot be had from there, and it is not taken for the blue one
+        // here, but left out.
+        QTemporaryDir elsewhere;
+        const QString secret = picture(elsewhere.filePath("secret.png"), QSize(20, 20), Qt::green);
+        QVERIFY(QFile::remove(desk.library.assetsFolder("red") + "/photo.png"));
+        QVERIFY(QFile::link(secret, desk.library.assetsFolder("red") + "/photo.png"));
+        QSignalSpy leftOut(desk.canvas, &CanvasView::itemsLeftOut);
+        QVERIFY(desk.canvas->paste());
+        QTRY_COMPARE(leftOut.count(), 1);
+        QCOMPARE(desk.all(Item::Kind::Image).size(), 3);
+        QCOMPARE(assets.entryList(QDir::Files).size(), 2);
         QCOMPARE(desk.warnings, QStringList());
     }
 

@@ -215,7 +215,7 @@ void paint(QPainter &painter, const Board &board, const QVector<quint32> &ids, c
         }
         case Item::Kind::Image: {
             if (!images.contains(item.asset))
-                images.insert(item.asset, ImageStore::read(assetFolder + "/" + item.asset));
+                images.insert(item.asset, ImageStore::read(assetFolder, item.asset));
             const QImage image = images.value(item.asset);
             if (image.isNull()) {
                 // A picture that is missing is shown to be missing.

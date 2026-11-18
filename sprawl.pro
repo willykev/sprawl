@@ -46,4 +46,7 @@ SOURCES += \
     src/theme.cpp \
     src/translator.cpp
 
+# Unpacks .svgz pictures, which are looked through before they are drawn.
+LIBS += -lz
+
 RESOURCES += src/resources.qrc

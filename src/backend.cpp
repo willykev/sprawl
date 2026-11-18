@@ -13,6 +13,7 @@
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <algorithm>
+#include <sys/stat.h>
 #include <utility>
 
 #include "exporter.h"
@@ -201,6 +202,7 @@ bool Backend::open(const Library::Location &location) {
     // that goes unseen. An export asked of the board before is not of this
     // one.
     m_location = location;
+    m_folderId = folderIdOf(boardFolder());
     m_exportAsked = false;
     watch();
     QJsonObject root;
@@ -266,6 +268,7 @@ void Backend::openNone(const QString &why) {
     m_saveTimer.stop();
     m_saveDeadline.stop();
     m_location = {};
+    m_folderId = {};
     m_exportAsked = false;
     watch();
     // Whatever the window had goes: nothing done to it could be kept.
@@ -282,6 +285,58 @@ void Backend::openNone(const QString &why) {
     setSaveState("readonly");
     emit boardChanged();
     emit boardOpened();
+}
+
+Backend::FolderId Backend::folderIdOf(const QString &folder) {
+    struct stat status;
+    if (folder.isEmpty() || ::stat(QFile::encodeName(folder).constData(), &status) != 0 || !S_ISDIR(status.st_mode))
+        return {};
+    return {quint64(status.st_dev), quint64(status.st_ino)};
+}
+
+QString Backend::boardFolder() const {
+    const QString file = QStringLiteral("/board.json");
+    if (!m_location.file.endsWith(file))
+        return {};
+    const QString folder = m_location.file.chopped(file.size());
+    return m_location.assets == folder + "/assets" ? folder : QString();
+}
+
+bool Backend::followMove() {
+    const QString folder = boardFolder();
+    if (folder.isEmpty() || !m_folderId.isValid() || QFileInfo::exists(folder))
+        return false;
+    // Renamed, it is the same folder, beside where it was and called
+    // something else.
+    const QString parent = folder.left(folder.lastIndexOf('/'));
+    for (const QString &name : QDir(parent).entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        const QString there = parent + "/" + name;
+        if (folderIdOf(there) == m_folderId && QFileInfo(there + "/board.json").isFile()) {
+            const QString was = m_location.name;
+            moveTo({name, there + "/board.json", there + "/assets"});
+            setNotice(tr("%1 was renamed %2 elsewhere, and is saved as %2").arg(was, name));
+            return true;
+        }
+    }
+    return false;
+}
+
+void Backend::moveTo(const Library::Location &location) {
+    // The view it was left at goes with it.
+    if (m_views.contains(viewKey()))
+        m_views.insert(location.file, m_views.take(viewKey()));
+    m_location = location;
+    if (m_library->exists(location.name) && m_library->boardFile(location.name) == location.file)
+        m_lastBoard = location.name;
+    watch();
+    // What is said of a board that could not be read names it, and its file:
+    // read again where it is now, it is said anew.
+    if (m_readOnly) {
+        m_unreadableFingerprint.clear();
+        fileChanged();
+    }
+    writeState();
+    emit boardChanged();
 }
 
 bool Backend::openBoard(const QString &name) {
@@ -328,20 +383,7 @@ bool Backend::renameBoard(const QString &name) {
         setProblem(problem);
         return false;
     }
-    // The view it was left at goes with it.
-    if (m_views.contains(viewKey()))
-        m_views.insert(m_library->boardFile(tidy), m_views.take(viewKey()));
-    m_location = {tidy, m_library->boardFile(tidy), m_library->assetsFolder(tidy)};
-    m_lastBoard = tidy;
-    watch();
-    // What is said of a board that could not be read names it, and its file:
-    // read again where it is now, it is said anew.
-    if (m_readOnly) {
-        m_unreadableFingerprint.clear();
-        fileChanged();
-    }
-    writeState();
-    emit boardChanged();
+    moveTo({tidy, m_library->boardFile(tidy), m_library->assetsFolder(tidy)});
     return true;
 }
 
@@ -350,10 +392,10 @@ bool Backend::deleteBoard() {
         setProblem(tr("Only boards in the library can be deleted here."));
         return false;
     }
-    m_saveTimer.stop();
-    m_saveDeadline.stop();
-    m_pool.waitForDone();
-    QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+    // What was done here goes into the trash with it: what is had back from
+    // there is the board as it was left. Not written, it is not moved.
+    if (!flush())
+        return false;
     const QString gone = m_location.name;
     const QString problem = m_library->remove(gone);
     if (!problem.isEmpty()) {
@@ -473,11 +515,26 @@ void Backend::save() {
     written.items = m_board.itemsToWrite();
     written.lastId = m_board.lastId();
     written.revision = m_board.revision();
+    // A board whose folder has gone was renamed or moved elsewhere, and is
+    // followed there; or it was taken away, and is made again, folder and
+    // all, so that nothing done here is lost. Never is the folder it had
+    // made again when it went somewhere else: what is done here would go
+    // to a board of the old name, and not to the one that is open.
+    followMove();
     const QString file = m_location.file;
     const QByteArray base = m_baseFingerprint;
+    QString folder = boardFolder();
+    if (!QFileInfo::exists(folder))
+        folder.clear();
     // `this` outlives the write: the pool is a member, and both flush() and
     // its destructor wait for it.
-    m_pool.start([this, written, file, base]() mutable {
+    m_pool.start([this, written, file, base, folder]() mutable {
+        // Gone since it was looked for: where to is looked for again first.
+        if (!folder.isEmpty() && !QFileInfo::exists(folder)) {
+            written.moved = true;
+            QMetaObject::invokeMethod(this, [this, written] { saved(written); }, Qt::QueuedConnection);
+            return;
+        }
         // Under the lock every writer takes, so no command comes in between.
         // What is to be written is made beforehand, so the lock is held no
         // longer than it must be.
@@ -504,6 +561,12 @@ void Backend::writeOver(const QString &file, const QByteArray &contents, const Q
 
 void Backend::saved(const Written &written) {
     m_saving = false;
+    if (written.moved) {
+        // Looked for, and written again where it is now (see save()).
+        followMove();
+        settle();
+        return;
+    }
     if (written.changed) {
         fileChanged();
         settle();
@@ -558,6 +621,8 @@ bool Backend::flush() {
     // What it is a write of, which saved() is told even when the lock cannot
     // be had: one of ids alone that fails is nothing to say.
     written.revision = m_board.revision();
+    // Moved elsewhere, it is written where it is now (see save()).
+    followMove();
     if (const auto lock = Library::lock(m_location.file, &written.error)) {
         for (int tries = 0; tries < flushTries; ++tries) {
             QJsonObject root;
@@ -615,8 +680,13 @@ void Backend::fileChanged() {
     if (m_saving)
         return;
     // Gone, there is nothing to take in or to write over: whatever the board
-    // has that the file did is written anew.
+    // has that the file did is written anew. Gone with its folder, it may
+    // only have been renamed, and then it is looked at where it is now.
     if (!QFileInfo::exists(m_location.file)) {
+        if (followMove()) {
+            fileChanged();
+            return;
+        }
         resume();
         return;
     }
@@ -880,9 +950,18 @@ bool Backend::pasteClipboard() {
 void Backend::exportBoard(const QString &format, const QVariantList &ids) {
     if (!m_picker || !m_location.isValid())
         return;
+    // What was selected when the export was asked for, as much of it as is
+    // still on the board. All of it taken away meanwhile (in another window,
+    // by a command), there is nothing to export: never the whole board,
+    // which is what no ids at all would mean.
     m_exportIds.clear();
     for (const QVariant &id : ids)
-        m_exportIds.append(id.toUInt());
+        if (m_board.item(id.toUInt()))
+            m_exportIds.append(id.toUInt());
+    if (!ids.isEmpty() && m_exportIds.isEmpty()) {
+        setProblem(selectionGone());
+        return;
+    }
     m_exportAsked = true;
     // Pictures go where pictures go, documents where documents go.
     const auto place = format == "pdf" ? QStandardPaths::DocumentsLocation : QStandardPaths::PicturesLocation;
@@ -898,7 +977,14 @@ void Backend::replaceWithExport(bool agreed) {
         writeExport(path, format);
 }
 
+QString Backend::selectionGone() const {
+    return tr("Nothing was exported: what was selected is no longer on the board.");
+}
+
 void Backend::writeExport(const QString &path, const QString &format) {
+    // Gone once it has been given a name, what was asked for is not
+    // exported either: ids none of which is on the board cover nothing, and
+    // the exporter says there is nothing to export.
     const QString problem = exportTo(path, format, m_exportIds);
     if (problem.isEmpty())
         setNotice(tr("Exported to %1").arg(homeRelative(path)));

@@ -122,6 +122,7 @@ sprawl add weekend-trip shape --shape diamond --text "Rain?" --x 240 --y 40
 sprawl add weekend-trip connector --from 1 --to 2 --text "check" --route elbow --dash dashed
 sprawl show weekend-trip
 sprawl export weekend-trip -o trip.pdf
+sprawl copy weekend-trip ~/to-share/weekend-trip
 sprawl open weekend-trip
 ```
 
@@ -143,6 +144,9 @@ boards for you.
 
 A board is a folder in `~/.local/share/sprawl/boards`: a `board.json`, which
 is plain enough to write by hand, and an `assets` folder with its pictures.
+The `assets` folder keeps a picture taken off the board too, so that an undo
+can put it back. `sprawl copy <board> <folder>` makes a copy to give away or
+move elsewhere that holds only the pictures still on the board.
 
 ```json
 {"sprawl": 1, "items": [
@@ -164,8 +168,10 @@ boards and state somewhere else.
 A board from somewhere else is only ever read as a board. What it says, and
 what it and its pictures are called, is shown as written and never as markup;
 only a picture is ever kept as one, wherever a board or the clipboard says to
-look; an item holds 10,000 characters at most; and what the commands print
-of it has nothing in it that a terminal obeys.
+look; a board shows only pictures that are files in its own `assets` folder,
+never a link out of it, and never an SVG that draws in other files; an item
+holds 10,000 characters at most; and what the commands print of it has
+nothing in it that a terminal obeys.
 
 ## How it draws
 

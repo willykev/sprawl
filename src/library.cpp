@@ -6,7 +6,6 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QSaveFile>
@@ -17,6 +16,7 @@
 #include <unistd.h>
 
 #include "board.h"
+#include "imagestore.h"
 
 namespace {
 
@@ -285,7 +285,7 @@ QString Library::importFile(const QString &assetsFolder, const QString &source, 
     QFile input(source);
     if (!input.open(QIODevice::ReadOnly))
         return fail(QString("Could not read %1: %2.").arg(source, input.errorString()));
-    if (!QImageReader(source).canRead())
+    if (!ImageStore::canShow(source))
         return fail(QString("%1 is not a picture Sprawl can show.").arg(source));
     QCryptographicHash hash(QCryptographicHash::Sha1);
     if (!hash.addData(&input))
@@ -303,6 +303,43 @@ QString Library::importFile(const QString &assetsFolder, const QString &source, 
     input.close();
     if (!QFile::copy(source, target) && !QFile::exists(target))
         return fail(QString("Could not copy %1 into the board.").arg(source));
+    return name;
+}
+
+QString Library::importAsset(const QString &assetsFolder, const QString &fromFolder, const QString &asset,
+                             QString *error) {
+    auto fail = [error](const QString &message) {
+        if (error)
+            *error = message;
+        return QString();
+    };
+    // Only what is in that folder, as a board's own pictures are read.
+    QFile input;
+    if (!ImageStore::openAsset(fromFolder, asset, input))
+        return fail(QString("Could not read the picture %1 in %2.").arg(asset, fromFolder));
+    const QByteArray bytes = input.readAll();
+    if (input.error() != QFileDevice::NoError)
+        return fail(QString("Could not read the picture %1 in %2.").arg(asset, fromFolder));
+    QBuffer buffer;
+    buffer.setData(bytes);
+    buffer.open(QIODevice::ReadOnly);
+    const QString suffix = QFileInfo(asset).suffix().toLower();
+    if (!ImageStore::canShow(&buffer, suffix.toLatin1()))
+        return fail(QString("%1 is not a picture Sprawl can show.").arg(asset));
+    // Named for what it holds, as every picture taken in is: one of the same
+    // name here is the same picture, and one called the same where it came
+    // from but different is not taken for it.
+    const QString name =
+        QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha1).toHex().left(16)) +
+        (suffix.isEmpty() ? "" : "." + suffix);
+    const QString target = assetsFolder + "/" + name;
+    if (QFile::exists(target))
+        return name;
+    if (!QDir().mkpath(assetsFolder))
+        return fail(QString("Could not make the folder %1.").arg(assetsFolder));
+    QSaveFile output(target);
+    if (!output.open(QIODevice::WriteOnly) || output.write(bytes) != bytes.size() || !output.commit())
+        return fail(QString("Could not write %1.").arg(target));
     return name;
 }
 

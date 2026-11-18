@@ -84,6 +84,12 @@ public:
     // nothing, with `error` saying why, for what is not a picture.
     static QString importFile(const QString &assetsFolder, const QString &source, QString *error = nullptr);
     static QString importImage(const QString &assetsFolder, const QImage &image, QString *error = nullptr);
+    // The same of `asset`, a picture of another board, in its assets folder
+    // `fromFolder`: only a file right in it is taken (see
+    // ImageStore::openAsset()), and it is named here for what it holds,
+    // whatever it is called there.
+    static QString importAsset(const QString &assetsFolder, const QString &fromFolder, const QString &asset,
+                               QString *error = nullptr);
 
     // A board named on the command line: one in the library, a folder, or a
     // .json file. Where its file and its pictures are. A board's name means

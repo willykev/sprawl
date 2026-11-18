@@ -153,7 +153,12 @@ starts, draws one frame, saves it and exits.
 
 Each board is a folder in `~/.local/share/sprawl/boards/`: a `board.json`
 plain enough to write by hand, and an `assets` folder with its pictures. Back
-up that folder, or copy a board's folder to another computer.
+up that folder to keep everything.
+
+The `assets` folder also keeps pictures you have taken off a board, so an
+undo can bring them back. To give a board to someone else, or move it to
+another computer, use `sprawl copy <board> <folder>`. The copy holds only
+the pictures that are still on the board.
 
 Sprawl never uses the network. There is no sync, no sharing, and no working
 on a board together.

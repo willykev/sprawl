@@ -138,6 +138,9 @@ public:
     // is known by `from`: the board, the stack, the connectors attached to
     // it, the step under way, and the history.
     void renumber(quint32 from, quint32 to);
+    // The same of a group: the items in group `from`, here, in the step
+    // under way, and in the history, are in group `to` from now on.
+    void regroup(quint32 from, quint32 to);
 
     // --- Files ---------------------------------------------------------------
 
@@ -217,6 +220,9 @@ private:
     void revise();
     QHash<quint32, const Item *> writtenInstead() const;
     QSet<quint32> idsInUse() const;
+    // Whether any item here, in the step under way, or in the history is in
+    // the group.
+    bool groupInUse(quint32 group) const;
 
     QHash<quint32, Item> m_items;
     QVector<quint32> m_order;
