@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+Fixes from a security and data-integrity review.
+
+### Safety
+
+- A board shows and exports only pictures that are plain files in its own
+  `assets` folder. A link there, or an `assets` folder that is itself a link,
+  is shown as a missing picture.
+- An SVG that draws in pictures or style sheets from other files is not
+  shown, exported or taken in, because Qt would read those files from
+  wherever the SVG points.
+- "Export what is selected" exports what was selected when the formats came
+  up. If all of it is gone by the time a format is chosen, nothing is
+  exported. Before, the whole board was.
+- `sprawl copy <board> <folder>` copies a board with only the pictures that
+  are on it. A board's own folder keeps pictures taken off it, for undo.
+
+### Saving
+
+- A board renamed in another window is followed there. Before, the window
+  that did not rename it made the old board again and saved its work there.
+- Moving a board to the trash saves its latest changes first.
+- A picture pasted from another board is always the one copied, even when
+  the board it is pasted on has a different picture with the same name.
+- Groups made in two windows at once stay two groups.
+- Pictures no longer on the board are let go of from memory past 256 MiB.
+
 ## 0.1.2 — 2026-11-16
 
 A new README and a fuller example. Sprawl itself is unchanged.

@@ -52,6 +52,8 @@ board is open in it.
 - Check: `sprawl check <board> --json` says whether a board file is valid.
 - Export: `sprawl export <board> -o plan.png` (also `.svg`, `.pdf`;
   `--scale 2`, `--transparent`, `--margin 32`).
+- Copy: `sprawl copy <board> <folder>` copies a board to share, with only the
+  pictures that are on it.
 
 ## Laying a board out
 

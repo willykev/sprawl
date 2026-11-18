@@ -911,11 +911,75 @@ void Board::renumber(quint32 from, quint32 to) {
     revise();
 }
 
+bool Board::groupInUse(quint32 group) const {
+    auto in = [group](const Item &item) { return item.group == group; };
+    if (std::any_of(m_items.cbegin(), m_items.cend(), in) || std::any_of(m_before.cbegin(), m_before.cend(), in))
+        return true;
+    for (const QVector<Command> *history : {&m_undo, &m_redo})
+        for (const Command &command : *history)
+            for (const Edit &edit : command)
+                if ((edit.existedBefore && in(edit.before)) || (edit.existsAfter && in(edit.after)))
+                    return true;
+    return false;
+}
+
+void Board::regroup(quint32 from, quint32 to) {
+    if (from == 0 || to == 0 || from == to)
+        return;
+    auto move = [from, to](Item &item) {
+        if (item.group != from)
+            return false;
+        item.group = to;
+        return true;
+    };
+    QVector<quint32> changed;
+    for (auto it = m_items.begin(); it != m_items.end(); ++it)
+        if (move(*it))
+            changed.append(it.key());
+    for (Item &item : m_before)
+        move(item);
+    for (QVector<Command> *history : {&m_undo, &m_redo})
+        for (Command &command : *history)
+            for (Edit &edit : command) {
+                move(edit.before);
+                move(edit.after);
+            }
+    m_lastGroup = qMax(m_lastGroup, to);
+    for (quint32 id : std::as_const(changed))
+        emit itemChanged(id, Change::Edited);
+    // What a step under way would go back to has the new group as well.
+    if (m_open)
+        m_revisionBefore = ++m_lastRevision;
+    revise();
+}
+
 Board::Merged Board::merge(const QVector<Item> &base, const QVector<Item> &theirs, quint32 lastId) {
     Merged merged;
     // Nothing made here is given an id the file gave, to an item it still
     // has or one it took away again.
     m_lastId = qMax(m_lastId, lastId);
+    // Groups are numbered as items are, by each that writes the board, from
+    // the last it knows of: a group new in the file can have the number of
+    // one made here meanwhile, of other items, and the two would be taken
+    // for one. The one made here is numbered anew, after every group the
+    // file has, as an item is (see renumber()). Were they the same items,
+    // the group they end up in is the one here, as anything changed both
+    // here and in the file is.
+    QSet<quint32> hadGroups, newGroups;
+    for (const Item &item : base)
+        hadGroups.insert(item.group);
+    quint32 lastGroup = m_lastGroup;
+    for (const Item &item : theirs) {
+        lastGroup = qMax(lastGroup, item.group);
+        if (item.group && !hadGroups.contains(item.group))
+            newGroups.insert(item.group);
+    }
+    QList<quint32> clashing(newGroups.cbegin(), newGroups.cend());
+    std::sort(clashing.begin(), clashing.end());
+    for (quint32 group : std::as_const(clashing))
+        if (groupInUse(group))
+            regroup(group, ++lastGroup);
+    m_lastGroup = qMax(m_lastGroup, lastGroup);
     // Each item as the file had it and has it now, by id, and in its order.
     QHash<quint32, QJsonObject> was, now;
     QHash<quint32, Item> incoming;

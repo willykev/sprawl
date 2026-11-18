@@ -13,6 +13,7 @@
 #include <QNativeGestureEvent>
 #include <QQuickTextDocument>
 #include <QQuickWindow>
+#include <QRegularExpression>
 #include <QSyntaxHighlighter>
 #include <QTextDocument>
 #include <algorithm>
@@ -192,7 +193,25 @@ void CanvasView::onImageLoaded(const QString &asset) {
     }
 }
 
+void CanvasView::picturesMayHaveChanged() {
+    if (std::exchange(m_picturesToTell, true))
+        return;
+    QMetaObject::invokeMethod(
+        this,
+        [this] {
+            m_picturesToTell = false;
+            QSet<QString> shown;
+            if (m_board)
+                for (quint32 id : m_board->order())
+                    if (const Item *item = m_board->item(id); item->kind == Item::Kind::Image)
+                        shown.insert(item->asset);
+            m_images->setInUse(shown);
+        },
+        Qt::QueuedConnection);
+}
+
 void CanvasView::onReset() {
+    picturesMayHaveChanged();
     // A different board: nothing of the last one carries over.
     m_drag = Drag::None;
     m_dragStarted = false;
@@ -222,6 +241,11 @@ void CanvasView::onReset() {
 
 void CanvasView::onItemChanged(quint32 id, Board::Change change) {
     const bool selected = m_selected.contains(id);
+    // What is gone may have been a picture; what is there says whether it is
+    // one. Only moved, it shows what it did.
+    if (change != Board::Change::Moved)
+        if (const Item *item = m_board->item(id); !item || item->kind == Item::Kind::Image)
+            picturesMayHaveChanged();
     switch (change) {
     case Board::Change::Added:
         markUnmeasured(id);
@@ -2266,14 +2290,52 @@ bool CanvasView::paste() {
     // clipboard only says where to look for them, and anything running can
     // put something on the clipboard: a picture is taken in as one dropped
     // on the board would be, and what is not a picture is not taken at all.
+    // Each is taken in whatever this board has already: a picture here with
+    // the same name may be another picture altogether, and what is taken in
+    // is named for what it holds. One that cannot be had from there is
+    // pasted as a picture that is missing, but not as this board's picture
+    // of the same name, unless that name is one of what a picture holds.
     const QString from = root.value("assets").toString();
-    if (!from.isEmpty() && from != m_assetFolder && !m_assetFolder.isEmpty())
-        for (Item &item : items)
-            if (item.kind == Item::Kind::Image && !QFile::exists(m_assetFolder + "/" + item.asset)) {
-                const QString kept = Library::importFile(m_assetFolder, from + "/" + item.asset);
-                if (!kept.isEmpty())
-                    item.asset = kept;
+    if (!from.isEmpty() && from != m_assetFolder && !m_assetFolder.isEmpty()) {
+        static const QRegularExpression namedForContents(QStringLiteral("^[0-9a-f]{16}(\\.[0-9a-z]+)?$"));
+        QHash<QString, QString> taken;
+        QVector<bool> dropped(items.size(), false);
+        QSet<quint32> droppedIds;
+        for (qsizetype i = 0; i < items.size(); ++i) {
+            Item &item = items[i];
+            if (item.kind != Item::Kind::Image)
+                continue;
+            auto found = taken.constFind(item.asset);
+            if (found == taken.constEnd())
+                found = taken.insert(item.asset, Library::importAsset(m_assetFolder, from, item.asset));
+            if (!found->isEmpty()) {
+                item.asset = *found;
+            } else if (QFile::exists(m_assetFolder + "/" + item.asset) &&
+                       !namedForContents.match(item.asset).hasMatch()) {
+                dropped[i] = true;
+                if (item.id)
+                    droppedIds.insert(item.id);
             }
+        }
+        // A connector on a picture left out goes with it, as one on an item
+        // taken off the board does.
+        for (qsizetype i = 0; i < items.size(); ++i)
+            if (items[i].kind == Item::Kind::Connector &&
+                (droppedIds.contains(items[i].from) || droppedIds.contains(items[i].to)))
+                dropped[i] = true;
+        if (dropped.contains(true)) {
+            QVector<Item> kept;
+            for (qsizetype i = 0; i < items.size(); ++i)
+                if (!dropped[i])
+                    kept.append(std::move(items[i]));
+            items = std::move(kept);
+            leftOut = true;
+        }
+        if (items.isEmpty()) {
+            QMetaObject::invokeMethod(this, &CanvasView::itemsLeftOut, Qt::QueuedConnection);
+            return true;
+        }
+    }
 
     // Centered where the mouse is, as anything inserted is.
     QRectF bounds;

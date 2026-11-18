@@ -451,6 +451,10 @@ private:
     void onReset();
     void onThemeChanged();
     void onImageLoaded(const QString &asset);
+    // The pictures the board shows may be others now: the store is told
+    // which, once the events of the moment have been handled (see
+    // ImageStore::setInUse()).
+    void picturesMayHaveChanged();
 
     // --- View ----------------------------------------------------------------
     void setZoomAround(qreal zoom, QPointF around);
@@ -528,6 +532,7 @@ private:
     bool m_reduceMotion = false;
     QString m_assetFolder;
     ImageStore *m_images = nullptr;
+    bool m_picturesToTell = false;
 
     // View
     qreal m_zoom = 1;

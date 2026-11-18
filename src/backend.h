@@ -86,10 +86,10 @@ public:
     Q_INVOKABLE bool pasteClipboard();
 
     // Asks where to save, then writes the items (all of them when `ids` is
-    // empty) as a png, svg or pdf. A name chosen without the format's ending
-    // is given it, and a file that has that name already, which the dialog
-    // never asked about, is written over only once that is agreed to (see
-    // replaceAsked()).
+    // empty, and none when every one of them is gone) as a png, svg or pdf.
+    // A name chosen without the format's ending is given it, and a file that
+    // has that name already, which the dialog never asked about, is written
+    // over only once that is agreed to (see replaceAsked()).
     Q_INVOKABLE void exportBoard(const QString &format, const QVariantList &ids);
     // The answer to replaceAsked(): the export is written over the file, or,
     // not agreed to, not written at all.
@@ -135,9 +135,29 @@ private:
         QByteArray fingerprint;
         // Nothing was written: the file had been changed from outside.
         bool changed = false;
+        // Nothing was written: the board's folder had gone (see save()).
+        bool moved = false;
         QString error;
     };
 
+    // Which folder a board's is, whatever it is called: the same while it is
+    // renamed. Not valid for what is no folder.
+    struct FolderId {
+        quint64 device = 0, inode = 0;
+        bool isValid() const { return inode != 0; }
+        bool operator==(const FolderId &other) const = default;
+    };
+    static FolderId folderIdOf(const QString &folder);
+    // The folder the open board is the board.json of, or nothing for a board
+    // that is a .json file of its own.
+    QString boardFolder() const;
+    // The board's folder has gone, and is found renamed (in another window,
+    // by hand) beside where it was: from now on the board is that one, as a
+    // board renamed here is. False when it is not found.
+    bool followMove();
+    // The open board is at `location` from now on, as it was renamed or
+    // moved there.
+    void moveTo(const Library::Location &location);
     bool open(const Library::Location &location);
     // The board that was open last, or the newest, or, the very first time,
     // a welcome board; or an untitled one, or, when not even that can be
@@ -168,12 +188,15 @@ private:
     void writeState();
     // Writes the export asked for to `path`, and says how that went.
     void writeExport(const QString &path, const QString &format);
+    // What is said when what was selected to be exported has all gone.
+    QString selectionGone() const;
 
     Library *m_library;
     FilePicker *m_picker;
     Theme *m_theme;
     Board m_board;
     Library::Location m_location;
+    FolderId m_folderId;
     // The board could not be read, or there is none, so nothing is ever
     // written; and why, as it was said, to be said again when asked.
     bool m_readOnly = false;

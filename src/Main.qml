@@ -53,7 +53,7 @@ ApplicationWindow {
         else if (name === "newboard")
             boards.openNew()
         else if (name === "export")
-            exporter.open(canvas.selectionCount > 0)
+            exporter.open(canvas.selectedIds())
         else if (name === "replace")
             replacing.open()
         else if (name === "quit")
@@ -564,7 +564,7 @@ ApplicationWindow {
             onDismissed: win.closePanel()
             onChosen: (format) => {
                 win.closePanel()
-                backend.exportBoard(format, canvas.selectedIds())
+                backend.exportBoard(format, exporter.ids)
             }
         }
 

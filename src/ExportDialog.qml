@@ -5,7 +5,10 @@ Card {
     id: dialog
     objectName: "export"
 
-    property bool selection: false
+    // What was selected as it opened: what is exported, whatever is
+    // selected by the time a format is chosen. None is all of the board.
+    property var ids: []
+    readonly property bool selection: ids.length > 0
     property int current: 0
     signal chosen(string format)
 
@@ -21,7 +24,7 @@ Card {
     cardHeight: column.implicitHeight + 32
 
     function open(selected) {
-        selection = selected
+        ids = selected
         current = 0
         visible = true
         keys.forceActiveFocus()

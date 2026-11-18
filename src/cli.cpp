@@ -18,6 +18,7 @@
 
 #include "board.h"
 #include "exporter.h"
+#include "imagestore.h"
 #include "library.h"
 #include "textlayout.h"
 #include "theme.h"
@@ -591,6 +592,83 @@ int removeItems(const QStringList &arguments) {
     return 0;
 }
 
+// A board's folder keeps every picture that was ever put on the board, so
+// that one taken off comes back with an undo, or is there for another
+// window that still shows it. A copy made to give to someone has only the
+// pictures the board shows.
+int copyBoard(const QStringList &arguments) {
+    Command command("copy", "Copy a board to a new folder, with only the pictures that are on it.");
+    command.parser.addPositionalArgument("board", boardArgument, "<board>");
+    command.parser.addPositionalArgument("folder", "Where to put the copy: a folder that is not there yet",
+                                         "<folder>");
+    command.json();
+    command.parser.process(arguments);
+    const QStringList words = command.arguments();
+    if (words.size() != 2)
+        return fail("Say which board and where to put the copy: sprawl copy <board> <folder>");
+    const Library library;
+    Library::Location location;
+    Board board;
+    if (!load(library, words[0], location, board))
+        return 1;
+    const QString target = QDir::cleanPath(QDir::current().absoluteFilePath(words[1]));
+    if (QFileInfo::exists(target) || QFileInfo(target).isSymLink())
+        return fail(QString("%1 is there already: give the copy a folder that is not.").arg(target));
+
+    // What the board shows, each picture once, read only from its own
+    // folder as the window reads it (see ImageStore::openAsset()).
+    QStringList pictures, missing;
+    for (quint32 id : board.order())
+        if (const Item *item = board.item(id); item->kind == Item::Kind::Image && !pictures.contains(item->asset))
+            pictures << item->asset;
+    if (!QDir().mkpath(target))
+        return fail(QString("Could not make the folder %1.").arg(target));
+    // The folder was made here, and goes again when the copy cannot be had
+    // whole.
+    auto abandon = [&target](const QString &message) {
+        QDir(target).removeRecursively();
+        return fail(message);
+    };
+    int copied = 0;
+    for (const QString &asset : std::as_const(pictures)) {
+        QFile input;
+        if (!ImageStore::openAsset(location.assets, asset, input)) {
+            missing << asset;
+            continue;
+        }
+        const QByteArray bytes = input.readAll();
+        QSaveFile output(target + "/assets/" + asset);
+        if (input.error() != QFileDevice::NoError || !QDir().mkpath(target + "/assets") ||
+            !output.open(QIODevice::WriteOnly) || output.write(bytes) != bytes.size() || !output.commit())
+            return abandon(QString("Could not copy the picture %1 to %2.").arg(asset, target));
+        ++copied;
+    }
+    const QString problem = Library::write(target + "/board.json", board.toJson());
+    if (!problem.isEmpty())
+        return abandon(problem);
+    // What the folder holds that the board no longer shows.
+    int leftOut = 0;
+    for (const QString &file : QDir(location.assets).entryList(QDir::Files | QDir::Hidden | QDir::System))
+        leftOut += !pictures.contains(file);
+
+    if (command.wantsJson()) {
+        print(QJsonObject{{"folder", target},
+                          {"file", target + "/board.json"},
+                          {"pictures", copied},
+                          {"leftOut", leftOut},
+                          {"missing", QJsonArray::fromStringList(missing)}});
+        return 0;
+    }
+    for (const QString &asset : std::as_const(missing))
+        print(stderr, QString("The picture %1 is missing from %2, so the copy does not have it either.")
+                          .arg(asset, location.assets));
+    print(stdout, leftOut ? QString("Copied %1 to %2, leaving out %3 files that are no longer on it.")
+                                .arg(location.name, target)
+                                .arg(leftOut)
+                          : QString("Copied %1 to %2.").arg(location.name, target));
+    return 0;
+}
+
 // As Hype does: one shared copy, linked into Claude Code, found directly by Codex.
 int skill(const QStringList &arguments) {
     Command command("skill", "Print the agent skill, or install it for your coding agents with: skill install.");
@@ -649,11 +727,13 @@ QString cliSummary() {
            "  remove <board> <id>...   Remove items, with the connectors attached to them\n"
            "  check <board>            Check that a board is one Sprawl can open\n"
            "  export <board>           Write a board as a png, svg or pdf\n"
+           "  copy <board> <folder>    Copy a board, with only the pictures that are on it\n"
            "  skill [install]          Print the skill for coding agents, or install it";
 }
 
 bool isCliCommand(const QString &word) {
-    return QStringList{"list", "new", "show", "add", "remove", "check", "export", "skill", "help"}.contains(word);
+    return QStringList{"list", "new", "show", "add", "remove", "check", "export", "copy", "skill", "help"}.contains(
+        word);
 }
 
 int runCli(const QStringList &arguments) {
@@ -672,6 +752,8 @@ int runCli(const QStringList &arguments) {
         return check(arguments);
     if (command == "export")
         return exportBoard(arguments);
+    if (command == "copy")
+        return copyBoard(arguments);
     if (command == "skill")
         return skill(arguments);
     return help(arguments);
