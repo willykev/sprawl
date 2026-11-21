@@ -126,20 +126,6 @@ signals:
     void replaceAsked(const QString &name, const QString &folder);
 
 private:
-    // What a save came to.
-    struct Written {
-        quint64 revision = 0;
-        // What was written, and the fingerprint of the file it made.
-        QVector<Item> items;
-        quint32 lastId = 0;
-        QByteArray fingerprint;
-        // Nothing was written: the file had been changed from outside.
-        bool changed = false;
-        // Nothing was written: the board's folder had gone (see save()).
-        bool moved = false;
-        QString error;
-    };
-
     // Which folder a board's is, whatever it is called: the same while it is
     // renamed. Not valid for what is no folder.
     struct FolderId {
@@ -147,18 +133,35 @@ private:
         bool isValid() const { return inode != 0; }
         bool operator==(const FolderId &other) const = default;
     };
+
+    // What a save came to.
+    struct Written {
+        quint64 revision = 0;
+        // What was written, and the fingerprint of the file it made.
+        QVector<Item> items;
+        quint32 lastId = 0;
+        QByteArray fingerprint;
+        QString folder;
+        FolderId folderId;
+        // Nothing was written: the file had been changed from outside.
+        bool changed = false;
+        // Nothing was written: the board's folder had moved (see save()).
+        bool moved = false;
+        QString error;
+    };
+
     static FolderId folderIdOf(const QString &folder);
     // The folder the open board is the board.json of, or nothing for a board
     // that is a .json file of its own.
     QString boardFolder() const;
-    // The board's folder has gone, and is found renamed (in another window,
-    // by hand) beside where it was: from now on the board is that one, as a
-    // board renamed here is. False when it is not found.
-    bool followMove();
+    // The board's folder has moved. If it is found beside where it was,
+    // the board is followed there as if it had been renamed here.
+    void followMove();
     // The open board is at `location` from now on, as it was renamed or
     // moved there.
     void moveTo(const Library::Location &location);
     bool open(const Library::Location &location);
+    void loadBoard(const Library::Location &location);
     // The board that was open last, or the newest, or, the very first time,
     // a welcome board; or an untitled one, or, when not even that can be
     // made, none.
@@ -174,6 +177,8 @@ private:
     void settle();
     void save();
     void saved(const Written &written);
+    bool prepareSave(Written &written);
+    static bool inSaveFolder(const Written &written);
     void setSaveState(const QString &state);
     void setNotice(const QString &notice);
     // Read only for `why`, which is said; or, for no reason, not.
@@ -184,7 +189,6 @@ private:
     bool takeIn(const QString &problem, const QJsonObject &root, const QByteArray &fingerprint);
     void resume();
     QString viewKey() const;
-    void readState();
     void writeState();
     // Writes the export asked for to `path`, and says how that went.
     void writeExport(const QString &path, const QString &format);
@@ -230,8 +234,9 @@ private:
     QByteArray m_unreadableFingerprint;
     QFileSystemWatcher m_watcher;
 
-    QString m_lastBoard;
-    QHash<QString, QVariantMap> m_views;
+    QString m_pendingLastBoard;
+    // Views this window has yet to write. An empty map forgets a view.
+    QHash<QString, QVariantMap> m_pendingViews;
     QVector<quint32> m_exportIds;
     // An export was asked for, of the board that is open: answered once
     // another has been opened, it is not written.

@@ -2117,6 +2117,46 @@ private slots:
                                          {200, 150}}));
     }
 
+    void aConnectorAtTheEdgeLeavesABoardThatOpens() {
+        QTemporaryDir home;
+        QVERIFY(home.isValid());
+        qputenv("SPRAWL_HOME", home.path().toUtf8());
+        const auto unset = qScopeGuard([] { qunsetenv("SPRAWL_HOME"); });
+        Library library(home.path());
+        QCOMPARE(library.create("ends"), QString());
+        QCOMPARE(runCli({"sprawl", "add", "ends", "shape", "--x", "1000000000", "--y", "0"}), 0);
+        QCOMPARE(runCli({"sprawl", "add", "ends", "shape", "--x", "999999800", "--y", "200"}), 0);
+        QCOMPARE(runCli({"sprawl", "add", "ends", "connector", "--from", "1", "--to", "2"}), 0);
+        QCOMPARE(runCli({"sprawl", "check", "ends"}), 0);
+
+        QJsonObject root;
+        QCOMPARE(Library::read(library.boardFile("ends"), root), QString());
+        QCOMPARE(root.value("items").toArray().last().toObject().value("x1").toDouble(), Item::farthest);
+        // The drawn end still finds the shape's edge when it opens again.
+        Board board;
+        QCOMPARE(board.fromJson(root), QStringList());
+        QVERIFY(board.item(3)->p1.x() > Item::farthest);
+        QCOMPARE(board.item(3)->from, quint32(1));
+        QCOMPARE(board.item(3)->to, quint32(2));
+    }
+
+    void aShapeGrownAtTheEdgeLeavesABoardThatOpens() {
+        QTemporaryDir home;
+        QVERIFY(home.isValid());
+        const QString file = home.filePath("shape.json");
+        write(file, R"({"sprawl": 1, "items": [{"id": 1, "type": "shape", "x": 0, "y": -1000000000,
+            "w": 40, "h": 1, "text": "Make room\nfor every\nline"}]})");
+        QCOMPARE(runCli({"sprawl", "check", file}), 0);
+        QCOMPARE(runCli({"sprawl", "add", file, "note", "--x", "0", "--y", "0"}), 0);
+        QCOMPARE(runCli({"sprawl", "check", file}), 0);
+        QJsonObject root;
+        QCOMPARE(Library::read(file, root), QString());
+        Board board;
+        QCOMPARE(board.fromJson(root), QStringList());
+        QCOMPARE(board.item(1)->rect.y(), -Item::farthest);
+        QVERIFY(board.item(1)->rect.height() > 1);
+    }
+
     void aCommandRefusesABoxOfNoSize() {
         // A file may say a box is less than a unit across or down, from before
         // boxes were kept to one, and it is read as a unit. Asked for with a
@@ -2187,6 +2227,39 @@ private slots:
         QCOMPARE(board.count(), 1);
         QCOMPARE(QDir(library.assetsFolder("refused")).entryList(QDir::Files),
                  QStringList{board.item(board.order().first())->asset});
+    }
+
+    void aPictureWithAnUnreadableBodyIsRefusedAndReported() {
+        QTemporaryDir home;
+        QVERIFY(home.isValid());
+        qputenv("SPRAWL_HOME", home.path().toUtf8());
+        const auto unset = qScopeGuard([] { qunsetenv("SPRAWL_HOME"); });
+        const QString good = picture(home.filePath("whole.png"), QSize(24, 24));
+        const QString bad = home.filePath("cut.png");
+        const QByteArray png = read(good);
+        const qsizetype pixels = png.indexOf("IDAT");
+        QVERIFY(pixels > 0);
+        const QByteArray cut = png.left(pixels + 5);
+        write(bad, cut);
+        QImageReader reader(bad);
+        QVERIFY(reader.canRead());
+        QCOMPARE(reader.size(), QSize(24, 24));
+
+        Library library(home.path());
+        QCOMPARE(library.create("pictures"), QString());
+        QCOMPARE(runCli({"sprawl", "add", "pictures", "image", "--file", good}), 0);
+        QCOMPARE(runCli({"sprawl", "check", "pictures"}), 0);
+        const QByteArray before = read(library.boardFile("pictures"));
+        const QDir assets(library.assetsFolder("pictures"));
+        const QStringList files = assets.entryList(QDir::Files);
+        QCOMPARE(files.size(), 1);
+        QCOMPARE(runCli({"sprawl", "add", "pictures", "image", "--file", bad}), 1);
+        QCOMPARE(read(library.boardFile("pictures")), before);
+        QCOMPARE(assets.entryList(QDir::Files), files);
+
+        // One already on the board can go bad too.
+        write(assets.filePath(files.first()), cut);
+        QCOMPARE(runCli({"sprawl", "check", "pictures"}), 1);
     }
 
     void aThinPictureOrFrameLeavesABoardThatOpens() {
@@ -2913,6 +2986,41 @@ private slots:
         QTRY_COMPARE(desk.backend.saveState(), QString("saved"));
         QCOMPARE(Board::read(desk.onDisk(), written), QStringList());
         QCOMPARE(written.size(), 4);
+        QCOMPARE(desk.warnings, QStringList());
+    }
+
+    void undoAndRedoKeepTheStackWhenAnItemIsTakenAwayElsewhere() {
+        Desk desk("desk", [](const QString &home) {
+            Board board;
+            for (int i = 0; i < 4; ++i)
+                board.add(note(i * 200, 0));
+            QCOMPARE(Library::write(Library(home).boardFile("desk"), board.toJson()), QString());
+        });
+        QVERIFY(desk.ready());
+        desk.canvas->select({3});
+        desk.key(Qt::Key_BracketLeft);
+        desk.canvas->select({2});
+        desk.key(Qt::Key_BracketRight);
+        QCOMPARE(desk.board().order(), (QVector<quint32>{3, 1, 4, 2}));
+        desk.key(Qt::Key_Z, Qt::ControlModifier);
+        QCOMPARE(desk.board().order(), (QVector<quint32>{3, 1, 2, 4}));
+        QVERIFY(desk.backend.flush());
+
+        qputenv("SPRAWL_HOME", desk.home.path().toUtf8());
+        const auto unset = qScopeGuard([] { qunsetenv("SPRAWL_HOME"); });
+        QCOMPARE(runCli({"sprawl", "remove", "desk", "1"}), 0);
+        QTRY_COMPARE(desk.board().order(), (QVector<quint32>{3, 2, 4}));
+        desk.key(Qt::Key_Z, Qt::ControlModifier);
+        QCOMPARE(desk.board().order(), (QVector<quint32>{2, 3, 4}));
+        QVERIFY(desk.backend.flush());
+        Board saved;
+        QCOMPARE(saved.fromJson(desk.onDisk()), QStringList());
+        QCOMPARE(saved.order(), desk.board().order());
+
+        desk.key(Qt::Key_Z, Qt::ControlModifier | Qt::ShiftModifier);
+        QCOMPARE(desk.board().order(), (QVector<quint32>{3, 2, 4}));
+        desk.key(Qt::Key_Z, Qt::ControlModifier | Qt::ShiftModifier);
+        QCOMPARE(desk.board().order(), (QVector<quint32>{3, 4, 2}));
         QCOMPARE(desk.warnings, QStringList());
     }
 
@@ -5719,6 +5827,22 @@ private slots:
         QCOMPARE(desk.board().count(), 3);
     }
 
+    void theMarqueeTouchesTheInkOfAStroke() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        Item ink = stroke({{250, 440}, {450, 440}});
+        ink.width = 8;
+        const quint32 id = desk.add(ink);
+        desk.drag(QPointF(230, 430), QPointF(350, 435));
+        QVERIFY(desk.canvas->selection().isEmpty());
+        desk.drag(QPointF(230, 430), QPointF(350, 438));
+        QCOMPARE(desk.canvas->selection(), QVector<quint32>{id});
+
+        // Close to the start of the line, the ink ends in a round cap.
+        QVERIFY(desk.board().touches(ink, QRectF(245, 439, 2, 2)));
+        QVERIFY(!desk.board().touches(ink, QRectF(245, 435, 2, 2)));
+    }
+
     void thePenDrawsStrokes() {
         Desk desk;
         QVERIFY(desk.ready());
@@ -6645,6 +6769,35 @@ private slots:
         QVERIFY(desk.backend.openBoard("desk"));
         QCOMPARE(desk.canvas->origin(), QPointF(320, 240));
         QCOMPARE(desk.canvas->zoom(), 2.0);
+    }
+
+    void windowsKeepTheViewsSavedByOtherWindows() {
+        QTemporaryDir home;
+        QVERIFY(home.isValid());
+        Library library(home.path());
+        QCOMPARE(library.create("alpha"), QString());
+        QCOMPARE(library.create("beta"), QString());
+        Theme theme(home.path());
+        auto open = [&](const QString &name) {
+            auto window = std::make_unique<Backend>(&library, nullptr, &theme);
+            window->openInitial(name);
+            return window;
+        };
+        open("beta")->rememberView(QPointF(30, 40), 1.5);
+        auto first = open("alpha");
+        auto second = open("beta");
+        first->rememberView(QPointF(100, 200), 2);
+        second->rememberView(QPointF(300, 400), 3);
+        second.reset();
+
+        // Even a window that was already open reads Beta's latest view.
+        QVERIFY(first->openBoard("beta"));
+        const QVariantMap beta{{"x", 300.0}, {"y", 400.0}, {"zoom", 3.0}};
+        QCOMPARE(first->rememberedView(), beta);
+        first.reset();
+        QCOMPARE(open("beta")->rememberedView(), beta);
+        const QVariantMap alpha{{"x", 100.0}, {"y", 200.0}, {"zoom", 2.0}};
+        QCOMPARE(open("alpha")->rememberedView(), alpha);
     }
 
     void theLastBoardOpensNextTime() {
@@ -11472,6 +11625,25 @@ private slots:
         QCOMPARE(library.boards().size(), 1);
     }
 
+    void aBoardsNameKeepsLettersBeyondTheBasicPlane() {
+        QTemporaryDir home;
+        QVERIFY(home.isValid());
+        qputenv("SPRAWL_HOME", home.path().toUtf8());
+        const auto unset = qScopeGuard([] { qunsetenv("SPRAWL_HOME"); });
+        const QString name = QStringLiteral("𠮷野");
+        const QString shortName = QStringLiteral("野");
+        QCOMPARE(runCli({"sprawl", "new", name}), 0);
+        QCOMPARE(runCli({"sprawl", "new", shortName}), 0);
+        QCOMPARE(runCli({"sprawl", "show", name}), 0);
+        QCOMPARE(runCli({"sprawl", "show", shortName}), 0);
+        QCOMPARE(Library::slug(QStringLiteral("𐐀")), QStringLiteral("𐐨"));
+
+        const QString letter = QStringLiteral("𠮷");
+        const QString room(62, 'a');
+        QCOMPARE(Library::slug(room + letter + "b"), room + letter);
+        QCOMPARE(Library::slug(room + 'a' + letter), room + 'a');
+    }
+
     void theSwitcherFindsBoardsByAFewLetters() {
         QVERIFY(Library::score("weekend-trip", "wt") > 0);
         QVERIFY(Library::score("weekend-trip", "WEEK") > 0);
@@ -14226,6 +14398,32 @@ private slots:
         QCOMPARE(library.locate("old.json").assets, library.assetsFolder("old.json"));
     }
 
+    void anExportCannotTakeThePlaceOfItsBoard() {
+        QTemporaryDir home;
+        QVERIFY(home.isValid());
+        qputenv("SPRAWL_HOME", home.path().toUtf8());
+        const auto unset = qScopeGuard([] { qunsetenv("SPRAWL_HOME"); });
+        Library library(home.path());
+        const QString file = library.boardFile("plan");
+        Board board;
+        board.add(note(0, 0, "Keep this"));
+        QCOMPARE(Library::write(file, board.toJson()), QString());
+        const QByteArray before = read(file);
+        const QString alias = home.filePath("alias.png");
+        QVERIFY(QFile::link(file, alias));
+        QVERIFY(QFileInfo(alias).isSymLink());
+        const QString relative = QDir::current().relativeFilePath(file);
+        for (const QString &path : {file, relative, alias}) {
+            QCOMPARE(runCli({"sprawl", "export", "plan", "-o", path}), 1);
+            QCOMPARE(read(file), before);
+        }
+        QCOMPARE(runCli({"sprawl", "export", alias, "-o", file}), 1);
+        QCOMPARE(read(file), before);
+        const QString png = home.filePath("plan.png");
+        QCOMPARE(runCli({"sprawl", "export", "plan", "-o", png}), 0);
+        QVERIFY(!QImage(png).isNull());
+    }
+
     void commandsAndTheWindowTakeANameAlike() {
         // Run from a folder with a file called plans that is no board, and a
         // folder called trip with a board of its own.
@@ -15013,6 +15211,68 @@ private slots:
         QVERIFY(reopened.item(1)->group != reopened.item(3)->group);
     }
 
+    void aBoardAtTheIdLimitCanStillHaveNewItemsAndGroups() {
+        Desk desk("desk", [](const QString &home) {
+            const Library library(home);
+            QVERIFY(QDir().mkpath(library.boardFolder("desk")));
+            write(library.boardFile("desk"), R"({"sprawl": 1, "items": [
+                {"id": 4000000000, "type": "note", "x": 0, "y": 0, "group": 4000000000},
+                {"id": 1, "type": "note", "x": 200, "y": 0},
+                {"id": 2, "type": "note", "x": 400, "y": 0}]})");
+        });
+        QVERIFY(desk.ready());
+        QVERIFY(!desk.backend.readOnly());
+        desk.canvas->select({1, 2});
+        desk.key(Qt::Key_G, Qt::ControlModifier);
+        const quint32 group = desk.board().item(1)->group;
+        QVERIFY(group > 0 && group < 4000000000u);
+        QCOMPARE(desk.board().item(2)->group, group);
+        QCOMPARE(desk.add(note(600, 0)), quint32(3));
+        QVERIFY(desk.backend.flush());
+        Board reopened;
+        QCOMPARE(reopened.fromJson(desk.onDisk()), QStringList());
+        QCOMPARE(reopened.count(), 4);
+        QCOMPARE(reopened.membersOf(group), (QVector<quint32>{1, 2}));
+        QCOMPARE(reopened.item(4000000000u)->group, 4000000000u);
+    }
+
+    void groupsMergedAtTheIdLimitStayApart() {
+        Board base;
+        Item old = note(0, 0);
+        old.group = 4000000000u;
+        base.add(old);
+        for (int i = 1; i < 7; ++i)
+            base.add(note(i * 200, 0));
+        Board here, there;
+        QCOMPARE(here.fromJson(base.toJson()), QStringList());
+        QCOMPARE(there.fromJson(base.toJson()), QStringList());
+        auto join = [](Board &board, quint32 a, quint32 b) {
+            const quint32 group = board.newGroup();
+            board.begin();
+            for (quint32 id : {a, b}) {
+                Item item = *board.item(id);
+                item.group = group;
+                board.set(item);
+            }
+            board.commit();
+            return group;
+        };
+        const quint32 first = join(here, 2, 3);
+        QCOMPARE(join(there, 4, 5), first);
+        const quint32 second = join(there, 6, 7);
+        here.merge(base.items(), there.items(), there.lastId());
+        const quint32 own = here.item(2)->group;
+        QVERIFY(own > 0 && own != first && own != second);
+        QCOMPARE(here.membersOf(own), (QVector<quint32>{2, 3}));
+        QCOMPARE(here.membersOf(first), (QVector<quint32>{4, 5}));
+        QCOMPARE(here.membersOf(second), (QVector<quint32>{6, 7}));
+        Board reopened;
+        QCOMPARE(reopened.fromJson(here.toJson()), QStringList());
+        here.undo();
+        here.redo();
+        QCOMPARE(here.membersOf(own), (QVector<quint32>{2, 3}));
+    }
+
     void aBoardRenamedInAnotherWindowIsFollowed() {
         QTemporaryDir home;
         Library library(home.path());
@@ -15053,6 +15313,94 @@ private slots:
         second.board()->add(note(600, 0, "Kept"));
         QVERIFY(second.flush());
         QCOMPARE(items("again"), (QStringList{"Second", "Quitting", "Kept"}));
+    }
+
+    void aRenamedBoardIsSavedEvenWhenItsOldNameIsTaken_data() {
+        QTest::addColumn<bool>("flushNow");
+        QTest::newRow("autosave") << false;
+        QTest::newRow("flush") << true;
+    }
+
+    void aRenamedBoardIsSavedEvenWhenItsOldNameIsTaken() {
+        QFETCH(bool, flushNow);
+        QTemporaryDir home;
+        QVERIFY(home.isValid());
+        Library library(home.path());
+        Board original;
+        original.add(note(20, 0, "Original"));
+        QCOMPARE(Library::write(library.boardFile("desk"), original.toJson()), QString());
+        Theme theme(home.path());
+        Backend first(&library, nullptr, &theme), second(&library, nullptr, &theme);
+        first.openInitial("desk");
+        second.openInitial("desk");
+        first.rememberView(QPointF(100, 200), 2);
+        Item nudged = *first.board()->item(1);
+        nudged.rect.translate(1, 0);
+        first.board()->set(nudged);
+        QVERIFY(second.renameBoard("renamed"));
+
+        // Make another board under the old name before the watch reports
+        // the rename. Its first item happens to have the same id.
+        Board replacement;
+        replacement.add(note(300, 0, "Replacement"));
+        replacement.add(note(500, 0, "Only here"));
+        const QByteArray contents = Library::contentsOf(replacement.toJson());
+        QCOMPARE(Library::write(library.boardFile("desk"), contents), QString());
+        {
+            Backend other(&library, nullptr, &theme);
+            other.openInitial("desk");
+            other.rememberView(QPointF(300, 400), 3);
+        }
+        if (flushNow)
+            QVERIFY(first.flush());
+        QTRY_COMPARE(first.boardName(), QString("renamed"));
+        QTRY_COMPARE(first.saveState(), QString("saved"));
+        QCOMPARE(first.board()->count(), 1);
+        QCOMPARE(read(library.boardFile("desk")), contents);
+        QJsonObject root;
+        QCOMPARE(Library::read(library.boardFile("renamed"), root), QString());
+        QCOMPARE(original.fromJson(root), QStringList());
+        QCOMPARE(original.item(1)->text, QString("Original"));
+        QCOMPARE(original.item(1)->rect.x(), qreal(21));
+        const QVariantMap originalView{{"x", 100.0}, {"y", 200.0}, {"zoom", 2.0}};
+        QCOMPARE(first.rememberedView(), originalView);
+        Backend reopened(&library, nullptr, &theme);
+        reopened.openInitial("desk");
+        const QVariantMap replacementView{{"x", 300.0}, {"y", 400.0}, {"zoom", 3.0}};
+        QCOMPARE(reopened.rememberedView(), replacementView);
+    }
+
+    void makingABoardWaitsUntilTheOpenBoardIsSaved() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        const quint32 id = desk.add(note(20, 0, "Keep this"));
+        QVERIFY(desk.backend.flush());
+        const QString active = desk.library.boardFile("desk");
+        const QByteArray before = read(active);
+        desk.canvas->select({id});
+        desk.key(Qt::Key_Right);
+        write(active, "{");
+
+        desk.key(Qt::Key_N, Qt::ControlModifier);
+        QCOMPARE(desk.panel(), QString("newboard"));
+        desk.type("draft");
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            desk.key(Qt::Key_Return);
+            QCOMPARE(desk.backend.boardName(), QString("desk"));
+            QCOMPARE(desk.panel(), QString("newboard"));
+            QCOMPARE(QDir(desk.library.boardsFolder()).entryList(QDir::Dirs | QDir::NoDotAndDotDot),
+                     QStringList{"desk"});
+        }
+
+        // With the file readable again, the same name can be made and the
+        // board just left has the edit that was still waiting to be saved.
+        write(active, before);
+        desk.key(Qt::Key_Return);
+        QCOMPARE(desk.backend.boardName(), QString("draft"));
+        QCOMPARE(desk.panel(), QString());
+        QJsonObject root;
+        QCOMPARE(Library::read(active, root), QString());
+        QCOMPARE(root.value("items").toArray().first().toObject().value("x").toDouble(), 21.0);
     }
 
     void aBoardTrashedRightAfterAnEditTakesTheEditWithIt() {
@@ -15246,6 +15594,45 @@ private slots:
         QCOMPARE(desk.last()->kind, Item::Kind::Text);
         QCOMPARE(desk.last()->text.size(), Item::longestText);
         QCOMPARE(desk.warnings, QStringList());
+    }
+
+    void theEditorLeavesOutAWholeCharacterWhenItWillNotFit() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        const QString original(Item::longestText - 1, 'a');
+        const QString emoji = QStringLiteral("😀");
+        const quint32 id = desk.add(note(0, 0, original));
+        desk.canvas->select({id});
+        desk.key(Qt::Key_Return);
+        QVERIFY(desk.canvas->editing());
+        QQuickItem *editor = desk.item("editor");
+        QVERIFY(editor);
+
+        QGuiApplication::clipboard()->setText(emoji);
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        QCOMPARE(editor->property("text").toString(), original);
+        QVERIFY2(desk.backend.notice().contains("characters"), qPrintable(desk.backend.notice()));
+        // The same paste in the middle leaves the text on either side alone.
+        QVERIFY(editor->setProperty("cursorPosition", 10));
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        QCOMPARE(editor->property("text").toString(), original);
+        desk.key(Qt::Key_Escape);
+        QVERIFY(desk.backend.flush());
+        Board saved;
+        QCOMPARE(saved.fromJson(desk.onDisk()), QStringList());
+        QCOMPARE(saved.item(id)->text, original);
+
+        // With room for the whole emoji, only what comes after it is left out.
+        desk.key(Qt::Key_Return);
+        desk.key(Qt::Key_Backspace);
+        QGuiApplication::clipboard()->setText(emoji + 'b');
+        desk.key(Qt::Key_V, Qt::ControlModifier);
+        const QString fitted = original.chopped(1) + emoji;
+        QCOMPARE(editor->property("text").toString(), fitted);
+        desk.key(Qt::Key_Escape);
+        QVERIFY(desk.backend.flush());
+        QCOMPARE(saved.fromJson(desk.onDisk()), QStringList());
+        QCOMPARE(saved.item(id)->text, fitted);
     }
 
     void whatIsBeingWrittenIsPartOfTheFrame() {

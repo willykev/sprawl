@@ -899,7 +899,18 @@ bool segmentIntersectsRect(QPointF a, QPointF b, const QRectF &rect) {
     return false;
 }
 
-bool polylineIntersectsRect(const QVector<QPointF> &points, const QRectF &rect) {
+bool polylineIntersectsRect(const QVector<QPointF> &points, const QRectF &rect, qreal radius) {
+    if (radius > 0) {
+        // A line with round ends reaches the box wherever its middle meets
+        // the box widened by its radius, with round corners.
+        if (polylineIntersectsRect(points, rect.adjusted(-radius, 0, radius, 0)) ||
+            polylineIntersectsRect(points, rect.adjusted(0, -radius, 0, radius)))
+            return true;
+        for (QPointF corner : {rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()})
+            if (distanceToPolyline(points, corner) <= radius)
+                return true;
+        return false;
+    }
     if (points.size() == 1)
         return rect.contains(points[0]);
     for (int i = 0; i + 1 < points.size(); ++i)

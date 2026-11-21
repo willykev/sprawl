@@ -129,7 +129,7 @@ sprawl open weekend-trip
 A board is given by its name, or by a path to its folder or its
 `board.json`. A board's name always means that board, even where the folder
 you are in has a file or folder called the same: give that folder as
-`./weekend-trip`.
+`./weekend-trip`. `sprawl export` never writes over the board it exports.
 
 With Sprawl open, `sprawl open` on its own brings its window to the front.
 Given a board, or something to start with such as `--theme nord` or
@@ -158,12 +158,13 @@ move elsewhere that holds only the pictures still on the board.
 
 Items are listed back to front; a unit is a pixel at 100%. An item written
 without an `id` is given one, which the window writes into the file once it has
-the board open. `sprawl check` says what is wrong with a file that will not
-open, and a board that cannot be read is never written over: the window says
-why (a click on "read only" says it again), shows it read only, and opens it by
-itself once the file can be read. Which board was open, and where each was
-left, is in `~/.local/state/sprawl/state.json`. Setting `SPRAWL_HOME` keeps
-boards and state somewhere else.
+the board open. `sprawl check` reports problems with the board file and names
+any pictures that are missing or cannot be read. A board that cannot be read
+is never written over. The window says why (a click on "read only" says it
+again), shows it read only, and opens it by itself once the file can be read.
+Which board was open, and where each was left, is in
+`~/.local/state/sprawl/state.json`. Setting `SPRAWL_HOME` keeps boards and state
+somewhere else.
 
 A board from somewhere else is only ever read as a board. What it says, and
 what it and its pictures are called, is shown as written and never as markup;

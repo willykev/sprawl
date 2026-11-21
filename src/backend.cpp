@@ -10,7 +10,6 @@
 #include <QImageReader>
 #include <QJsonDocument>
 #include <QMimeData>
-#include <QSaveFile>
 #include <QStandardPaths>
 #include <algorithm>
 #include <sys/stat.h>
@@ -62,6 +61,12 @@ bool wouldReplace(const QString &path) {
     if (!there.exists() || there.isDir() || !there.isWritable())
         return false;
     return QFileInfo(QFileInfo(there.canonicalFilePath()).absolutePath()).isWritable();
+}
+
+QJsonObject stateAt(const QString &file) {
+    QJsonObject state;
+    Library::read(file, state);
+    return state;
 }
 
 } // namespace
@@ -130,7 +135,6 @@ Backend::Backend(Library *library, FilePicker *picker, Theme *theme, QObject *pa
             writeExport(path, format);
         });
     }
-    readState();
 }
 
 Backend::~Backend() {
@@ -169,7 +173,8 @@ void Backend::openInitial(const QString &argument) {
 }
 
 void Backend::openLast() {
-    if (m_library->exists(m_lastBoard) && openBoard(m_lastBoard))
+    const QString last = stateAt(m_library->stateFile()).value("last").toString();
+    if (m_library->exists(last) && openBoard(last))
         return;
     const auto boards = m_library->boards();
     if (!boards.isEmpty() && openBoard(boards.first().name))
@@ -195,6 +200,11 @@ bool Backend::open(const Library::Location &location) {
     // Whatever was open is safely on disk before it is let go of.
     if (m_location.isValid() && !flush())
         return false;
+    loadBoard(location);
+    return true;
+}
+
+void Backend::loadBoard(const Library::Location &location) {
     m_saveTimer.stop();
     m_saveDeadline.stop();
 
@@ -240,12 +250,11 @@ bool Backend::open(const Library::Location &location) {
         settle();
 
     if (m_library->exists(location.name) && m_library->boardFile(location.name) == location.file) {
-        m_lastBoard = location.name;
+        m_pendingLastBoard = location.name;
         m_stateTimer.start();
     }
     emit boardChanged();
     emit boardOpened();
-    return true;
 }
 
 QString Backend::cannotOpen(const QString &why, bool newer) const {
@@ -302,10 +311,10 @@ QString Backend::boardFolder() const {
     return m_location.assets == folder + "/assets" ? folder : QString();
 }
 
-bool Backend::followMove() {
+void Backend::followMove() {
     const QString folder = boardFolder();
-    if (folder.isEmpty() || !m_folderId.isValid() || QFileInfo::exists(folder))
-        return false;
+    if (folder.isEmpty() || !m_folderId.isValid() || folderIdOf(folder) == m_folderId)
+        return;
     // Renamed, it is the same folder, beside where it was and called
     // something else.
     const QString parent = folder.left(folder.lastIndexOf('/'));
@@ -315,19 +324,22 @@ bool Backend::followMove() {
             const QString was = m_location.name;
             moveTo({name, there + "/board.json", there + "/assets"});
             setNotice(tr("%1 was renamed %2 elsewhere, and is saved as %2").arg(was, name));
-            return true;
+            return;
         }
     }
-    return false;
 }
 
 void Backend::moveTo(const Library::Location &location) {
-    // The view it was left at goes with it.
-    if (m_views.contains(viewKey()))
-        m_views.insert(location.file, m_views.take(viewKey()));
+    // The view goes with the board. If its old name is already taken,
+    // any view saved there may belong to the new board.
+    const QString old = viewKey();
+    const QVariantMap view = QFile::exists(old) ? m_pendingViews.value(old) : rememberedView();
+    m_pendingViews.remove(old);
+    if (!view.isEmpty())
+        m_pendingViews.insert(location.file, view);
     m_location = location;
     if (m_library->exists(location.name) && m_library->boardFile(location.name) == location.file)
-        m_lastBoard = location.name;
+        m_pendingLastBoard = location.name;
     watch();
     // What is said of a board that could not be read names it, and its file:
     // read again where it is now, it is said anew.
@@ -350,14 +362,15 @@ bool Backend::openBoard(const QString &name) {
 }
 
 bool Backend::newBoard(const QString &name) {
+    if (m_location.isValid() && !flush())
+        return false;
     const QString free = m_library->freeName(name);
     const QString problem = m_library->create(free);
     if (!problem.isEmpty()) {
         setProblem(problem);
         return false;
     }
-    if (!openBoard(free))
-        return false;
+    loadBoard({free, m_library->boardFile(free), m_library->assetsFolder(free)});
     // Numbered for something that is not a board, which no list of the
     // boards shows: the board is not called what was asked for, and why is
     // said once it is open (opening it put away what was said before).
@@ -402,7 +415,7 @@ bool Backend::deleteBoard() {
         setProblem(problem);
         return false;
     }
-    m_views.remove(viewKey());
+    m_pendingViews.insert(viewKey(), {});
     // Nothing to flush: the board that was open is in the trash.
     m_location = {};
     m_savedRevision = m_board.revision();
@@ -515,34 +528,53 @@ void Backend::save() {
     written.items = m_board.itemsToWrite();
     written.lastId = m_board.lastId();
     written.revision = m_board.revision();
-    // A board whose folder has gone was renamed or moved elsewhere, and is
-    // followed there; or it was taken away, and is made again, folder and
-    // all, so that nothing done here is lost. Never is the folder it had
-    // made again when it went somewhere else: what is done here would go
-    // to a board of the old name, and not to the one that is open.
-    followMove();
+    if (!prepareSave(written)) {
+        saved(written);
+        return;
+    }
     const QString file = m_location.file;
     const QByteArray base = m_baseFingerprint;
-    QString folder = boardFolder();
-    if (!QFileInfo::exists(folder))
-        folder.clear();
     // `this` outlives the write: the pool is a member, and both flush() and
     // its destructor wait for it.
-    m_pool.start([this, written, file, base, folder]() mutable {
-        // Gone since it was looked for: where to is looked for again first.
-        if (!folder.isEmpty() && !QFileInfo::exists(folder)) {
-            written.moved = true;
-            QMetaObject::invokeMethod(this, [this, written] { saved(written); }, Qt::QueuedConnection);
-            return;
-        }
+    m_pool.start([this, written, file, base]() mutable {
         // Under the lock every writer takes, so no command comes in between.
         // What is to be written is made beforehand, so the lock is held no
         // longer than it must be.
         const QByteArray contents = Library::contentsOf(Board::toJson(written.items, written.lastId));
-        if (const auto lock = Library::lock(file, &written.error))
-            writeOver(file, contents, base, written);
+        written.moved = !inSaveFolder(written);
+        if (!written.moved)
+            if (const auto lock = Library::lock(file, &written.error))
+                writeOver(file, contents, base, written);
         QMetaObject::invokeMethod(this, [this, written] { saved(written); }, Qt::QueuedConnection);
     });
+}
+
+bool Backend::prepareSave(Written &written) {
+    followMove();
+    written.folder = boardFolder();
+    if (written.folder.isEmpty())
+        return true;
+    FolderId found = folderIdOf(written.folder);
+    if (found.isValid() && m_folderId.isValid() && found != m_folderId) {
+        written.error = tr("The folder for %1 now holds another board.").arg(m_location.name);
+        return false;
+    }
+    if (!found.isValid()) {
+        // Taken away for good, the board is made again. Make the folder
+        // itself here, so a folder made by someone else cannot be taken for it.
+        const QFileInfo folder(written.folder);
+        if (!QDir().mkpath(folder.absolutePath()) || !folder.dir().mkdir(folder.fileName())) {
+            written.error = tr("Could not make the folder for %1.").arg(m_location.file);
+            return false;
+        }
+        found = folderIdOf(written.folder);
+    }
+    m_folderId = written.folderId = found;
+    return true;
+}
+
+bool Backend::inSaveFolder(const Written &written) {
+    return written.folder.isEmpty() || (written.folderId.isValid() && folderIdOf(written.folder) == written.folderId);
 }
 
 // Writes over the file only while it is as this app last read or wrote it,
@@ -553,9 +585,13 @@ void Backend::save() {
 // written (by an agent, which takes no lock) is replaced unseen.
 void Backend::writeOver(const QString &file, const QByteArray &contents, const QByteArray &base, Written &written) {
     written.changed = false;
+    written.moved = !inSaveFolder(written);
+    if (written.moved)
+        return;
     written.error = Library::write(file, contents, &written.fingerprint, [&] {
         written.changed = QFileInfo::exists(file) && Library::fingerprint(file) != base;
-        return !written.changed;
+        written.moved = !inSaveFolder(written);
+        return !written.changed && !written.moved;
     });
 }
 
@@ -621,31 +657,42 @@ bool Backend::flush() {
     // What it is a write of, which saved() is told even when the lock cannot
     // be had: one of ids alone that fails is nothing to say.
     written.revision = m_board.revision();
-    // Moved elsewhere, it is written where it is now (see save()).
-    followMove();
-    if (const auto lock = Library::lock(m_location.file, &written.error)) {
-        for (int tries = 0; tries < flushTries; ++tries) {
-            QJsonObject root;
-            QByteArray fingerprint;
-            const QString problem = Library::read(m_location.file, root, &fingerprint);
-            if (!QFileInfo::exists(m_location.file)) {
-                resume();
-            } else if (fingerprint != m_baseFingerprint && !takeIn(problem, root, fingerprint)) {
-                // Asked to write it now, it says why it cannot. Ids alone
-                // are no loss: only what was done here is.
-                sayWhy();
-                return m_board.revision() == m_savedRevision;
-            }
-            if (m_board.revision() == m_savedRevision && !m_idsToWrite)
-                return true;
-            written.items = m_board.itemsToWrite();
-            written.lastId = m_board.lastId();
-            written.revision = m_board.revision();
-            writeOver(m_location.file, Library::contentsOf(Board::toJson(written.items, written.lastId)),
-                      m_baseFingerprint, written);
-            if (!written.changed)
-                break;
+    for (int tries = 0; tries < flushTries; ++tries) {
+        written.changed = written.moved = false;
+        written.error.clear();
+        if (!prepareSave(written))
+            break;
+        const QString file = m_location.file;
+        const auto lock = Library::lock(file, &written.error);
+        if (!inSaveFolder(written)) {
+            written.moved = true;
+            continue;
         }
+        if (!lock)
+            break;
+        QJsonObject root;
+        QByteArray fingerprint;
+        const QString problem = Library::read(file, root, &fingerprint);
+        if (!inSaveFolder(written)) {
+            written.moved = true;
+            continue;
+        }
+        if (!QFileInfo::exists(file)) {
+            resume();
+        } else if (fingerprint != m_baseFingerprint && !takeIn(problem, root, fingerprint)) {
+            // Asked to write it now, it says why it cannot. Ids alone
+            // are no loss: only what was done here is.
+            sayWhy();
+            return m_board.revision() == m_savedRevision;
+        }
+        if (m_board.revision() == m_savedRevision && !m_idsToWrite)
+            return true;
+        written.items = m_board.itemsToWrite();
+        written.lastId = m_board.lastId();
+        written.revision = m_board.revision();
+        writeOver(file, Library::contentsOf(Board::toJson(written.items, written.lastId)), m_baseFingerprint, written);
+        if (!written.changed && !written.moved)
+            break;
     }
     m_saving = true;
     saved(written);
@@ -679,14 +726,14 @@ void Backend::fileChanged() {
     // looks again.
     if (m_saving)
         return;
+    followMove();
+    const QString folder = boardFolder();
+    const FolderId found = folderIdOf(folder);
+    if (found.isValid() && m_folderId.isValid() && found != m_folderId)
+        return;
     // Gone, there is nothing to take in or to write over: whatever the board
-    // has that the file did is written anew. Gone with its folder, it may
-    // only have been renamed, and then it is looked at where it is now.
+    // has that the file did is written anew.
     if (!QFileInfo::exists(m_location.file)) {
-        if (followMove()) {
-            fileChanged();
-            return;
-        }
         resume();
         return;
     }
@@ -704,7 +751,8 @@ void Backend::fileChanged() {
     QJsonObject root;
     QByteArray fingerprint;
     const QString problem = Library::read(m_location.file, root, &fingerprint);
-    takeIn(problem, root, fingerprint);
+    if (folder.isEmpty() || folderIdOf(folder) == found)
+        takeIn(problem, root, fingerprint);
 }
 
 // Takes in the file as it is now: read with `problem`, as `root`, holding
@@ -837,31 +885,35 @@ void Backend::setNotice(const QString &notice) {
 
 QString Backend::viewKey() const { return m_location.file; }
 
-void Backend::readState() {
-    QFile file(m_library->stateFile());
-    if (!file.open(QIODevice::ReadOnly))
-        return;
-    const QJsonObject state = QJsonDocument::fromJson(file.readAll()).object();
-    m_lastBoard = state.value("last").toString();
-    const QJsonObject views = state.value("views").toObject();
-    for (auto it = views.constBegin(); it != views.constEnd(); ++it)
-        m_views.insert(it.key(), it.value().toObject().toVariantMap());
-}
-
 void Backend::writeState() {
     m_stateTimer.stop();
-    QJsonObject views;
-    for (auto it = m_views.constBegin(); it != m_views.constEnd(); ++it)
-        // Boards that are gone are forgotten.
-        if (QFile::exists(it.key()))
-            views.insert(it.key(), QJsonObject::fromVariantMap(it.value()));
-    const QString file = m_library->stateFile();
-    QDir().mkpath(QFileInfo(file).absolutePath());
-    QSaveFile output(file);
-    if (!output.open(QIODevice::WriteOnly))
+    if (m_pendingLastBoard.isEmpty() && m_pendingViews.isEmpty())
         return;
-    output.write(QJsonDocument(QJsonObject{{"last", m_lastBoard}, {"views", views}}).toJson());
-    output.commit();
+    const QString file = m_library->stateFile();
+    const auto lock = Library::lock(file);
+    if (!lock)
+        return;
+    // Another window may have left boards at views of its own. Read those
+    // under the lock and change only what this window has to write.
+    const QJsonObject state = stateAt(file);
+    QJsonObject views = state.value("views").toObject();
+    for (auto it = m_pendingViews.cbegin(); it != m_pendingViews.cend(); ++it) {
+        if (it.value().isEmpty())
+            views.remove(it.key());
+        else
+            views.insert(it.key(), QJsonObject::fromVariantMap(it.value()));
+    }
+    for (auto it = views.begin(); it != views.end();) {
+        if (QFile::exists(it.key()))
+            ++it;
+        else
+            it = views.erase(it);
+    }
+    const QString last = m_pendingLastBoard.isEmpty() ? state.value("last").toString() : m_pendingLastBoard;
+    if (Library::write(file, QJsonObject{{"last", last}, {"views", views}}).isEmpty()) {
+        m_pendingViews.clear();
+        m_pendingLastBoard.clear();
+    }
 }
 
 void Backend::rememberView(QPointF origin, qreal zoom) {
@@ -869,11 +921,17 @@ void Backend::rememberView(QPointF origin, qreal zoom) {
     // be: the empty board shown in its place has nothing to go back to.
     if (!m_location.isValid() || m_readOnly)
         return;
-    m_views.insert(viewKey(), {{"x", origin.x()}, {"y", origin.y()}, {"zoom", zoom}});
+    m_pendingViews.insert(viewKey(), {{"x", origin.x()}, {"y", origin.y()}, {"zoom", zoom}});
     m_stateTimer.start();
 }
 
-QVariantMap Backend::rememberedView() const { return m_views.value(viewKey()); }
+QVariantMap Backend::rememberedView() const {
+    const auto pending = m_pendingViews.constFind(viewKey());
+    if (pending != m_pendingViews.constEnd())
+        return *pending;
+    const QJsonObject state = stateAt(m_library->stateFile());
+    return state.value("views").toObject().value(viewKey()).toObject().toVariantMap();
+}
 
 // --- Pictures and the clipboard --------------------------------------------------------
 

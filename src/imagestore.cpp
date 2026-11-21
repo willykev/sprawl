@@ -187,27 +187,9 @@ QImage ImageStore::read(const QString &path) {
 }
 
 bool ImageStore::canShow(QIODevice *device, const QByteArray &hint) {
-    const QByteArray format = formatOf(device, hint);
-    if (format.isEmpty())
-        return false;
-    if (isSvg(format)) {
-        QByteArray source = svgSource(device);
-        if (source.isEmpty())
-            return false;
-        QBuffer buffer(&source);
-        buffer.open(QIODevice::ReadOnly);
-        return QImageReader(&buffer, "svg").canRead();
-    }
-    const bool can = QImageReader(device, format).canRead();
+    const bool can = !decode(device, hint).isNull();
     device->seek(0);
     return can;
-}
-
-bool ImageStore::canShow(const QString &path) {
-    QFile file(path);
-    if (!QFileInfo(path).isFile() || !file.open(QIODevice::ReadOnly))
-        return false;
-    return canShow(&file, suffixOf(path));
 }
 
 bool ImageStore::loading() const {

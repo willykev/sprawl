@@ -159,14 +159,18 @@ quint32 lastIdOf(const QJsonObject &root) {
 // The id to give next: the one after `last`, the last id given, which it
 // then is. Past the most an id can be, which only a file that says it gave
 // ids that far brings about, a board could not be read back: there it is
-// the first id not among those `used` gives.
-quint32 nextId(quint32 &last, const std::function<QSet<quint32>()> &used) {
+// the first id not among those `used` gives. A group id may be given before
+// anything has it, so a `cursor` remembers how far the search got.
+quint32 nextId(quint32 &last, const std::function<QSet<quint32>()> &used, quint32 *cursor = nullptr) {
     if (last < mostId)
         return ++last;
     const QSet<quint32> taken = used();
-    quint32 id = 1;
-    while (taken.contains(id))
-        ++id;
+    quint32 id = cursor ? *cursor : 0;
+    do {
+        id = id == mostId ? 1 : id + 1;
+    } while (taken.contains(id));
+    if (cursor)
+        *cursor = id;
     return id;
 }
 
@@ -331,7 +335,8 @@ bool Board::hits(const Item &item, QPointF point, qreal slack) const {
 bool Board::touches(const Item &item, const QRectF &area) const {
     switch (item.kind) {
     case Item::Kind::Stroke:
-        return Geo::polylineIntersectsRect(item.points, area.translated(-item.rect.topLeft()));
+        return Geo::polylineIntersectsRect(Geo::smooth(item.points, Geo::strokeTolerance),
+                                           area.translated(-item.rect.topLeft()), item.width / 2);
     case Item::Kind::Connector:
         return Geo::polylineIntersectsRect(Geo::connectorPath(item), area);
     case Item::Kind::Frame:
@@ -350,6 +355,10 @@ QVector<quint32> Board::membersOf(quint32 group) const {
         if (m_items.value(id).group == group)
             members.append(id);
     return members;
+}
+
+quint32 Board::newGroup() {
+    return nextId(m_lastGroup, [this] { return groupsInUse(); }, &m_wrappedGroup);
 }
 
 Board::Ends Board::connectorEnds(const Item &connector) const {
@@ -711,17 +720,37 @@ void Board::rollback() {
     }
 }
 
+Board::StackChange Board::stackChange(const Command &command, bool forward) {
+    StackChange stack;
+    for (const Edit &edit : command) {
+        const bool existed = forward ? edit.existedBefore : edit.existsAfter;
+        const bool exists = forward ? edit.existsAfter : edit.existedBefore;
+        if (existed && (!exists || edit.restacked))
+            stack.leaving.insert(edit.id);
+        if (exists && (!existed || edit.restacked))
+            stack.arriving.append({forward ? edit.afterDepth : edit.beforeDepth, edit.id});
+    }
+    std::sort(stack.arriving.begin(), stack.arriving.end());
+    return stack;
+}
+
+void Board::StackChange::takeFrom(QVector<quint32> &order) const {
+    if (!leaving.isEmpty())
+        order.removeIf([this](quint32 id) { return leaving.contains(id); });
+}
+
+void Board::StackChange::putInto(QVector<quint32> &order) const {
+    // They take their places from the back forward, each where it was.
+    for (const auto &[at, id] : arriving)
+        order.insert(at < 0 ? order.size() : qMin<qsizetype>(at, order.size()), id);
+}
+
 void Board::apply(const Command &command, bool forward) {
-    auto existsFrom = [forward](const Edit &edit) { return forward ? edit.existedBefore : edit.existsAfter; };
     auto existsTo = [forward](const Edit &edit) { return forward ? edit.existsAfter : edit.existedBefore; };
 
     // Items that go away, or change places, leave the stack first.
-    QSet<quint32> leaving;
-    for (const Edit &edit : command)
-        if (existsFrom(edit) && (!existsTo(edit) || edit.restacked))
-            leaving.insert(edit.id);
-    if (!leaving.isEmpty())
-        m_order.removeIf([&leaving](quint32 id) { return leaving.contains(id); });
+    const StackChange stack = stackChange(command, forward);
+    stack.takeFrom(m_order);
 
     for (const Edit &edit : command) {
         if (!existsTo(edit)) {
@@ -744,15 +773,7 @@ void Board::apply(const Command &command, bool forward) {
         }
     }
 
-    // Then those that arrive take their places, from the back forward, which
-    // puts every one of them exactly where it was.
-    QVector<QPair<int, quint32>> arriving;
-    for (const Edit &edit : command)
-        if (existsTo(edit) && (!existsFrom(edit) || edit.restacked))
-            arriving.append({forward ? edit.afterDepth : edit.beforeDepth, edit.id});
-    std::sort(arriving.begin(), arriving.end());
-    for (const auto &[at, id] : std::as_const(arriving))
-        m_order.insert(at < 0 ? m_order.size() : qMin<qsizetype>(at, m_order.size()), id);
+    stack.putInto(m_order);
     m_depthsStale = true;
 
     // Connectors follow whatever moved under them. One still attached to an
@@ -767,15 +788,18 @@ void Board::apply(const Command &command, bool forward) {
         refreshConnector(edit.id);
         refreshConnectorsOf(edit.id);
     }
-    if (!leaving.isEmpty() || !arriving.isEmpty())
+    if (!stack.leaving.isEmpty() || !stack.arriving.isEmpty())
         emit orderChanged();
 }
 
 void Board::setMeasuredRect(quint32 id, const QRectF &rect) {
+    // A shape grown about its middle can put its top edge past the file's
+    // coordinate limit, just as an edit can.
+    const QRectF measured(within(rect.topLeft()), rect.size());
     const auto found = m_items.find(id);
-    if (found == m_items.end() || found->rect == rect)
+    if (found == m_items.end() || found->rect == measured)
         return;
-    found->rect = rect;
+    found->rect = measured;
     m_grid.update(id, boundsFor(*found));
     emit itemChanged(id, Change::Edited);
     refreshConnectorsOf(id);
@@ -911,16 +935,23 @@ void Board::renumber(quint32 from, quint32 to) {
     revise();
 }
 
-bool Board::groupInUse(quint32 group) const {
-    auto in = [group](const Item &item) { return item.group == group; };
-    if (std::any_of(m_items.cbegin(), m_items.cend(), in) || std::any_of(m_before.cbegin(), m_before.cend(), in))
-        return true;
+QSet<quint32> Board::groupsInUse() const {
+    QSet<quint32> groups;
+    auto use = [&groups](const Item &item) {
+        if (item.group)
+            groups.insert(item.group);
+    };
+    for (const Item &item : m_items)
+        use(item);
+    for (const Item &item : m_before)
+        use(item);
     for (const QVector<Command> *history : {&m_undo, &m_redo})
         for (const Command &command : *history)
-            for (const Edit &edit : command)
-                if ((edit.existedBefore && in(edit.before)) || (edit.existsAfter && in(edit.after)))
-                    return true;
-    return false;
+            for (const Edit &edit : command) {
+                use(edit.before);
+                use(edit.after);
+            }
+    return groups;
 }
 
 void Board::regroup(quint32 from, quint32 to) {
@@ -953,6 +984,42 @@ void Board::regroup(quint32 from, quint32 to) {
     revise();
 }
 
+void Board::rebaseHistory(const QSet<quint32> &gone) {
+    if (gone.isEmpty())
+        return;
+    auto removedDepths = [&gone](const QVector<quint32> &order) {
+        QVector<int> depths;
+        for (int depth = 0; depth < order.size(); ++depth)
+            if (gone.contains(order[depth]))
+                depths.append(depth);
+        return depths;
+    };
+    auto shift = [](int depth, const QVector<int> &removed) {
+        return depth - int(std::lower_bound(removed.cbegin(), removed.cend(), depth) - removed.cbegin());
+    };
+    // A missing item may have been at a different depth on either side of
+    // a step. Walk each history as it was, shifting each saved depth by
+    // the number of items that are now gone below it.
+    for (QVector<Command> *history : {&m_undo, &m_redo}) {
+        const bool forward = history == &m_redo;
+        QVector<quint32> order = m_orderRemembered ? m_orderBefore : m_order;
+        QVector<int> from = removedDepths(order);
+        for (auto it = history->rbegin(); it != history->rend(); ++it) {
+            const StackChange stack = stackChange(*it, forward);
+            if (stack.leaving.isEmpty() && stack.arriving.isEmpty())
+                continue;
+            stack.takeFrom(order);
+            stack.putInto(order);
+            QVector<int> to = removedDepths(order);
+            for (Edit &edit : *it) {
+                edit.beforeDepth = shift(edit.beforeDepth, forward ? from : to);
+                edit.afterDepth = shift(edit.afterDepth, forward ? to : from);
+            }
+            from = std::move(to);
+        }
+    }
+}
+
 Board::Merged Board::merge(const QVector<Item> &base, const QVector<Item> &theirs, quint32 lastId) {
     Merged merged;
     // Nothing made here is given an id the file gave, to an item it still
@@ -965,21 +1032,28 @@ Board::Merged Board::merge(const QVector<Item> &base, const QVector<Item> &their
     // file has, as an item is (see renumber()). Were they the same items,
     // the group they end up in is the one here, as anything changed both
     // here and in the file is.
-    QSet<quint32> hadGroups, newGroups;
+    QSet<quint32> hadGroups, incomingGroups;
     for (const Item &item : base)
         hadGroups.insert(item.group);
-    quint32 lastGroup = m_lastGroup;
     for (const Item &item : theirs) {
-        lastGroup = qMax(lastGroup, item.group);
-        if (item.group && !hadGroups.contains(item.group))
-            newGroups.insert(item.group);
+        m_lastGroup = qMax(m_lastGroup, item.group);
+        if (item.group)
+            incomingGroups.insert(item.group);
     }
-    QList<quint32> clashing(newGroups.cbegin(), newGroups.cend());
-    std::sort(clashing.begin(), clashing.end());
-    for (quint32 group : std::as_const(clashing))
-        if (groupInUse(group))
-            regroup(group, ++lastGroup);
-    m_lastGroup = qMax(m_lastGroup, lastGroup);
+    const QSet<quint32> newGroups = incomingGroups - hadGroups;
+    if (!newGroups.isEmpty()) {
+        const QSet<quint32> used = groupsInUse();
+        QSet<quint32> reserved = used + incomingGroups;
+        QList<quint32> clashing = newGroups.values();
+        std::sort(clashing.begin(), clashing.end());
+        for (quint32 group : std::as_const(clashing)) {
+            if (!used.contains(group))
+                continue;
+            const quint32 next = nextId(m_lastGroup, [&reserved] { return reserved; }, &m_wrappedGroup);
+            reserved.insert(next);
+            regroup(group, next);
+        }
+    }
     // Each item as the file had it and has it now, by id, and in its order.
     QHash<quint32, QJsonObject> was, now;
     QHash<quint32, Item> incoming;
@@ -1075,6 +1149,7 @@ Board::Merged Board::merge(const QVector<Item> &base, const QVector<Item> &their
     // it added on top. What all three have, the file restacked, and the
     // board did not, takes the file's order, each in a place one of them had
     // here.
+    rebaseHistory(gone);
     QVector<quint32> order = m_order;
     order.removeIf([&gone](quint32 id) { return gone.contains(id); });
     QSet<quint32> shared;
@@ -1207,15 +1282,19 @@ QJsonObject Board::itemToJson(const Item &item) {
         object["points"] = points;
         break;
     }
-    case Item::Kind::Connector:
+    case Item::Kind::Connector: {
         if (item.from)
             object["from"] = qint64(item.from);
         if (item.to)
             object["to"] = qint64(item.to);
-        object["x1"] = rounded(item.p1.x());
-        object["y1"] = rounded(item.p1.y());
-        object["x2"] = rounded(item.p2.x());
-        object["y2"] = rounded(item.p2.y());
+        // An attached end can reach the edge of a box that extends past
+        // the file's coordinate limit. On opening, it finds that edge
+        // again. The points kept in the file must be within the limit.
+        const QPointF first = within(item.p1), second = within(item.p2);
+        object["x1"] = rounded(first.x());
+        object["y1"] = rounded(first.y());
+        object["x2"] = rounded(second.x());
+        object["y2"] = rounded(second.y());
         object["width"] = rounded(item.width);
         // Only what is not what a connector is to begin with.
         if (item.route != Item::Route::Straight)
@@ -1227,6 +1306,7 @@ QJsonObject Board::itemToJson(const Item &item) {
         if (item.dash != Item::Dash::Solid)
             object["dash"] = dashNames.value(int(item.dash));
         break;
+    }
     }
     if (!item.color.isEmpty())
         object["color"] = item.color;
@@ -1579,7 +1659,7 @@ QStringList Board::fromJson(const QJsonObject &root, bool *numbered) {
     m_orderBefore.clear();
     m_orderRemembered = false;
     m_open = false;
-    m_lastId = m_lastGroup = 0;
+    m_lastId = m_lastGroup = m_wrappedGroup = 0;
     for (const Item &item : std::as_const(items)) {
         place(item);
         m_order.append(item.id);

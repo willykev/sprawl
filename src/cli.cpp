@@ -312,11 +312,22 @@ int check(const QStringList &arguments) {
             problems << problem;
         else
             problems = Board::parse(root, items);
-        // A picture the board shows has to be in its assets folder.
-        if (problems.isEmpty())
-            for (const Item &item : std::as_const(items))
-                if (item.kind == Item::Kind::Image && !QFile::exists(location.assets + "/" + item.asset))
+        // A picture has to be in its assets folder and readable as a picture.
+        if (problems.isEmpty()) {
+            QSet<QString> checked;
+            for (const Item &item : std::as_const(items)) {
+                if (item.kind != Item::Kind::Image || checked.contains(item.asset))
+                    continue;
+                checked.insert(item.asset);
+                QFile file;
+                if (!ImageStore::openAsset(location.assets, item.asset, file)) {
                     problems << QString("The picture %1 is missing from %2.").arg(item.asset, location.assets);
+                } else if (!ImageStore::canShow(&file, QFileInfo(item.asset).suffix().toLatin1())) {
+                    problems << QString("The picture %1 in %2 is not a picture Sprawl can show.")
+                                    .arg(item.asset, location.assets);
+                }
+            }
+        }
     }
     if (command.wantsJson()) {
         print(QJsonObject{{"ok", problems.isEmpty()},
@@ -363,6 +374,9 @@ int exportBoard(const QStringList &arguments) {
         return fail(QString("Sprawl exports %1, not %2.").arg(Exporter::formats().join(", "), options.format));
     if (output.isEmpty())
         output = location.name + "." + options.format;
+    const QString destination = QFileInfo(output).canonicalFilePath();
+    if (!destination.isEmpty() && destination == QFileInfo(location.file).canonicalFilePath())
+        return fail(QString("Exporting to %1 would replace the board file. Choose another file.").arg(output));
     bool scaleOk = false, marginOk = false;
     options.scale = command.parser.value("scale").toDouble(&scaleOk);
     options.margin = command.parser.value("margin").toDouble(&marginOk);

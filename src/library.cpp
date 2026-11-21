@@ -74,13 +74,17 @@ QString Library::slug(const QString &text) {
     // dashes: a name that is easy to type, safe as a folder, and never
     // taken for an option or a path on a command line.
     QString name;
-    for (const QChar c : text.trimmed().toLower()) {
-        if (c.isLetterOrNumber() || c == '_')
-            name += c;
+    for (const char32_t c : text.trimmed().toLower().toUcs4()) {
+        if (QChar::isLetterOrNumber(c) || c == '_')
+            name += QString::fromUcs4(&c, 1);
         else if (!name.isEmpty() && !name.endsWith('-'))
             name += '-';
+        if (name.size() >= 64)
+            break;
     }
     name.truncate(64);
+    if (!name.isEmpty() && name.back().isHighSurrogate())
+        name.chop(1);
     while (name.endsWith('-'))
         name.chop(1);
     return name;
@@ -285,12 +289,12 @@ QString Library::importFile(const QString &assetsFolder, const QString &source, 
     QFile input(source);
     if (!input.open(QIODevice::ReadOnly))
         return fail(QString("Could not read %1: %2.").arg(source, input.errorString()));
-    if (!ImageStore::canShow(source))
+    const QString suffix = info.suffix().toLower();
+    if (!ImageStore::canShow(&input, suffix.toLatin1()))
         return fail(QString("%1 is not a picture Sprawl can show.").arg(source));
     QCryptographicHash hash(QCryptographicHash::Sha1);
     if (!hash.addData(&input))
         return fail(QString("Could not read %1.").arg(source));
-    const QString suffix = QFileInfo(source).suffix().toLower();
     const QString name = QString::fromLatin1(hash.result().toHex().left(16)) + (suffix.isEmpty() ? "" : "." + suffix);
     const QString target = assetsFolder + "/" + name;
     if (QFile::exists(target))

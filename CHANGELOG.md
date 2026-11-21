@@ -17,16 +17,34 @@ Fixes from a security and data-integrity review.
   exported. Before, the whole board was.
 - `sprawl copy <board> <folder>` copies a board with only the pictures that
   are on it. A board's own folder keeps pictures taken off it, for undo.
+- `sprawl export` refuses to write over the board it exports, even through
+  a link to the board file.
+- Sprawl reads a picture before copying it in. `sprawl check` reports
+  pictures on a board that it cannot read.
 
 ### Saving
 
-- A board renamed in another window is followed there. Before, the window
-  that did not rename it made the old board again and saved its work there.
+- A board renamed in another window is followed there, even when a
+  different board has taken its old name.
 - Moving a board to the trash saves its latest changes first.
 - A picture pasted from another board is always the one copied, even when
   the board it is pasted on has a different picture with the same name.
 - Groups made in two windows at once stay two groups.
 - Pictures no longer on the board are let go of from memory past 256 MiB.
+- A board still opens when a shape grows or a connector reaches past the
+  file's coordinate limit, or a group is made at the group ID limit.
+- Each board keeps the pan and zoom it was left at when several windows use
+  the same library.
+- New Board saves the open board before making another, so a failed save
+  leaves the library as it was.
+- Board names keep letters such as `𠮷` in `𠮷野`.
+
+### The canvas
+
+- Undo and redo keep the order of the remaining items when one was taken
+  off the board elsewhere.
+- An emoji pasted at the text limit is left out whole when it will not fit.
+- Box selection picks up a pen stroke when the box touches its ink.
 
 ## 0.1.2 — 2026-11-16
 

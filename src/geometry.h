@@ -284,7 +284,7 @@ ConnectorArt connectorArt(const Item &connector);
 qreal distanceToSegment(QPointF p, QPointF a, QPointF b);
 qreal distanceToPolyline(const QVector<QPointF> &points, QPointF p);
 bool segmentIntersectsRect(QPointF a, QPointF b, const QRectF &rect);
-bool polylineIntersectsRect(const QVector<QPointF> &points, const QRectF &rect);
+bool polylineIntersectsRect(const QVector<QPointF> &points, const QRectF &rect, qreal radius = 0);
 bool shapeContains(Item::Shape shape, const QRectF &rect, QPointF p);
 
 // --- Connectors -------------------------------------------------------------
