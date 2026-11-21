@@ -132,6 +132,24 @@ def save_loop(picture, frames):
                    check=True)
 
 
+def hero(stage, picture):
+    """Zoom from the whole trip board into the three notes in Before Friday."""
+    frames = []
+    steps = 22
+    for step in range(steps + 1):
+        t = step / steps
+        t = t * t * (3 - 2 * t)
+        zoom = 0.86 * (2.02 / 0.86) ** t
+        # Keep a point on "Book a cabin" at the same spot on screen, as Ctrl+scroll does.
+        view = (38 - 100 / zoom, 160 - 180 / zoom, zoom)
+        frame = stage.scratch / f"hero-{step:02}.png"
+        stage.draw(frame, "1152x620", view=view, scale=0.875)
+        frames.append(frame)
+
+    moving = [(frame, 7) for frame in frames[1:-1]]
+    save_loop(picture, [(frames[0], 100), *moving, (frames[-1], 205), *reversed(moving)])
+
+
 def pen(stage, picture):
     """Draw the example's mountain outline in one drag with the default pen."""
     items = stage.example["items"]
@@ -236,6 +254,7 @@ def main():
         drawn = stage.scratch / "drawn"
         drawn.mkdir()
         stage.draw(drawn / "hero.png", WHOLE)
+        hero(stage, drawn / "hero.gif")
         connectors(stage, drawn / "connectors.gif")
         stage.draw(drawn / "pen.png", CLOSE, "--tool", "pen", view=SKETCH)
         pen(stage, drawn / "pen.gif")

@@ -56,6 +56,8 @@
 
 ### README tour
 
+- The opening animation zooms from the whole weekend-trip board into three
+  planning notes and back out.
 - Two new animations show a pen stroke taking shape and a board search
   through to the board opening. `sprawl open --show boards=tri` opens the
   switcher with the search text filled in.

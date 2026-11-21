@@ -7,7 +7,7 @@ and there is no account.
 
 [Install](#install) · [Guide](docs/guide.md) · [Changelog](CHANGELOG.md) · [Releases](https://github.com/willykev/sprawl/releases)
 
-![Sprawl with a weekend trip planned on a board: sticky notes in a frame, a flowchart, and a pen sketch of mountains](screenshots/hero.png)
+![Sprawl zooms from a whole weekend-trip board into three notes about booking a cabin, planning the drive and picking a trail, then back out](screenshots/hero.gif)
 
 ## Features
 
@@ -61,8 +61,8 @@ Press **Space** to put a note under the pointer, type your idea, and press
 **Esc**. Drag things to move them, scroll to pan, and hold **Ctrl** while
 scrolling to zoom. There is nothing to save.
 
-To look around a finished board first, open the one in these pictures from
-the folder you cloned:
+Open the weekend-trip example from the folder you cloned, or
+[view the whole board as a full-size still](screenshots/hero.png).
 
 ```sh
 sprawl open examples/weekend-trip
