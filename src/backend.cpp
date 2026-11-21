@@ -7,12 +7,11 @@
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QImage>
-#include <QImageReader>
 #include <QJsonDocument>
 #include <QMimeData>
-#include <QSaveFile>
 #include <QStandardPaths>
 #include <algorithm>
+#include <cerrno>
 #include <sys/stat.h>
 #include <utility>
 
@@ -64,11 +63,20 @@ bool wouldReplace(const QString &path) {
     return QFileInfo(QFileInfo(there.canonicalFilePath()).absolutePath()).isWritable();
 }
 
+bool readState(const QString &file, QJsonObject &state) {
+    struct stat status;
+    if (::lstat(QFile::encodeName(file).constData(), &status) != 0)
+        return errno == ENOENT;
+    // A dangling link or an unreadable file is still there.
+    return QFileInfo(file).isFile() && Library::read(file, state).isEmpty();
+}
+
 } // namespace
 
 Backend::Backend(Library *library, FilePicker *picker, Theme *theme, QObject *parent)
     : QObject(parent), m_library(library), m_picker(picker), m_theme(theme) {
     m_pool.setMaxThreadCount(1);
+    m_importPool.setMaxThreadCount(1);
 
     m_saveTimer.setSingleShot(true);
     m_saveTimer.setInterval(saveDelay);
@@ -130,7 +138,6 @@ Backend::Backend(Library *library, FilePicker *picker, Theme *theme, QObject *pa
             writeExport(path, format);
         });
     }
-    readState();
 }
 
 Backend::~Backend() {
@@ -169,7 +176,9 @@ void Backend::openInitial(const QString &argument) {
 }
 
 void Backend::openLast() {
-    if (m_library->exists(m_lastBoard) && openBoard(m_lastBoard))
+    loadState();
+    const QString last = m_state.value("last").toString();
+    if (m_library->exists(last) && openBoard(last))
         return;
     const auto boards = m_library->boards();
     if (!boards.isEmpty() && openBoard(boards.first().name))
@@ -195,6 +204,11 @@ bool Backend::open(const Library::Location &location) {
     // Whatever was open is safely on disk before it is let go of.
     if (m_location.isValid() && !flush())
         return false;
+    loadBoard(location);
+    return true;
+}
+
+void Backend::loadBoard(const Library::Location &location) {
     m_saveTimer.stop();
     m_saveDeadline.stop();
 
@@ -202,7 +216,10 @@ bool Backend::open(const Library::Location &location) {
     // that goes unseen. An export asked of the board before is not of this
     // one.
     m_location = location;
-    m_folderId = folderIdOf(boardFolder());
+    m_folderId = Library::folderId(QFileInfo(location.file).absolutePath());
+    m_imports.clear();
+    m_readyPicture.reset();
+    loadState();
     m_exportAsked = false;
     watch();
     QJsonObject root;
@@ -240,12 +257,11 @@ bool Backend::open(const Library::Location &location) {
         settle();
 
     if (m_library->exists(location.name) && m_library->boardFile(location.name) == location.file) {
-        m_lastBoard = location.name;
+        m_pendingLastBoard = location.name;
         m_stateTimer.start();
     }
     emit boardChanged();
     emit boardOpened();
-    return true;
 }
 
 QString Backend::cannotOpen(const QString &why, bool newer) const {
@@ -269,6 +285,8 @@ void Backend::openNone(const QString &why) {
     m_saveDeadline.stop();
     m_location = {};
     m_folderId = {};
+    m_imports.clear();
+    m_readyPicture.reset();
     m_exportAsked = false;
     watch();
     // Whatever the window had goes: nothing done to it could be kept.
@@ -287,13 +305,6 @@ void Backend::openNone(const QString &why) {
     emit boardOpened();
 }
 
-Backend::FolderId Backend::folderIdOf(const QString &folder) {
-    struct stat status;
-    if (folder.isEmpty() || ::stat(QFile::encodeName(folder).constData(), &status) != 0 || !S_ISDIR(status.st_mode))
-        return {};
-    return {quint64(status.st_dev), quint64(status.st_ino)};
-}
-
 QString Backend::boardFolder() const {
     const QString file = QStringLiteral("/board.json");
     if (!m_location.file.endsWith(file))
@@ -302,32 +313,45 @@ QString Backend::boardFolder() const {
     return m_location.assets == folder + "/assets" ? folder : QString();
 }
 
-bool Backend::followMove() {
+void Backend::followMove() {
     const QString folder = boardFolder();
-    if (folder.isEmpty() || !m_folderId.isValid() || QFileInfo::exists(folder))
-        return false;
+    if (folder.isEmpty() || !m_folderId.isValid() || Library::folderId(folder) == m_folderId)
+        return;
     // Renamed, it is the same folder, beside where it was and called
     // something else.
     const QString parent = folder.left(folder.lastIndexOf('/'));
     for (const QString &name : QDir(parent).entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
         const QString there = parent + "/" + name;
-        if (folderIdOf(there) == m_folderId && QFileInfo(there + "/board.json").isFile()) {
+        if (Library::folderId(there) == m_folderId && QFileInfo(there + "/board.json").isFile()) {
             const QString was = m_location.name;
             moveTo({name, there + "/board.json", there + "/assets"});
             setNotice(tr("%1 was renamed %2 elsewhere, and is saved as %2").arg(was, name));
-            return true;
+            return;
         }
     }
+}
+
+bool Backend::verifyOpenFolder() {
+    followMove();
+    if (!m_location.isValid() ||
+        (m_folderId.isValid() && Library::folderId(QFileInfo(m_location.file).absolutePath()) == m_folderId))
+        return true;
+    setProblem(tr("The folder for %1 no longer holds the open board.").arg(m_location.name));
     return false;
 }
 
 void Backend::moveTo(const Library::Location &location) {
-    // The view it was left at goes with it.
-    if (m_views.contains(viewKey()))
-        m_views.insert(location.file, m_views.take(viewKey()));
+    // The view goes with the board. If its old name is already taken,
+    // any view saved there may belong to the new board.
+    loadState();
+    const QString old = viewKey();
+    const QVariantMap view = QFile::exists(old) ? m_pendingViews.value(old) : rememberedView();
+    m_pendingViews.remove(old);
+    if (!view.isEmpty())
+        m_pendingViews.insert(location.file, view);
     m_location = location;
     if (m_library->exists(location.name) && m_library->boardFile(location.name) == location.file)
-        m_lastBoard = location.name;
+        m_pendingLastBoard = location.name;
     watch();
     // What is said of a board that could not be read names it, and its file:
     // read again where it is now, it is said anew.
@@ -350,14 +374,15 @@ bool Backend::openBoard(const QString &name) {
 }
 
 bool Backend::newBoard(const QString &name) {
+    if (m_location.isValid() && !flush())
+        return false;
     const QString free = m_library->freeName(name);
     const QString problem = m_library->create(free);
     if (!problem.isEmpty()) {
         setProblem(problem);
         return false;
     }
-    if (!openBoard(free))
-        return false;
+    loadBoard({free, m_library->boardFile(free), m_library->assetsFolder(free)});
     // Numbered for something that is not a board, which no list of the
     // boards shows: the board is not called what was asked for, and why is
     // said once it is open (opening it put away what was said before).
@@ -369,6 +394,8 @@ bool Backend::newBoard(const QString &name) {
 }
 
 bool Backend::renameBoard(const QString &name) {
+    if (!verifyOpenFolder())
+        return false;
     const QString tidy = Library::slug(name);
     if (tidy.isEmpty() || tidy == m_location.name)
         return tidy == m_location.name;
@@ -378,7 +405,7 @@ bool Backend::renameBoard(const QString &name) {
     }
     if (!flush())
         return false;
-    const QString problem = m_library->rename(m_location.name, tidy);
+    const QString problem = m_library->rename(m_location.name, tidy, m_folderId);
     if (!problem.isEmpty()) {
         setProblem(problem);
         return false;
@@ -388,6 +415,8 @@ bool Backend::renameBoard(const QString &name) {
 }
 
 bool Backend::deleteBoard() {
+    if (!verifyOpenFolder())
+        return false;
     if (!m_library->exists(m_location.name) || m_library->boardFile(m_location.name) != m_location.file) {
         setProblem(tr("Only boards in the library can be deleted here."));
         return false;
@@ -397,12 +426,12 @@ bool Backend::deleteBoard() {
     if (!flush())
         return false;
     const QString gone = m_location.name;
-    const QString problem = m_library->remove(gone);
+    const QString problem = m_library->remove(gone, m_folderId);
     if (!problem.isEmpty()) {
         setProblem(problem);
         return false;
     }
-    m_views.remove(viewKey());
+    m_pendingViews.insert(viewKey(), {});
     // Nothing to flush: the board that was open is in the trash.
     m_location = {};
     m_savedRevision = m_board.revision();
@@ -515,34 +544,67 @@ void Backend::save() {
     written.items = m_board.itemsToWrite();
     written.lastId = m_board.lastId();
     written.revision = m_board.revision();
-    // A board whose folder has gone was renamed or moved elsewhere, and is
-    // followed there; or it was taken away, and is made again, folder and
-    // all, so that nothing done here is lost. Never is the folder it had
-    // made again when it went somewhere else: what is done here would go
-    // to a board of the old name, and not to the one that is open.
-    followMove();
+    if (!prepareSave(written)) {
+        saved(written);
+        return;
+    }
     const QString file = m_location.file;
     const QByteArray base = m_baseFingerprint;
-    QString folder = boardFolder();
-    if (!QFileInfo::exists(folder))
-        folder.clear();
     // `this` outlives the write: the pool is a member, and both flush() and
     // its destructor wait for it.
-    m_pool.start([this, written, file, base, folder]() mutable {
-        // Gone since it was looked for: where to is looked for again first.
-        if (!folder.isEmpty() && !QFileInfo::exists(folder)) {
-            written.moved = true;
-            QMetaObject::invokeMethod(this, [this, written] { saved(written); }, Qt::QueuedConnection);
-            return;
-        }
+    m_pool.start([this, written, file, base]() mutable {
         // Under the lock every writer takes, so no command comes in between.
         // What is to be written is made beforehand, so the lock is held no
         // longer than it must be.
         const QByteArray contents = Library::contentsOf(Board::toJson(written.items, written.lastId));
-        if (const auto lock = Library::lock(file, &written.error))
-            writeOver(file, contents, base, written);
+        written.moved = !inSaveFolder(written);
+        if (!written.moved) {
+            const auto lock = Library::lock(file, &written.error);
+            written.moved = !inSaveFolder(written) ||
+                            (lock && !written.folder.isEmpty() && lock->folderId() != written.folderId);
+            if (lock && !written.moved)
+                writeOver(file, contents, base, written);
+        }
         QMetaObject::invokeMethod(this, [this, written] { saved(written); }, Qt::QueuedConnection);
     });
+}
+
+bool Backend::prepareSave(Written &written) {
+    followMove();
+    written.folder = boardFolder();
+    if (written.folder.isEmpty()) {
+        const QString parent = QFileInfo(m_location.file).absolutePath();
+        if (QFileInfo(parent).isDir())
+            return true;
+        if (QDir().mkpath(parent)) {
+            m_folderId = Library::folderId(parent);
+            return true;
+        }
+        written.error = tr("Could not make the folder for %1.").arg(m_location.file);
+        return false;
+    }
+    Library::FileId found = Library::folderId(written.folder);
+    if (found.isValid() && m_folderId.isValid() && found != m_folderId) {
+        written.error = tr("The folder for %1 now holds another board.").arg(m_location.name);
+        return false;
+    }
+    if (!found.isValid()) {
+        // Taken away for good, the board is made again. Make the folder
+        // itself here, so a folder made by someone else cannot be taken for it.
+        const QFileInfo folder(written.folder);
+        if (!QDir().mkpath(folder.absolutePath()) || !folder.dir().mkdir(folder.fileName())) {
+            written.error = tr("Could not make the folder for %1.").arg(m_location.file);
+            return false;
+        }
+        found = Library::folderId(written.folder);
+    }
+    m_folderId = written.folderId = found;
+    return true;
+}
+
+bool Backend::inSaveFolder(const Written &written) {
+    return written.folder.isEmpty() ||
+           (written.folderId.isValid() && Library::folderId(written.folder) == written.folderId);
 }
 
 // Writes over the file only while it is as this app last read or wrote it,
@@ -553,9 +615,13 @@ void Backend::save() {
 // written (by an agent, which takes no lock) is replaced unseen.
 void Backend::writeOver(const QString &file, const QByteArray &contents, const QByteArray &base, Written &written) {
     written.changed = false;
+    written.moved = !inSaveFolder(written);
+    if (written.moved)
+        return;
     written.error = Library::write(file, contents, &written.fingerprint, [&] {
         written.changed = QFileInfo::exists(file) && Library::fingerprint(file) != base;
-        return !written.changed;
+        written.moved = !inSaveFolder(written);
+        return !written.changed && !written.moved;
     });
 }
 
@@ -603,6 +669,11 @@ void Backend::saved(const Written &written) {
 }
 
 bool Backend::flush() {
+    // What was picked for this board goes on it before saving and leaving.
+    while (m_readingPicture) {
+        m_importPool.waitForDone();
+        QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+    }
     m_saveTimer.stop();
     m_saveDeadline.stop();
     // Let a save that is under way finish and report.
@@ -621,31 +692,42 @@ bool Backend::flush() {
     // What it is a write of, which saved() is told even when the lock cannot
     // be had: one of ids alone that fails is nothing to say.
     written.revision = m_board.revision();
-    // Moved elsewhere, it is written where it is now (see save()).
-    followMove();
-    if (const auto lock = Library::lock(m_location.file, &written.error)) {
-        for (int tries = 0; tries < flushTries; ++tries) {
-            QJsonObject root;
-            QByteArray fingerprint;
-            const QString problem = Library::read(m_location.file, root, &fingerprint);
-            if (!QFileInfo::exists(m_location.file)) {
-                resume();
-            } else if (fingerprint != m_baseFingerprint && !takeIn(problem, root, fingerprint)) {
-                // Asked to write it now, it says why it cannot. Ids alone
-                // are no loss: only what was done here is.
-                sayWhy();
-                return m_board.revision() == m_savedRevision;
-            }
-            if (m_board.revision() == m_savedRevision && !m_idsToWrite)
-                return true;
-            written.items = m_board.itemsToWrite();
-            written.lastId = m_board.lastId();
-            written.revision = m_board.revision();
-            writeOver(m_location.file, Library::contentsOf(Board::toJson(written.items, written.lastId)),
-                      m_baseFingerprint, written);
-            if (!written.changed)
-                break;
+    for (int tries = 0; tries < flushTries; ++tries) {
+        written.changed = written.moved = false;
+        written.error.clear();
+        if (!prepareSave(written))
+            break;
+        const QString file = m_location.file;
+        const auto lock = Library::lock(file, &written.error);
+        if (!inSaveFolder(written) || (lock && !written.folder.isEmpty() && lock->folderId() != written.folderId)) {
+            written.moved = true;
+            continue;
         }
+        if (!lock)
+            break;
+        QJsonObject root;
+        QByteArray fingerprint;
+        const QString problem = Library::read(file, root, &fingerprint);
+        if (!inSaveFolder(written)) {
+            written.moved = true;
+            continue;
+        }
+        if (!QFileInfo::exists(file)) {
+            resume();
+        } else if (fingerprint != m_baseFingerprint && !takeIn(problem, root, fingerprint)) {
+            // Asked to write it now, it says why it cannot. Ids alone
+            // are no loss: only what was done here is.
+            sayWhy();
+            return m_board.revision() == m_savedRevision;
+        }
+        if (m_board.revision() == m_savedRevision && !m_idsToWrite)
+            return true;
+        written.items = m_board.itemsToWrite();
+        written.lastId = m_board.lastId();
+        written.revision = m_board.revision();
+        writeOver(file, Library::contentsOf(Board::toJson(written.items, written.lastId)), m_baseFingerprint, written);
+        if (!written.changed && !written.moved)
+            break;
     }
     m_saving = true;
     saved(written);
@@ -679,14 +761,14 @@ void Backend::fileChanged() {
     // looks again.
     if (m_saving)
         return;
+    followMove();
+    const QString folder = boardFolder();
+    const Library::FileId found = Library::folderId(folder);
+    if (found.isValid() && m_folderId.isValid() && found != m_folderId)
+        return;
     // Gone, there is nothing to take in or to write over: whatever the board
-    // has that the file did is written anew. Gone with its folder, it may
-    // only have been renamed, and then it is looked at where it is now.
+    // has that the file did is written anew.
     if (!QFileInfo::exists(m_location.file)) {
-        if (followMove()) {
-            fileChanged();
-            return;
-        }
         resume();
         return;
     }
@@ -704,7 +786,8 @@ void Backend::fileChanged() {
     QJsonObject root;
     QByteArray fingerprint;
     const QString problem = Library::read(m_location.file, root, &fingerprint);
-    takeIn(problem, root, fingerprint);
+    if (folder.isEmpty() || Library::folderId(folder) == found)
+        takeIn(problem, root, fingerprint);
 }
 
 // Takes in the file as it is now: read with `problem`, as `root`, holding
@@ -837,31 +920,48 @@ void Backend::setNotice(const QString &notice) {
 
 QString Backend::viewKey() const { return m_location.file; }
 
-void Backend::readState() {
-    QFile file(m_library->stateFile());
-    if (!file.open(QIODevice::ReadOnly))
-        return;
-    const QJsonObject state = QJsonDocument::fromJson(file.readAll()).object();
-    m_lastBoard = state.value("last").toString();
-    const QJsonObject views = state.value("views").toObject();
-    for (auto it = views.constBegin(); it != views.constEnd(); ++it)
-        m_views.insert(it.key(), it.value().toObject().toVariantMap());
+void Backend::loadState() {
+    QJsonObject state;
+    if (readState(m_library->stateFile(), state))
+        m_state = state;
 }
 
 void Backend::writeState() {
     m_stateTimer.stop();
-    QJsonObject views;
-    for (auto it = m_views.constBegin(); it != m_views.constEnd(); ++it)
-        // Boards that are gone are forgotten.
-        if (QFile::exists(it.key()))
-            views.insert(it.key(), QJsonObject::fromVariantMap(it.value()));
-    const QString file = m_library->stateFile();
-    QDir().mkpath(QFileInfo(file).absolutePath());
-    QSaveFile output(file);
-    if (!output.open(QIODevice::WriteOnly))
+    if (m_pendingLastBoard.isEmpty() && m_pendingViews.isEmpty())
         return;
-    output.write(QJsonDocument(QJsonObject{{"last", m_lastBoard}, {"views", views}}).toJson());
-    output.commit();
+    const QString file = m_library->stateFile();
+    QLockFile lock(file + ".lock");
+    QJsonObject state;
+    if (!QDir().mkpath(QFileInfo(file).absolutePath()) || !lock.tryLock(0) || !readState(file, state)) {
+        m_stateTimer.start();
+        return;
+    }
+    // Another window may have left boards at views of its own. Read those
+    // under the lock and change only what this window has to write.
+    QJsonObject views = state.value("views").toObject();
+    for (auto it = m_pendingViews.cbegin(); it != m_pendingViews.cend(); ++it) {
+        if (it.value().isEmpty())
+            views.remove(it.key());
+        else
+            views.insert(it.key(), QJsonObject::fromVariantMap(it.value()));
+    }
+    for (auto it = views.begin(); it != views.end();) {
+        if (QFile::exists(it.key()))
+            ++it;
+        else
+            it = views.erase(it);
+    }
+    state.insert("views", views);
+    if (!m_pendingLastBoard.isEmpty())
+        state.insert("last", m_pendingLastBoard);
+    if (Library::write(file, state).isEmpty()) {
+        m_state = state;
+        m_pendingViews.clear();
+        m_pendingLastBoard.clear();
+    } else {
+        m_stateTimer.start();
+    }
 }
 
 void Backend::rememberView(QPointF origin, qreal zoom) {
@@ -869,13 +969,56 @@ void Backend::rememberView(QPointF origin, qreal zoom) {
     // be: the empty board shown in its place has nothing to go back to.
     if (!m_location.isValid() || m_readOnly)
         return;
-    m_views.insert(viewKey(), {{"x", origin.x()}, {"y", origin.y()}, {"zoom", zoom}});
+    m_pendingViews.insert(viewKey(), {{"x", origin.x()}, {"y", origin.y()}, {"zoom", zoom}});
     m_stateTimer.start();
 }
 
-QVariantMap Backend::rememberedView() const { return m_views.value(viewKey()); }
+QVariantMap Backend::rememberedView() const {
+    const auto pending = m_pendingViews.constFind(viewKey());
+    if (pending != m_pendingViews.constEnd())
+        return *pending;
+    return m_state.value("views").toObject().value(viewKey()).toObject().toVariantMap();
+}
 
 // --- Pictures and the clipboard --------------------------------------------------------
+
+void Backend::attachCanvas(CanvasView *canvas) {
+    if (canvas == m_canvas)
+        return;
+    if (m_canvas) {
+        m_canvas->disconnect(this);
+        disconnect(this, nullptr, m_canvas, nullptr);
+        m_canvas->setBackend(nullptr);
+    }
+    m_canvas = canvas;
+    if (canvas) {
+        canvas->setBackend(this);
+        connect(this, &Backend::imageAdded, canvas, &CanvasView::insertImage);
+        connect(canvas, &CanvasView::pressedChanged, this, &Backend::continueImport, Qt::QueuedConnection);
+    }
+}
+
+std::unique_ptr<Library::Lock> Backend::lockAssets() {
+    if (!m_location.isValid() || m_readOnly || !verifyOpenFolder())
+        return {};
+    const QString file = m_location.file;
+    const Library::FileId expected = m_folderId;
+    QString error;
+    auto lock = Library::lock(file, &error);
+    // It may have moved while waiting for the writer. The lock stayed
+    // with its folder, so we can still write there if we can follow it.
+    if (!verifyOpenFolder())
+        return {};
+    if (!lock) {
+        setProblem(error);
+        return {};
+    }
+    if (lock->folderId() != expected || Library::folderId(QFileInfo(m_location.file).absolutePath()) != expected) {
+        setProblem(tr("The folder for %1 no longer holds the open board.").arg(m_location.name));
+        return {};
+    }
+    return lock;
+}
 
 void Backend::pickImages() {
     if (m_picker)
@@ -885,32 +1028,56 @@ void Backend::pickImages() {
 void Backend::addFiles(const QList<QUrl> &urls) {
     if (!m_location.isValid() || m_readOnly)
         return;
-    int position = 0;
+    QStringList files;
     for (const QUrl &url : urls) {
         const QString path = url.toLocalFile();
-        if (path.isEmpty())
-            continue;
-        QImageReader reader(path);
-        reader.setAutoTransform(true);
-        // Only a file is looked into: a pipe or a device would never answer.
-        // A picture of no width or height, as an SVG can say it is, has
-        // nothing to show, and is refused before it is copied in.
-        QSize size = QFileInfo(path).isFile() ? reader.size() : QSize();
-        if (size.isEmpty() || !reader.canRead()) {
-            setProblem(tr("%1 is not a picture Sprawl can show.").arg(QFileInfo(path).fileName()));
-            continue;
-        }
-        // A photo taken on its side is as tall as it says it is wide.
-        if (reader.transformation() & QImageIOHandler::TransformationRotate90)
-            size.transpose();
-        QString problem;
-        const QString asset = Library::importFile(m_location.assets, path, &problem);
-        if (asset.isEmpty()) {
-            setProblem(problem);
-            continue;
-        }
-        emit imageAdded(asset, size, position++);
+        if (!path.isEmpty())
+            files.append(path);
     }
+    if (files.isEmpty())
+        return;
+    m_imports.enqueue({std::move(files), m_canvas ? m_canvas->insertPoint() : QPointF()});
+    continueImport();
+}
+
+void Backend::continueImport() {
+    if (m_imports.isEmpty() || m_readingPicture || (m_canvas && m_canvas->pressed()))
+        return;
+    if (m_readyPicture) {
+        PreparedPicture ready = std::move(*m_readyPicture);
+        m_readyPicture.reset();
+        QString asset;
+        if (ready.error.isEmpty()) {
+            if (const auto lock = lockAssets())
+                asset = Library::savePicture(m_location.assets, ready.picture, &ready.error, lock.get());
+        }
+        ImportBatch &batch = m_imports.head();
+        const QPointF at = batch.at;
+        const int position = batch.position;
+        if (!asset.isEmpty())
+            ++batch.position;
+        if (batch.files.isEmpty())
+            m_imports.dequeue();
+        if (!ready.error.isEmpty())
+            setProblem(ready.error);
+        else if (!asset.isEmpty())
+            emit imageAdded(asset, ready.picture.size, position, at);
+    }
+    if (m_imports.isEmpty() || m_readingPicture)
+        return;
+    // Hold at most one checked file while it waits for the GUI. The
+    // originals are read and decoded off this thread and before locking.
+    const QString path = m_imports.head().files.takeFirst();
+    m_readingPicture = true;
+    m_importPool.start([this, path] {
+        PreparedPicture ready;
+        ready.picture = Library::preparePicture(path, &ready.error);
+        QMetaObject::invokeMethod(this, [this, ready = std::move(ready)]() mutable {
+            m_readingPicture = false;
+            m_readyPicture = std::move(ready);
+            continueImport();
+        }, Qt::QueuedConnection);
+    });
 }
 
 bool Backend::pasteClipboard() {
@@ -920,12 +1087,15 @@ bool Backend::pasteClipboard() {
     if (data->hasImage()) {
         const QImage image = qvariant_cast<QImage>(data->imageData());
         QString problem;
-        const QString asset = Library::importImage(m_location.assets, image, &problem);
+        QString asset;
+        if (const auto lock = lockAssets())
+            asset = Library::importImage(m_location.assets, image, &problem, lock.get());
         if (asset.isEmpty()) {
-            setProblem(problem);
+            if (!problem.isEmpty())
+                setProblem(problem);
             return true;
         }
-        emit imageAdded(asset, image.size(), 0);
+        emit imageAdded(asset, image.size(), 0, m_canvas ? m_canvas->insertPoint() : QPointF());
         return true;
     }
     if (data->hasUrls()) {

@@ -4,6 +4,7 @@
 #include <QImage>
 #include <QJsonObject>
 #include <QLockFile>
+#include <QSize>
 #include <QString>
 #include <QVector>
 #include <functional>
@@ -43,11 +44,23 @@ public:
     // `base` as nameFor() names it, or, when that is taken, base-2, base-3...
     QString freeName(const QString &base) const;
 
-    // These return what went wrong, or nothing when it worked.
+    struct FileId {
+        quint64 device = 0, inode = 0;
+        bool isValid() const { return inode != 0; }
+        bool operator==(const FileId &other) const = default;
+    };
+    // The identity of a file or folder, through any link to it.
+    static FileId identity(const QString &path);
+    static FileId folderId(const QString &folder);
+
+    // These return what went wrong, or nothing when it worked. When the
+    // window knows the folder, only that folder may be moved.
     QString create(const QString &name);
-    QString rename(const QString &from, const QString &to);
+    QString rename(const QString &from, const QString &to, FileId expected);
+    QString rename(const QString &from, const QString &to) { return rename(from, to, {}); }
     // To the trash, so a board deleted by mistake can be had back.
-    QString remove(const QString &name);
+    QString remove(const QString &name, FileId expected);
+    QString remove(const QString &name) { return remove(name, {}); }
 
     // `fingerprint`, when asked for, is that of what was read (see
     // fingerprint()), whether or not it turned out to be a board.
@@ -67,29 +80,50 @@ public:
     // What a file holds, in short: the same for the same bytes, and nothing
     // when there is no file it can be read from.
     static QByteArray fingerprint(const QString &file);
-    // Whoever changes a board's file, the window as it saves and every
-    // command, holds this from reading the file to writing it back, so that
-    // none of them writes over a change it never read. Waits while someone
-    // else holds it, and takes over one left by a writer that is gone. Null,
-    // with `error` saying why, when it cannot be had.
-    static std::unique_ptr<QLockFile> lock(const QString &file, QString *error = nullptr);
+    class Lock {
+    public:
+        ~Lock();
+        FileId folderId() const { return m_folderId; }
+
+    private:
+        friend class Library;
+        Lock(int directory, FileId folderId, const QString &name);
+        int m_directory;
+        FileId m_folderId;
+        QString m_folder;
+        QLockFile m_lock;
+    };
+    // Saves, commands and moves all take the lock in the existing folder.
+    // It follows that folder if it moves, so releasing it frees that same
+    // lock. Null, with `error` saying why, when it cannot be had.
+    static std::unique_ptr<Lock> lock(const QString &file, QString *error = nullptr);
 
     // How well a board's name answers what was typed in the switcher: the
     // letters in order, better when together and at the start of words.
     // Negative when it does not.
     static int score(const QString &name, const QString &query);
 
-    // Copies a picture into a board's assets, named for its contents so the
-    // same picture is only kept once. Returns the name it has there, or
-    // nothing, with `error` saying why, for what is not a picture.
+    // The bytes of a picture, checked and named for what they hold. The
+    // size is before scaling, with a photo's rotation applied.
+    struct Picture {
+        QString name;
+        QByteArray bytes;
+        QSize size;
+    };
+    static Picture preparePicture(const QString &source, QString *error = nullptr);
+    // Saves the checked bytes and returns the name, or nothing on failure.
+    // With a board lock, uses the assets in that very folder.
+    static QString savePicture(const QString &assetsFolder, const Picture &picture, QString *error = nullptr,
+                               const Lock *held = nullptr);
     static QString importFile(const QString &assetsFolder, const QString &source, QString *error = nullptr);
-    static QString importImage(const QString &assetsFolder, const QImage &image, QString *error = nullptr);
+    static QString importImage(const QString &assetsFolder, const QImage &image, QString *error = nullptr,
+                               const Lock *held = nullptr);
     // The same of `asset`, a picture of another board, in its assets folder
     // `fromFolder`: only a file right in it is taken (see
     // ImageStore::openAsset()), and it is named here for what it holds,
     // whatever it is called there.
     static QString importAsset(const QString &assetsFolder, const QString &fromFolder, const QString &asset,
-                               QString *error = nullptr);
+                               QString *error = nullptr, const Lock *held = nullptr);
 
     // A board named on the command line: one in the library, a folder, or a
     // .json file. Where its file and its pictures are. A board's name means
@@ -105,6 +139,7 @@ private:
     // Why no board can be given `name`, a name one can have: a board has it,
     // or something that is not a board does. Nothing when it is free.
     QString taken(const QString &name) const;
+    std::unique_ptr<Lock> lockBoardToMove(const QString &name, FileId expected, QString &error) const;
 
     QString m_root;
     // In the desktop's own data folder, not one that was asked for.

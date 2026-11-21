@@ -101,24 +101,17 @@ QByteArray svgSource(QIODevice *device) {
     return !source.isEmpty() && selfContained(source) ? source : QByteArray();
 }
 
-QImage readWith(QImageReader &reader) {
-    // Photos carry their rotation beside the pixels.
-    reader.setAutoTransform(true);
-    const QSize size = reader.size();
+void scaleReader(QImageReader &reader, const QSize &size, int longestSide) {
     // Brought down to the longest side kept, a picture far longer than it is
     // wide is still a pixel across: at none, it would not be read at all.
-    if (size.isValid() && qMax(size.width(), size.height()) > ImageStore::longestSide)
-        reader.setScaledSize(size.scaled(ImageStore::longestSide, ImageStore::longestSide, Qt::KeepAspectRatio)
-                                 .expandedTo(QSize(1, 1)));
-    const QImage image = reader.read();
-    // The format the GPU takes as it is.
-    return image.isNull() ? image : image.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+    if (size.isValid() && qMax(size.width(), size.height()) > longestSide)
+        reader.setScaledSize(size.scaled(longestSide, longestSide, Qt::KeepAspectRatio).expandedTo(QSize(1, 1)));
 }
 
-// Reads the picture `device` holds, `hint` being what its name says it is.
-// What it holds is read only by the reader of the format it was found to be
-// in, so an SVG is always looked through first, whatever it is called.
-QImage decode(QIODevice *device, const QByteArray &hint) {
+// Reads or measures the picture only after an SVG has been looked through,
+// whatever the file is called.
+template <typename Read>
+auto withReader(QIODevice *device, const QByteArray &hint, Read read) -> decltype(read(std::declval<QImageReader &>())) {
     const QByteArray format = formatOf(device, hint);
     if (format.isEmpty())
         return {};
@@ -129,10 +122,21 @@ QImage decode(QIODevice *device, const QByteArray &hint) {
         QBuffer buffer(&source);
         buffer.open(QIODevice::ReadOnly);
         QImageReader reader(&buffer, "svg");
-        return readWith(reader);
+        reader.setAutoTransform(true);
+        return read(reader);
     }
     QImageReader reader(device, format);
-    return readWith(reader);
+    reader.setAutoTransform(true);
+    return read(reader);
+}
+
+QImage decode(QIODevice *device, const QByteArray &hint) {
+    return withReader(device, hint, [](QImageReader &reader) {
+        scaleReader(reader, reader.size(), ImageStore::longestSide);
+        const QImage image = reader.read();
+        // The format the GPU takes as it is.
+        return image.isNull() ? image : image.convertToFormat(QImage::Format_RGBA8888_Premultiplied);
+    });
 }
 
 QByteArray suffixOf(const QString &name) { return QFileInfo(name).suffix().toLower().toLatin1(); }
@@ -187,27 +191,22 @@ QImage ImageStore::read(const QString &path) {
 }
 
 bool ImageStore::canShow(QIODevice *device, const QByteArray &hint) {
-    const QByteArray format = formatOf(device, hint);
-    if (format.isEmpty())
-        return false;
-    if (isSvg(format)) {
-        QByteArray source = svgSource(device);
-        if (source.isEmpty())
-            return false;
-        QBuffer buffer(&source);
-        buffer.open(QIODevice::ReadOnly);
-        return QImageReader(&buffer, "svg").canRead();
-    }
-    const bool can = QImageReader(device, format).canRead();
-    device->seek(0);
-    return can;
+    return !validatedSize(device, hint).isEmpty();
 }
 
-bool ImageStore::canShow(const QString &path) {
-    QFile file(path);
-    if (!QFileInfo(path).isFile() || !file.open(QIODevice::ReadOnly))
-        return false;
-    return canShow(&file, suffixOf(path));
+QSize ImageStore::validatedSize(QIODevice *device, const QByteArray &hint) {
+    const QSize size = withReader(device, hint, [](QImageReader &reader) -> QSize {
+        const QSize natural = reader.size();
+        if (natural.isEmpty())
+            return {};
+        // The decoded pixels are only used to tell whether the picture
+        // can be read. Keep a thumbnail and skip conversion for the GPU.
+        scaleReader(reader, natural, 128);
+        const bool rotated = reader.transformation() & QImageIOHandler::TransformationRotate90;
+        return reader.read().isNull() ? QSize() : rotated ? natural.transposed() : natural;
+    });
+    device->seek(0);
+    return size;
 }
 
 bool ImageStore::loading() const {

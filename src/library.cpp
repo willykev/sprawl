@@ -12,7 +12,11 @@
 #include <QStandardPaths>
 #include <QThread>
 #include <algorithm>
+#include <cerrno>
 #include <climits>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "board.h"
@@ -26,6 +30,31 @@ const int lockWait = 20000;
 
 QByteArray fingerprintOf(const QByteArray &contents) {
     return QCryptographicHash::hash(contents, QCryptographicHash::Sha1);
+}
+
+Library::FileId idOf(const struct stat &status) {
+    return {quint64(status.st_dev), quint64(status.st_ino)};
+}
+
+Library::Picture pictureFrom(QFile &input, const QString &name, QString *error) {
+    QByteArray bytes = input.readAll();
+    if (input.error() != QFileDevice::NoError) {
+        if (error)
+            *error = QString("Could not read %1: %2.").arg(name, input.errorString());
+        return {};
+    }
+    QBuffer buffer(&bytes);
+    buffer.open(QIODevice::ReadOnly);
+    const QString suffix = QFileInfo(name).suffix().toLower();
+    const QSize size = ImageStore::validatedSize(&buffer, suffix.toLatin1());
+    if (size.isEmpty()) {
+        if (error)
+            *error = QString("%1 is not a picture Sprawl can show.").arg(name);
+        return {};
+    }
+    const QString asset = QString::fromLatin1(fingerprintOf(bytes).toHex().left(16)) +
+                          (suffix.isEmpty() ? "" : "." + suffix);
+    return {asset, std::move(bytes), size};
 }
 
 } // namespace
@@ -74,13 +103,17 @@ QString Library::slug(const QString &text) {
     // dashes: a name that is easy to type, safe as a folder, and never
     // taken for an option or a path on a command line.
     QString name;
-    for (const QChar c : text.trimmed().toLower()) {
-        if (c.isLetterOrNumber() || c == '_')
-            name += c;
+    for (const char32_t c : text.trimmed().toLower().toUcs4()) {
+        if (QChar::isLetterOrNumber(c) || c == '_')
+            name += QString::fromUcs4(&c, 1);
         else if (!name.isEmpty() && !name.endsWith('-'))
             name += '-';
+        if (name.size() >= 64)
+            break;
     }
     name.truncate(64);
+    if (!name.isEmpty() && name.back().isHighSurrogate())
+        name.chop(1);
     while (name.endsWith('-'))
         name.chop(1);
     return name;
@@ -118,16 +151,58 @@ QString Library::create(const QString &name) {
     const QString why = taken(name);
     if (!why.isEmpty())
         return why;
-    if (!QDir().mkpath(boardFolder(name)))
+    const QDir boards(boardsFolder());
+    if (!QDir().mkpath(boards.path()))
         return QString("Could not make the folder %1.").arg(boardFolder(name));
-    return write(boardFile(name), QJsonObject{{"sprawl", Board::formatVersion}, {"items", QJsonArray()}});
+    if (!boards.mkdir(name)) {
+        const QString why = taken(name);
+        return why.isEmpty() ? QString("Could not make the folder %1.").arg(boardFolder(name)) : why;
+    }
+    const QString problem = write(boardFile(name), QJsonObject{{"sprawl", Board::formatVersion}, {"items", QJsonArray()}});
+    if (!problem.isEmpty())
+        boards.rmdir(name);
+    return problem;
 }
 
-QString Library::rename(const QString &from, const QString &to) {
+Library::FileId Library::identity(const QString &path) {
+    struct stat status;
+    return ::stat(QFile::encodeName(path).constData(), &status) == 0 ? idOf(status) : FileId{};
+}
+
+Library::FileId Library::folderId(const QString &folder) {
+    struct stat status;
+    return ::stat(QFile::encodeName(folder).constData(), &status) == 0 && S_ISDIR(status.st_mode)
+               ? idOf(status) : FileId{};
+}
+
+std::unique_ptr<Library::Lock> Library::lockBoardToMove(const QString &name, FileId expected, QString &error) const {
+    if (!exists(name)) {
+        error = QString("There is no board called %1.").arg(name);
+        return {};
+    }
+    const QString folder = boardFolder(name);
+    if (!expected.isValid())
+        expected = folderId(folder);
+    const auto stillThere = [&] { return expected.isValid() && folderId(folder) == expected; };
+    auto held = stillThere() ? lock(boardFile(name), &error) : nullptr;
+    if (!stillThere() || (held && held->folderId() != expected)) {
+        error = QString("The folder for %1 no longer holds the open board.").arg(name);
+        return {};
+    }
+    if (held && !exists(name)) {
+        error = QString("There is no board called %1.").arg(name);
+        return {};
+    }
+    return held;
+}
+
+QString Library::rename(const QString &from, const QString &to, FileId expected) {
     if (to.isEmpty() || to != slug(to))
         return QString("\"%1\" is not a name a board can have.").arg(to);
-    if (!exists(from))
-        return QString("There is no board called %1.").arg(from);
+    QString error;
+    const auto held = lockBoardToMove(from, expected, error);
+    if (!held)
+        return error;
     const QString why = taken(to);
     if (!why.isEmpty())
         return why;
@@ -136,9 +211,11 @@ QString Library::rename(const QString &from, const QString &to) {
     return {};
 }
 
-QString Library::remove(const QString &name) {
-    if (!exists(name))
-        return QString("There is no board called %1.").arg(name);
+QString Library::remove(const QString &name, FileId expected) {
+    QString error;
+    const auto held = lockBoardToMove(name, expected, error);
+    if (!held)
+        return error;
     if (!QFile::moveToTrash(boardFolder(name)))
         return QString("Could not move %1 to the trash.").arg(name);
     return {};
@@ -149,6 +226,8 @@ QString Library::read(const QString &file, QJsonObject &root, QByteArray *finger
     if (!input.open(QIODevice::ReadOnly))
         return QString("Could not read %1: %2.").arg(file, input.errorString());
     const QByteArray contents = input.readAll();
+    if (input.error() != QFileDevice::NoError)
+        return QString("Could not read %1: %2.").arg(file, input.errorString());
     if (fingerprint)
         *fingerprint = fingerprintOf(contents);
     QJsonParseError error;
@@ -200,28 +279,47 @@ QByteArray Library::fingerprint(const QString &file) {
     return input.open(QIODevice::ReadOnly) ? fingerprintOf(input.readAll()) : QByteArray();
 }
 
-std::unique_ptr<QLockFile> Library::lock(const QString &file, QString *error) {
+Library::Lock::Lock(int directory, FileId folderId, const QString &name)
+    : m_directory(directory), m_folderId(folderId),
+      m_folder(QString("/proc/self/fd/%1").arg(directory)), m_lock(m_folder + "/" + name + ".lock") {}
+
+Library::Lock::~Lock() {
+    m_lock.unlock();
+    ::close(m_directory);
+}
+
+std::unique_ptr<Library::Lock> Library::lock(const QString &file, QString *error) {
     auto fail = [error](const QString &message) {
         if (error)
             *error = message;
-        return std::unique_ptr<QLockFile>();
+        return std::unique_ptr<Lock>();
     };
-    if (!QDir().mkpath(QFileInfo(file).absolutePath()))
-        return fail(QString("Could not make the folder for %1.").arg(file));
-    auto lock = std::make_unique<QLockFile>(file + ".lock");
+    const QFileInfo info(file);
+    // Keep the directory open so a rename cannot strand the lock in it
+    // or release a different lock at the old name.
+    const int directory = ::open(QFile::encodeName(info.absolutePath()).constData(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+    if (directory < 0)
+        return fail(QString("Could not open the folder for %1.").arg(file));
+    struct stat status;
+    if (::fstat(directory, &status) != 0) {
+        ::close(directory);
+        return fail(QString("Could not open the folder for %1.").arg(file));
+    }
+    auto held = std::unique_ptr<Lock>(new Lock(directory, idOf(status), info.fileName()));
+    QLockFile &lock = held->m_lock;
     // Tried often, so that a queue of writers (an agent's commands, run side
     // by side) is soon through.
     const QDeadlineTimer deadline(lockWait);
-    while (!lock->tryLock(0)) {
-        if (lock->error() == QLockFile::PermissionError)
+    while (!lock.tryLock(0)) {
+        if (lock.error() == QLockFile::PermissionError)
             return fail(QString("Could not write %1: its folder cannot be written to.").arg(file));
-        if (lock->error() != QLockFile::LockFailedError)
-            return fail(QString("Could not write %1: %2 could not be made.").arg(file, lock->fileName()));
+        if (lock.error() != QLockFile::LockFailedError)
+            return fail(QString("Could not write %1: %1.lock could not be made.").arg(file));
         if (deadline.hasExpired())
             return fail(QString("Could not write %1: something else has been writing it for too long.").arg(file));
         QThread::msleep(10);
     }
-    return lock;
+    return held;
 }
 
 int Library::score(const QString &name, const QString &query) {
@@ -270,101 +368,82 @@ int Library::score(const QString &name, const QString &query) {
     return qMax(1, total - n / 4);
 }
 
-QString Library::importFile(const QString &assetsFolder, const QString &source, QString *error) {
+Library::Picture Library::preparePicture(const QString &source, QString *error) {
     auto fail = [error](const QString &message) {
         if (error)
             *error = message;
-        return QString();
+        return Picture{};
     };
-    // Only ever a picture, wherever the asking came from: a folder, a pipe
-    // or a device is not opened, and a file that is something else is not
-    // copied.
     const QFileInfo info(source);
     if (info.exists() && !info.isFile())
         return fail(QString("%1 is not a file.").arg(source));
-    QFile input(source);
-    if (!input.open(QIODevice::ReadOnly))
+    // Only read a regular file. Open without waiting in case a pipe takes
+    // its place, and use this one handle for the bytes to be kept.
+    const int handle = ::open(QFile::encodeName(source).constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (handle < 0)
+        return fail(QString("Could not read %1: %2.").arg(source, QString::fromLocal8Bit(std::strerror(errno))));
+    struct stat status;
+    QFile input;
+    if (::fstat(handle, &status) != 0 || !S_ISREG(status.st_mode)) {
+        ::close(handle);
+        return fail(QString("%1 is not a file.").arg(source));
+    }
+    if (!input.open(handle, QIODevice::ReadOnly, QFileDevice::AutoCloseHandle)) {
+        ::close(handle);
         return fail(QString("Could not read %1: %2.").arg(source, input.errorString()));
-    if (!ImageStore::canShow(source))
-        return fail(QString("%1 is not a picture Sprawl can show.").arg(source));
-    QCryptographicHash hash(QCryptographicHash::Sha1);
-    if (!hash.addData(&input))
-        return fail(QString("Could not read %1.").arg(source));
-    const QString suffix = QFileInfo(source).suffix().toLower();
-    const QString name = QString::fromLatin1(hash.result().toHex().left(16)) + (suffix.isEmpty() ? "" : "." + suffix);
-    const QString target = assetsFolder + "/" + name;
+    }
+    return pictureFrom(input, source, error);
+}
+
+QString Library::savePicture(const QString &assetsFolder, const Picture &picture, QString *error,
+                             const Lock *held) {
+    auto fail = [error](const QString &message) {
+        if (error)
+            *error = message;
+        return QString();
+    };
+    if (picture.name.isEmpty())
+        return {};
+    // One with this name already is the same picture, whatever it was
+    // called where it came from.
+    const QString folder = held ? held->m_folder + "/assets" : assetsFolder;
+    const QString target = folder + "/" + picture.name;
     if (QFile::exists(target))
-        return name;
-    if (!QDir().mkpath(assetsFolder))
+        return picture.name;
+    if (!QDir().mkpath(folder))
         return fail(QString("Could not make the folder %1.").arg(assetsFolder));
-    // The original is only ever read; the board keeps a copy of its own.
-    // One put there meanwhile, whole, by whatever else was adding the same
-    // picture (the window, a command beside it) is that same picture.
-    input.close();
-    if (!QFile::copy(source, target) && !QFile::exists(target))
-        return fail(QString("Could not copy %1 into the board.").arg(source));
-    return name;
+    QSaveFile output(target);
+    if (!output.open(QIODevice::WriteOnly) || output.write(picture.bytes) != picture.bytes.size() || !output.commit())
+        return fail(QString("Could not write %1/%2.").arg(assetsFolder, picture.name));
+    return picture.name;
+}
+
+QString Library::importFile(const QString &assetsFolder, const QString &source, QString *error) {
+    return savePicture(assetsFolder, preparePicture(source, error), error);
 }
 
 QString Library::importAsset(const QString &assetsFolder, const QString &fromFolder, const QString &asset,
-                             QString *error) {
-    auto fail = [error](const QString &message) {
-        if (error)
-            *error = message;
-        return QString();
-    };
-    // Only what is in that folder, as a board's own pictures are read.
+                             QString *error, const Lock *held) {
     QFile input;
-    if (!ImageStore::openAsset(fromFolder, asset, input))
-        return fail(QString("Could not read the picture %1 in %2.").arg(asset, fromFolder));
-    const QByteArray bytes = input.readAll();
-    if (input.error() != QFileDevice::NoError)
-        return fail(QString("Could not read the picture %1 in %2.").arg(asset, fromFolder));
-    QBuffer buffer;
-    buffer.setData(bytes);
-    buffer.open(QIODevice::ReadOnly);
-    const QString suffix = QFileInfo(asset).suffix().toLower();
-    if (!ImageStore::canShow(&buffer, suffix.toLatin1()))
-        return fail(QString("%1 is not a picture Sprawl can show.").arg(asset));
-    // Named for what it holds, as every picture taken in is: one of the same
-    // name here is the same picture, and one called the same where it came
-    // from but different is not taken for it.
-    const QString name =
-        QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha1).toHex().left(16)) +
-        (suffix.isEmpty() ? "" : "." + suffix);
-    const QString target = assetsFolder + "/" + name;
-    if (QFile::exists(target))
-        return name;
-    if (!QDir().mkpath(assetsFolder))
-        return fail(QString("Could not make the folder %1.").arg(assetsFolder));
-    QSaveFile output(target);
-    if (!output.open(QIODevice::WriteOnly) || output.write(bytes) != bytes.size() || !output.commit())
-        return fail(QString("Could not write %1.").arg(target));
-    return name;
+    if (!ImageStore::openAsset(fromFolder, asset, input)) {
+        if (error)
+            *error = QString("Could not read the picture %1 in %2.").arg(asset, fromFolder);
+        return {};
+    }
+    return savePicture(assetsFolder, pictureFrom(input, asset, error), error, held);
 }
 
-QString Library::importImage(const QString &assetsFolder, const QImage &image, QString *error) {
-    auto fail = [error](const QString &message) {
-        if (error)
-            *error = message;
-        return QString();
-    };
+QString Library::importImage(const QString &assetsFolder, const QImage &image, QString *error, const Lock *held) {
     QByteArray bytes;
     QBuffer buffer(&bytes);
     buffer.open(QIODevice::WriteOnly);
-    if (image.isNull() || !image.save(&buffer, "PNG"))
-        return fail("Could not read the picture.");
-    const QString name =
-        QString::fromLatin1(QCryptographicHash::hash(bytes, QCryptographicHash::Sha1).toHex().left(16)) + ".png";
-    const QString target = assetsFolder + "/" + name;
-    if (QFile::exists(target))
-        return name;
-    if (!QDir().mkpath(assetsFolder))
-        return fail(QString("Could not make the folder %1.").arg(assetsFolder));
-    QSaveFile output(target);
-    if (!output.open(QIODevice::WriteOnly) || output.write(bytes) != bytes.size() || !output.commit())
-        return fail(QString("Could not write %1.").arg(target));
-    return name;
+    if (image.isNull() || !image.save(&buffer, "PNG")) {
+        if (error)
+            *error = "Could not read the picture.";
+        return {};
+    }
+    const QString name = QString::fromLatin1(fingerprintOf(bytes).toHex().left(16)) + ".png";
+    return savePicture(assetsFolder, {name, bytes, image.size()}, error, held);
 }
 
 Library::Location Library::locate(const QString &nameOrPath) const {

@@ -6,12 +6,12 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QImageReader>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
 #include <QSaveFile>
+#include <QScopeGuard>
 #include <QStandardPaths>
 #include <cmath>
 #include <cstdio>
@@ -49,6 +49,12 @@ QByteArray printableJson(const QByteArray &json) {
 namespace {
 
 void print(FILE *stream, const QString &text) { fprintf(stream, "%s\n", qPrintable(printableText(text))); }
+void printQtMessage(QtMsgType type, const QMessageLogContext &context, const QString &message) {
+    const QString line = qFormatLogMessage(type, context, message);
+    if (!line.isEmpty())
+        print(stderr, line);
+}
+
 void print(const QJsonObject &object) {
     fprintf(stdout, "%s", printableJson(QJsonDocument(object).toJson()).constData());
 }
@@ -90,28 +96,14 @@ const char *const boardArgument = "A board's name, or a path to a board's folder
 // is something writing it without end.
 const int writeTries = 5;
 
-// Reads the board named on the command line: one in the library, a board's
-// folder, or a .json file. Says what is wrong when it cannot. A command that
-// changes the board asks for `lock`, which it holds until it has written the
-// board back: nothing else (the window, a command run beside it) writes the
-// board in between, to be written over. Read again, it is read under the
-// lock it holds already. `fingerprint`, when asked for, is that of the file
-// as it was read.
-bool load(const Library &library, const QString &name, Library::Location &location, Board &board,
-          std::unique_ptr<QLockFile> *lock = nullptr, QByteArray *fingerprint = nullptr) {
-    location = library.locate(name);
-    if (!location.isValid()) {
+Library::Location findBoard(const Library &library, const QString &name) {
+    const Library::Location location = library.locate(name);
+    if (!location.isValid())
         print(stderr, QString("There is no board \"%1\". %2").arg(name, boardNames(library)));
-        return false;
-    }
-    if (lock && !*lock) {
-        QString error;
-        *lock = Library::lock(location.file, &error);
-        if (!*lock) {
-            print(stderr, error);
-            return false;
-        }
-    }
+    return location;
+}
+
+bool readBoard(const Library::Location &location, Board &board, QByteArray *fingerprint = nullptr) {
     QJsonObject root;
     const QString problem = Library::read(location.file, root, fingerprint);
     if (!problem.isEmpty()) {
@@ -129,40 +121,56 @@ bool load(const Library &library, const QString &name, Library::Location &locati
     return true;
 }
 
-// Writes the board back over its file, read as `fingerprint`, while the file
-// is still that one at the moment before it would be replaced (see
-// Library::write()). An agent, which takes no lock, may have renamed a whole
-// board over it meanwhile, or the board may have been renamed or deleted:
-// then nothing is written, and `changed` says so.
-QString writeBack(const QString &file, const Board &board, const QByteArray &fingerprint, bool &changed) {
-    // Gone, it is not made again: whatever took it away has it now.
-    changed = !QFileInfo::exists(file);
-    if (changed)
-        return {};
-    return Library::write(file, Library::contentsOf(board.toJson()), nullptr, [&] {
-        changed = Library::fingerprint(file) != fingerprint;
-        return !changed;
-    });
+bool load(const Library &library, const QString &name, Library::Location &location, Board &board) {
+    location = findBoard(library, name);
+    return location.isValid() && readBoard(location, board);
 }
 
-// Reads the board named on the command line, as load() does, has `change`
-// change it, and writes it back, under the board's lock all along. Written
-// over meanwhile, or taken away, the board is read and changed again, so
-// that what is done is done to the board as it is. `change` says what is
-// wrong when it cannot be done. False, said why, when nothing was written.
+// Only reread the board in the folder locked at the start. A whole file
+// written over it meanwhile is taken in, but a changed folder ends the edit.
 bool rewrite(const Library &library, const QString &name, Library::Location &location, Board &board,
-             const std::function<QString()> &change) {
-    std::unique_ptr<QLockFile> lock;
+             const std::function<QString(const Library::Lock &)> &change) {
+    location = findBoard(library, name);
+    if (!location.isValid())
+        return false;
+    const QString file = location.file;
+    const QString folder = QFileInfo(file).absolutePath();
+    const Library::FileId original = Library::folderId(folder);
+    QString error;
+    const auto lock = Library::lock(file, &error);
+    const auto stillThere = [&] { return original.isValid() && Library::folderId(folder) == original; };
+    const QString moved = QString("Could not write %1: the board's folder has moved or been replaced.").arg(file);
+    if (!stillThere() || (lock && lock->folderId() != original)) {
+        print(stderr, moved);
+        return false;
+    }
+    if (!lock) {
+        print(stderr, error);
+        return false;
+    }
     for (int tries = 1;; ++tries) {
-        QByteArray fingerprint;
-        if (!load(library, name, location, board, &lock, &fingerprint))
+        if (!stillThere()) {
+            print(stderr, moved);
             return false;
-        bool changed = false;
-        QString problem = change();
-        if (problem.isEmpty())
-            problem = writeBack(location.file, board, fingerprint, changed);
-        if (problem.isEmpty() && changed && tries == writeTries)
-            problem = QString("Could not write %1: something else keeps writing it.").arg(location.file);
+        }
+        QByteArray fingerprint;
+        if (!readBoard(location, board, &fingerprint))
+            return false;
+        if (!stillThere()) {
+            print(stderr, moved);
+            return false;
+        }
+        QString problem = change(*lock);
+        bool changed = !QFileInfo::exists(file);
+        if (problem.isEmpty() && !changed && stillThere())
+            problem = Library::write(file, Library::contentsOf(board.toJson()), nullptr, [&] {
+                changed = !stillThere() || Library::fingerprint(file) != fingerprint;
+                return !changed;
+            });
+        if (!stillThere())
+            problem = moved;
+        else if (problem.isEmpty() && changed && tries == writeTries)
+            problem = QString("Could not write %1: something else keeps writing it.").arg(file);
         if (!problem.isEmpty()) {
             print(stderr, problem);
             return false;
@@ -312,11 +320,22 @@ int check(const QStringList &arguments) {
             problems << problem;
         else
             problems = Board::parse(root, items);
-        // A picture the board shows has to be in its assets folder.
-        if (problems.isEmpty())
-            for (const Item &item : std::as_const(items))
-                if (item.kind == Item::Kind::Image && !QFile::exists(location.assets + "/" + item.asset))
+        // A picture has to be in its assets folder and readable as a picture.
+        if (problems.isEmpty()) {
+            QSet<QString> checked;
+            for (const Item &item : std::as_const(items)) {
+                if (item.kind != Item::Kind::Image || checked.contains(item.asset))
+                    continue;
+                checked.insert(item.asset);
+                QFile file;
+                if (!ImageStore::openAsset(location.assets, item.asset, file)) {
                     problems << QString("The picture %1 is missing from %2.").arg(item.asset, location.assets);
+                } else if (!ImageStore::canShow(&file, QFileInfo(item.asset).suffix().toLatin1())) {
+                    problems << QString("The picture %1 in %2 is not a picture Sprawl can show.")
+                                    .arg(item.asset, location.assets);
+                }
+            }
+        }
     }
     if (command.wantsJson()) {
         print(QJsonObject{{"ok", problems.isEmpty()},
@@ -363,6 +382,11 @@ int exportBoard(const QStringList &arguments) {
         return fail(QString("Sprawl exports %1, not %2.").arg(Exporter::formats().join(", "), options.format));
     if (output.isEmpty())
         output = location.name + "." + options.format;
+    const QString destination = QFileInfo(output).canonicalFilePath();
+    const Library::FileId destinationId = Library::identity(output);
+    if ((!destination.isEmpty() && destination == QFileInfo(location.file).canonicalFilePath()) ||
+        (destinationId.isValid() && destinationId == Library::identity(location.file)))
+        return fail(QString("Exporting to %1 would replace the board file. Choose another file.").arg(output));
     bool scaleOk = false, marginOk = false;
     options.scale = command.parser.value("scale").toDouble(&scaleOk);
     options.margin = command.parser.value("margin").toDouble(&marginOk);
@@ -448,25 +472,15 @@ int add(const QStringList &arguments) {
     for (const char *key : {"x", "y"})
         if (!parser.isSet(key))
             object.insert(key, 0);
+    Library::Picture picture;
     if (words[1] == "image") {
         if (!parser.isSet("file"))
             return fail("An image needs --file <picture>.");
-        // Only ever a picture: a folder, a pipe or a device is not opened even
-        // to be looked at (see Library::importFile()), and is refused before
-        // the board is read, so a pipe that never sends anything holds up
-        // nothing else that writes the board.
-        const QFileInfo info(parser.value("file"));
-        if (info.exists() && !info.isFile())
-            return fail(QString("%1 is not a file.").arg(parser.value("file")));
-        QImageReader reader(parser.value("file"));
-        reader.setAutoTransform(true);
-        QSize size = reader.size();
-        // A picture of no width or height, as an SVG can say it is, has
-        // nothing to show and no proportions to keep.
-        if (!reader.canRead() || size.isEmpty())
-            return fail(QString("%1 is not a picture Sprawl can show.").arg(parser.value("file")));
-        if (reader.transformation() & QImageIOHandler::TransformationRotate90)
-            size.transpose();
+        QString error;
+        picture = Library::preparePicture(parser.value("file"), &error);
+        if (picture.name.isEmpty())
+            return fail(error);
+        const QSize size = picture.size;
         // It starts at a size to arrange and to see: neither a screenful nor
         // a sliver. A width asked for takes the height along with it, in
         // proportion, and a unit at least.
@@ -508,12 +522,12 @@ int add(const QStringList &arguments) {
     TextMetrics::fit(item);
     // Only now is the board read, the command line and the picture checked
     // already: it is held from here until the item is written to it (see
-    // load()), and nothing else that writes it waits on more than that.
+    // rewrite()), and nothing else that writes it waits on more than that.
     const Library library;
     Library::Location location;
     Board board;
     quint32 id = 0;
-    const bool added = rewrite(library, words[0], location, board, [&] {
+    const bool added = rewrite(library, words[0], location, board, [&](const Library::Lock &held) {
         for (quint32 end : {item.from, item.to}) {
             const Item *attached = end ? board.item(end) : nullptr;
             if (end && (!attached || !Board::canAttach(*attached)))
@@ -538,7 +552,7 @@ int add(const QStringList &arguments) {
         }
         if (item.kind == Item::Kind::Image) {
             QString error;
-            item.asset = Library::importFile(location.assets, parser.value("file"), &error);
+            item.asset = Library::savePicture(location.assets, picture, &error, &held);
             if (item.asset.isEmpty())
                 return error;
         }
@@ -567,7 +581,7 @@ int removeItems(const QStringList &arguments) {
     Library::Location location;
     Board board;
     int before = 0;
-    const bool removed = rewrite(library, words[0], location, board, [&] {
+    const bool removed = rewrite(library, words[0], location, board, [&](const Library::Lock &) {
         QVector<quint32> ids;
         for (const QString &word : words.mid(1)) {
             bool ok = false;
@@ -737,6 +751,8 @@ bool isCliCommand(const QString &word) {
 }
 
 int runCli(const QStringList &arguments) {
+    const auto previousHandler = qInstallMessageHandler(printQtMessage);
+    const auto restoreHandler = qScopeGuard([previousHandler] { qInstallMessageHandler(previousHandler); });
     const QString command = arguments.value(1);
     if (command == "list")
         return list(arguments);

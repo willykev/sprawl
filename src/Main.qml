@@ -137,7 +137,10 @@ ApplicationWindow {
         }
     }
 
-    Component.onCompleted: restoreView()
+    Component.onCompleted: {
+        backend.attachCanvas(canvas)
+        restoreView()
+    }
 
     Connections {
         target: canvas
@@ -169,7 +172,6 @@ ApplicationWindow {
     Connections {
         target: backend
         function onBoardOpened() { win.restoreView() }
-        function onImageAdded(asset, size, position) { canvas.insertImage(asset, size, position) }
         function onTextPasted(text) { canvas.insertText(text) }
     }
 
@@ -422,7 +424,13 @@ ApplicationWindow {
                     if (length > canvas.longestText) {
                         const over = length - canvas.longestText
                         const end = Math.max(over, cursorPosition)
-                        remove(end - over, end)
+                        const start = end - over
+                        const splitsCharacter = (at) => {
+                            const before = text.charCodeAt(at - 1)
+                            const after = text.charCodeAt(at)
+                            return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff
+                        }
+                        remove(splitsCharacter(start) ? start - 1 : start, splitsCharacter(end) ? end + 1 : end)
                         canvas.textLeftOut()
                         return
                     }

@@ -56,12 +56,12 @@ public:
     // file is no pipe or device. A board from somewhere else shows only
     // what it brought along.
     static bool openAsset(const QString &folder, const QString &asset, QFile &file);
-    // Whether what `device` holds is a picture Sprawl shows. `hint` is what
-    // its name says it is (its suffix). An SVG that draws other files into
-    // itself is not: Qt would read them from wherever it says, and nothing
-    // else of a board reaches outside it.
+    // Whether what `device` holds decodes as a picture Sprawl shows (see
+    // read()). `hint` is what its name says it is (its suffix). The device
+    // is rewound for whatever reads it next.
     static bool canShow(QIODevice *device, const QByteArray &hint = {});
-    static bool canShow(const QString &path);
+    // The picture's natural size, after any rotation, if it decodes.
+    static QSize validatedSize(QIODevice *device, const QByteArray &hint);
     // A picture is never kept bigger than this on its long side: more than
     // any screen shows, and safely within what a GPU takes as one texture.
     static constexpr int longestSide = 4096;

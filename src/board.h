@@ -47,7 +47,7 @@ public:
     bool touches(const Item &item, const QRectF &area) const;
     QVector<quint32> connectorsOf(quint32 id) const { return m_links.values(id); }
     QVector<quint32> membersOf(quint32 group) const;
-    quint32 newGroup() { return ++m_lastGroup; }
+    quint32 newGroup();
     // The last id given to an item, here or by whatever wrote the file,
     // whether the board still has that item or not: one taken away is never
     // given to another, which would be taken for it (see toJson()).
@@ -206,9 +206,17 @@ private:
         Item before, after;
     };
     using Command = QVector<Edit>;
+    struct StackChange {
+        QSet<quint32> leaving;
+        QVector<QPair<int, quint32>> arriving;
+
+        void takeFrom(QVector<quint32> &order) const;
+        void putInto(QVector<quint32> &order) const;
+    };
 
     void touch(quint32 id);
     void rememberOrder();
+    QRectF indexedBounds(const Item &item);
     void place(const Item &item);
     void erase(quint32 id);
     void link(const Item &item);
@@ -216,22 +224,25 @@ private:
     void refreshConnector(quint32 id);
     void refreshConnectorsOf(quint32 id);
     Command close();
+    static StackChange stackChange(const Command &command, bool forward);
     void apply(const Command &command, bool forward);
+    void rebaseHistory(const QSet<quint32> &gone, const QVector<quint32> &mergedOrder);
     void revise();
     QHash<quint32, const Item *> writtenInstead() const;
     QSet<quint32> idsInUse() const;
-    // Whether any item here, in the step under way, or in the history is in
-    // the group.
-    bool groupInUse(quint32 group) const;
+    QSet<quint32> groupsInUse() const;
 
     QHash<quint32, Item> m_items;
     QVector<quint32> m_order;
     mutable QHash<quint32, int> m_depths;
     mutable bool m_depthsStale = true;
     SpatialGrid m_grid;
+    // The curves used for stroke bounds and marquee selection.
+    QHash<quint32, QVector<QPointF>> m_strokeCurves;
     // Item -> the connectors attached to it.
     QMultiHash<quint32, quint32> m_links;
     quint32 m_lastId = 0, m_lastGroup = 0;
+    quint32 m_wrappedGroup = 0;
     quint64 m_revision = 0, m_lastRevision = 0;
 
     bool m_open = false;
