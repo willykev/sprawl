@@ -4,6 +4,8 @@
 #include <QHash>
 #include <QObject>
 #include <QPointF>
+#include <QPointer>
+#include <QQueue>
 #include <QSize>
 #include <QThreadPool>
 #include <QTimer>
@@ -13,6 +15,7 @@
 #include <optional>
 
 #include "board.h"
+#include "canvasview.h"
 #include "library.h"
 
 class FilePicker;
@@ -81,6 +84,9 @@ public:
 
     Q_INVOKABLE void pickImages();
     Q_INVOKABLE void addFiles(const QList<QUrl> &urls);
+    Q_INVOKABLE void attachCanvas(CanvasView *canvas);
+    // Follow the open board and keep it in place while its assets are written.
+    std::unique_ptr<Library::Lock> lockAssets();
     // Takes a picture, files, or text from the system clipboard. False when
     // it holds none of them.
     Q_INVOKABLE bool pasteClipboard();
@@ -118,7 +124,7 @@ signals:
     void readOnlyChanged();
     // A picture is in the board's assets and ready to be placed. `position`
     // counts the pictures of one batch, so they can be fanned out.
-    void imageAdded(const QString &asset, const QSize &size, int position);
+    void imageAdded(const QString &asset, const QSize &size, int position, QPointF at = {});
     void textPasted(const QString &text);
     // An export is to be written over a file, `name` in `folder`, that the
     // dialog never asked about (see exportBoard()). It waits on
@@ -126,14 +132,6 @@ signals:
     void replaceAsked(const QString &name, const QString &folder);
 
 private:
-    // Which folder a board's is, whatever it is called: the same while it is
-    // renamed. Not valid for what is no folder.
-    struct FolderId {
-        quint64 device = 0, inode = 0;
-        bool isValid() const { return inode != 0; }
-        bool operator==(const FolderId &other) const = default;
-    };
-
     // What a save came to.
     struct Written {
         quint64 revision = 0;
@@ -142,7 +140,7 @@ private:
         quint32 lastId = 0;
         QByteArray fingerprint;
         QString folder;
-        FolderId folderId;
+        Library::FileId folderId;
         // Nothing was written: the file had been changed from outside.
         bool changed = false;
         // Nothing was written: the board's folder had moved (see save()).
@@ -150,13 +148,13 @@ private:
         QString error;
     };
 
-    static FolderId folderIdOf(const QString &folder);
     // The folder the open board is the board.json of, or nothing for a board
     // that is a .json file of its own.
     QString boardFolder() const;
     // The board's folder has moved. If it is found beside where it was,
     // the board is followed there as if it had been renamed here.
     void followMove();
+    bool verifyOpenFolder();
     // The open board is at `location` from now on, as it was renamed or
     // moved there.
     void moveTo(const Library::Location &location);
@@ -189,7 +187,9 @@ private:
     bool takeIn(const QString &problem, const QJsonObject &root, const QByteArray &fingerprint);
     void resume();
     QString viewKey() const;
+    void loadState();
     void writeState();
+    void continueImport();
     // Writes the export asked for to `path`, and says how that went.
     void writeExport(const QString &path, const QString &format);
     // What is said when what was selected to be exported has all gone.
@@ -200,7 +200,7 @@ private:
     Theme *m_theme;
     Board m_board;
     Library::Location m_location;
-    FolderId m_folderId;
+    Library::FileId m_folderId;
     // The board could not be read, or there is none, so nothing is ever
     // written; and why, as it was said, to be said again when asked.
     bool m_readOnly = false;
@@ -235,8 +235,23 @@ private:
     QFileSystemWatcher m_watcher;
 
     QString m_pendingLastBoard;
+    QJsonObject m_state;
     // Views this window has yet to write. An empty map forgets a view.
     QHash<QString, QVariantMap> m_pendingViews;
+    QPointer<CanvasView> m_canvas;
+    struct ImportBatch {
+        QStringList files;
+        QPointF at;
+        int position = 0;
+    };
+    struct PreparedPicture {
+        Library::Picture picture;
+        QString error;
+    };
+    QQueue<ImportBatch> m_imports;
+    std::optional<PreparedPicture> m_readyPicture;
+    QThreadPool m_importPool;
+    bool m_readingPicture = false;
     QVector<quint32> m_exportIds;
     // An export was asked for, of the board that is open: answered once
     // another has been opened, it is not written.

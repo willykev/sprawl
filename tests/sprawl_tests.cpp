@@ -19,6 +19,7 @@
 #include <QQuickStyle>
 #include <QQuickWindow>
 #include <QRegularExpression>
+#include <QSemaphore>
 #include <QSGGeometryNode>
 #include <QSGTextNode>
 #include <QSGTransformNode>
@@ -34,7 +35,10 @@
 #include <memory>
 #include <qpa/qwindowsysteminterface.h>
 #include <sys/stat.h>
+#include <thread>
 #include <typeinfo>
+#include <unistd.h>
+#include <vector>
 #include <zlib.h>
 
 #include "backend.h"
@@ -2253,9 +2257,25 @@ private slots:
         const QDir assets(library.assetsFolder("pictures"));
         const QStringList files = assets.entryList(QDir::Files);
         QCOMPARE(files.size(), 1);
-        QCOMPARE(runCli({"sprawl", "add", "pictures", "image", "--file", bad}), 1);
+        // An unreadable picture is refused even while a writer holds the
+        // board. Its readable header alone would get as far as the lock.
+        auto held = Library::lock(library.boardFile("pictures"));
+        QVERIFY(held);
+        QProcess command;
+        command.start(QCoreApplication::applicationFilePath(), {"--cli", "add", "pictures", "image", "--file", bad});
+        QVERIFY(command.waitForFinished(4000));
+        QCOMPARE(command.exitCode(), 1);
+        QVERIFY(command.readAllStandardError().contains("is not a picture Sprawl can show"));
+        held.reset();
         QCOMPARE(read(library.boardFile("pictures")), before);
         QCOMPARE(assets.entryList(QDir::Files), files);
+
+        Desk desk;
+        QVERIFY(desk.ready());
+        desk.backend.addFiles({QUrl::fromLocalFile(bad)});
+        QTRY_VERIFY(desk.backend.problem().contains("is not a picture Sprawl can show"));
+        QCOMPARE(desk.board().count(), 0);
+        QVERIFY(QDir(desk.backend.assetFolder()).entryList(QDir::Files).isEmpty());
 
         // One already on the board can go bad too.
         write(assets.filePath(files.first()), cut);
@@ -2273,7 +2293,7 @@ private slots:
             desk.picker.images = {QUrl::fromLocalFile(picture(desk.home.filePath("rule.png"), QSize(2000, 2)))};
             desk.hover(QPointF(400, 300));
             desk.key(Qt::Key_I);
-            QCOMPARE(desk.all(Item::Kind::Image).size(), 1);
+            QTRY_COMPARE(desk.all(Item::Kind::Image).size(), 1);
             const Item *rule = desk.all(Item::Kind::Image).first();
             QVERIFY(rule->rect.width() >= 1 && rule->rect.height() >= 1);
             asset = rule->asset;
@@ -3022,6 +3042,28 @@ private slots:
         desk.key(Qt::Key_Z, Qt::ControlModifier | Qt::ShiftModifier);
         QCOMPARE(desk.board().order(), (QVector<quint32>{3, 4, 2}));
         QCOMPARE(desk.warnings, QStringList());
+    }
+
+    void undoKeepsARestackThatCameWithADeletion() {
+        Board initial, here, there;
+        for (int i = 0; i < 4; ++i)
+            initial.add(note(i * 200, 0));
+        QCOMPARE(here.fromJson(initial.toJson()), QStringList());
+        here.restack({3}, false);
+        const QVector<Item> saved = here.items();
+        QCOMPARE(there.fromJson(here.toJson()), QStringList());
+        there.begin();
+        there.remove(1);
+        there.restack({4}, false);
+        QVERIFY(there.commit());
+        here.merge(saved, there.items(), there.lastId());
+        QCOMPARE(here.order(), (QVector<quint32>{4, 3, 2}));
+        here.undo();
+        QCOMPARE(here.order(), (QVector<quint32>{4, 2, 3}));
+        here.redo();
+        QCOMPARE(here.order(), (QVector<quint32>{4, 3, 2}));
+        here.undo();
+        QCOMPARE(here.order(), (QVector<quint32>{4, 2, 3}));
     }
 
     void aChangeFromOutsideJustBeforeAResizeIsKept() {
@@ -4701,6 +4743,25 @@ private slots:
                  1);
         QVERIFY(!QFile::exists(library.boardFolder("race")));
         QCOMPARE(written(renamed), (QStringList{"The command's", "The agent's too"}));
+
+        // The old name was reused before the command finished reading.
+        // The same item number in the replacement belongs to that board.
+        QVERIFY(QDir().rename(library.boardFolder("renamed"), library.boardFolder("race")));
+        Board replacement;
+        const quint32 first = replacement.add(note(0, 0));
+        replacement.add(note(0, 0, "Replacement"));
+        replacement.remove(first);
+        QString problem;
+        QCOMPARE(racing({"remove", "race", "2"}, [&](const QByteArray &board) {
+                     QDir().rename(library.boardFolder("race"), library.boardFolder("renamed"));
+                     renamedOver(renamed, board);
+                     problem = Library::write(file, replacement.toJson());
+                 }),
+                 1);
+        QCOMPARE(problem, QString());
+        QCOMPARE(written(file), QStringList{"Replacement"});
+        QCOMPARE(written(renamed), (QStringList{"The command's", "The agent's too"}));
+        QVERIFY(!QFileInfo::exists(renamed + ".lock"));
     }
 
     void aConnectorAskedToBeSomewhereIsNotAddedUnsaid() {
@@ -4747,14 +4808,14 @@ private slots:
         const QString blank = desk.home.filePath("blank.svg");
         write(blank, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"0\" height=\"10\"/>");
         desk.backend.addFiles({QUrl::fromLocalFile(blank)});
-        QCOMPARE(desk.backend.problem(), QString("blank.svg is not a picture Sprawl can show."));
+        QTRY_VERIFY(desk.backend.problem().contains("blank.svg is not a picture Sprawl can show."));
         QCOMPARE(desk.board().count(), 0);
         QCOMPARE(QDir(desk.backend.assetFolder()).entryList(QDir::Files), QStringList());
         // One with a size is added as ever.
         desk.backend.dismissProblem();
         desk.backend.addFiles({QUrl::fromLocalFile(picture(desk.home.filePath("photo.png"), QSize(80, 60)))});
+        QTRY_COMPARE(desk.all(Item::Kind::Image).size(), 1);
         QCOMPARE(desk.backend.problem(), QString());
-        QCOMPARE(desk.all(Item::Kind::Image).size(), 1);
         QCOMPARE(QDir(desk.backend.assetFolder()).entryList(QDir::Files).size(), 1);
         QCOMPARE(desk.warnings, QStringList());
     }
@@ -5843,6 +5904,32 @@ private slots:
         QVERIFY(!desk.board().touches(ink, QRectF(245, 435, 2, 2)));
     }
 
+    void theMarqueeFollowsAStrokesCurveAfterItChanges() {
+        Board board;
+        Item ink = stroke({{0, 0}, {100, 100}, {200, 100}, {300, 0}});
+        ink.width = 2;
+        const quint32 id = board.add(ink);
+        const QVector<QPointF> curve = Geo::smooth(ink.points, Geo::strokeTolerance);
+        const auto peak = std::max_element(curve.cbegin(), curve.cend(), [](QPointF a, QPointF b) {
+            return a.y() < b.y();
+        });
+        const QRectF tip(*peak - QPointF(0.5, 0.5), QSizeF(1, 1));
+        QVERIFY(!Geo::polylineIntersectsRect(ink.points, tip, ink.width / 2));
+        QVERIFY(board.touches(*board.item(id), tip));
+
+        ink = *board.item(id);
+        ink.rect.translate(400, 0);
+        board.set(ink);
+        QVERIFY(!board.touches(*board.item(id), tip));
+        QVERIFY(board.touches(*board.item(id), tip.translated(400, 0)));
+        ink.points = {{0, 0}, {300, 0}};
+        ink.rect.setHeight(0);
+        board.set(ink);
+        QVERIFY(!board.touches(*board.item(id), tip.translated(400, 0)));
+        board.undo();
+        QVERIFY(board.touches(*board.item(id), tip.translated(400, 0)));
+    }
+
     void thePenDrawsStrokes() {
         Desk desk;
         QVERIFY(desk.ready());
@@ -6666,7 +6753,7 @@ private slots:
         desk.hover(QPointF(400, 300));
         desk.key(Qt::Key_I);
         QCOMPARE(desk.picker.opened, 1);
-        QCOMPARE(desk.board().count(), 1);
+        QTRY_COMPARE(desk.board().count(), 1);
         const quint32 id = desk.last()->id;
         QCOMPARE(desk.board().item(id)->kind, Item::Kind::Image);
         // Brought down to a size to arrange, under the pointer.
@@ -6690,7 +6777,7 @@ private slots:
         // the first.
         desk.hover(QPointF(400, 300));
         desk.key(Qt::Key_I);
-        QCOMPARE(desk.board().count(), 2);
+        QTRY_COMPARE(desk.board().count(), 2);
         QCOMPARE(QDir(assets).entryList(QDir::Files).size(), 1);
         QCOMPARE(desk.last()->rect, QRectF(206, 211, 420, 210));
 
@@ -6698,8 +6785,8 @@ private slots:
         write(desk.home.filePath("notes.txt"), "not a picture");
         desk.picker.images = {QUrl::fromLocalFile(desk.home.filePath("notes.txt"))};
         desk.key(Qt::Key_I);
+        QTRY_VERIFY(desk.backend.problem().contains("notes.txt"));
         QCOMPARE(desk.board().count(), 2);
-        QVERIFY(desk.backend.problem().contains("notes.txt"));
         // And so is a dialog that could not be shown.
         desk.picker.failure = "The desktop has no file dialog.";
         desk.key(Qt::Key_I);
@@ -6798,6 +6885,61 @@ private slots:
         QCOMPARE(open("beta")->rememberedView(), beta);
         const QVariantMap alpha{{"x", 100.0}, {"y", 200.0}, {"zoom", 2.0}};
         QCOMPARE(open("alpha")->rememberedView(), alpha);
+    }
+
+    void aViewWriteWaitsForReadableState() {
+        QTemporaryDir home;
+        Library library(home.path());
+        QCOMPARE(library.create("alpha"), QString());
+        QCOMPARE(library.create("beta"), QString());
+        const QString alpha = library.boardFile("alpha"), beta = library.boardFile("beta");
+        const QJsonObject first{{"x", 10.0}, {"y", 20.0}, {"zoom", 2.0}};
+        const QJsonObject other{{"x", 30.0}, {"y", 40.0}, {"zoom", 3.0}};
+        const QJsonObject latest{{"x", 50.0}, {"y", 60.0}, {"zoom", 4.0}};
+        const QString file = library.stateFile();
+        const QJsonObject state{{"last", "alpha"}, {"views", QJsonObject{{alpha, first}, {beta, other}}}};
+        QCOMPARE(Library::write(file, state), QString());
+        Theme theme(home.path());
+        Backend window(&library, nullptr, &theme);
+        window.openInitial("alpha");
+        QCOMPARE(window.rememberedView(), first.toVariantMap());
+
+        // Resizes use the loaded view. A partial write on disk neither
+        // takes it away nor causes the next view to replace the whole file.
+        const QByteArray partial = "{\"views\":";
+        write(file, partial);
+        QCOMPARE(window.rememberedView(), first.toVariantMap());
+        window.rememberView(QPointF(50, 60), 4);
+        QTest::qWait(1800);
+        QCOMPARE(read(file), partial);
+
+        QCOMPARE(Library::write(file, state), QString());
+        const auto views = [&] { return QJsonDocument::fromJson(read(file)).object().value("views").toObject(); };
+        QTRY_COMPARE(views(), (QJsonObject{{alpha, latest}, {beta, other}}));
+        QCOMPARE(window.rememberedView(), latest.toVariantMap());
+    }
+
+    void aBusyStateFileDoesNotHoldUpTheWindow() {
+        QTemporaryDir home;
+        Library library(home.path());
+        QCOMPARE(library.create("desk"), QString());
+        Theme theme(home.path());
+        Backend window(&library, nullptr, &theme);
+        window.openInitial("desk");
+        const QString file = library.stateFile();
+        QLockFile held(file + ".lock");
+        QVERIFY(held.tryLock(0));
+        window.rememberView(QPointF(10, 20), 2);
+        QElapsedTimer timer;
+        timer.start();
+        QTest::qWait(1800);
+        QVERIFY(timer.elapsed() < 2500);
+        QVERIFY(!QFileInfo::exists(file));
+        held.unlock();
+        QTRY_VERIFY(QFileInfo::exists(file));
+        Backend reopened(&library, nullptr, &theme);
+        reopened.openInitial("desk");
+        QCOMPARE(reopened.rememberedView(), (QVariantMap{{"x", 10.0}, {"y", 20.0}, {"zoom", 2.0}}));
     }
 
     void theLastBoardOpensNextTime() {
@@ -7201,7 +7343,7 @@ private slots:
         QVERIFY(desk.backend.openBoard("desk"));
         QVERIFY(!desk.canvas->readOnly());
         QVERIFY(desk.drop(QPointF(600, 400), photo));
-        QCOMPARE(desk.board().count(), 1);
+        QTRY_COMPARE(desk.board().count(), 1);
         QCOMPARE(desk.last()->kind, Item::Kind::Image);
         desk.key(Qt::Key_N);
         QCOMPARE(desk.canvas->tool(), QString("note"));
@@ -7282,8 +7424,10 @@ private slots:
         // the writing is finished, and the picture is where it was dropped.
         desk.canvas->pointTo(desk.canvas->toItem(QPointF(700, 400)));
         desk.backend.addFiles({QUrl::fromLocalFile(photo)});
+        // Reading the picture leaves the pointer free to move.
+        desk.canvas->pointTo(desk.canvas->toItem(QPointF(400, 300)));
+        QTRY_COMPARE(desk.board().count(), 2);
         QVERIFY(!desk.canvas->editing());
-        QCOMPARE(desk.board().count(), 2);
         QCOMPARE(desk.last()->kind, Item::Kind::Image);
         QCOMPARE(desk.last()->rect.center(), QPointF(700, 400));
         QCOMPARE(desk.canvas->selection(), QVector<quint32>{desk.last()->id});
@@ -7425,7 +7569,7 @@ private slots:
         desk.picker.images = {QUrl::fromLocalFile(rule)};
         desk.hover(QPointF(400, 100));
         desk.key(Qt::Key_I);
-        QCOMPARE(desk.board().count(), 1);
+        QTRY_COMPARE(desk.board().count(), 1);
         QCOMPARE(desk.last()->rect, QRectF(190, 92, 420, least));
         QGuiApplication::clipboard()->setImage(QImage(rule));
         desk.hover(QPointF(400, 250));
@@ -7433,18 +7577,20 @@ private slots:
         QCOMPARE(desk.board().count(), 2);
         QCOMPARE(desk.last()->rect, QRectF(190, 242, 420, least));
         QVERIFY(desk.drop(QPointF(400, 400), rule));
-        QCOMPARE(desk.board().count(), 3);
+        QTRY_COMPARE(desk.board().count(), 3);
         QCOMPARE(desk.last()->rect, QRectF(190, 392, 420, least));
         // Stood on end, it is as narrow, and as tall as a picture starts.
         desk.picker.images = {QUrl::fromLocalFile(picture(desk.home.filePath("post.png"), QSize(2, 2000)))};
         desk.hover(QPointF(800, 300));
         desk.key(Qt::Key_I);
+        QTRY_COMPARE(desk.board().count(), 4);
         QCOMPARE(desk.last()->rect, QRectF(792, 140, least, 320));
         // A picture less than the least across and down grows to it, in
         // proportion.
         desk.picker.images = {QUrl::fromLocalFile(picture(desk.home.filePath("dot.png"), QSize(6, 3)))};
         desk.hover(QPointF(400, 550));
         desk.key(Qt::Key_I);
+        QTRY_COMPARE(desk.board().count(), 5);
         QCOMPARE(desk.last()->rect, QRectF(384, 542, 32, least));
         QCOMPARE(desk.all(Item::Kind::Image).size(), 5);
 
@@ -7514,6 +7660,7 @@ private slots:
         desk.picker.images = {QUrl::fromLocalFile(picture(desk.home.filePath("banner.png"), QSize(1200, 100)))};
         desk.hover(QPointF(400, 300));
         desk.key(Qt::Key_I);
+        QTRY_COMPARE(desk.all(Item::Kind::Image).size(), 1);
         const quint32 banner = desk.last()->id;
         QCOMPARE(desk.board().item(banner)->rect, QRectF(190, 283, 420, 35));
         desk.drag(QPointF(613, 300), QPointF(0, 300));
@@ -11625,6 +11772,35 @@ private slots:
         QCOMPARE(library.boards().size(), 1);
     }
 
+    void onlyOneCreatorClaimsABoardName() {
+        QTemporaryDir home;
+        QVERIFY(home.isValid());
+        const QString root = home.path();
+        for (int round = 0; round < 8; ++round) {
+            const QString name = QString("same-%1").arg(round);
+            QSemaphore ready, start;
+            QStringList problems(8, QString());
+            std::vector<std::jthread> creators;
+            for (qsizetype i = 0; i < problems.size(); ++i) {
+                QString &problem = problems[i];
+                creators.emplace_back([&root, &name, &ready, &start, &problem] {
+                    ready.release();
+                    start.acquire();
+                    problem = Library(root).create(name);
+                });
+            }
+            ready.acquire(int(problems.size()));
+            start.release(int(problems.size()));
+            creators.clear();
+            QCOMPARE(problems.count(QString()), 1);
+            QJsonObject rootObject;
+            QCOMPARE(Library::read(Library(root).boardFile(name), rootObject), QString());
+            Board reopened;
+            QCOMPARE(reopened.fromJson(rootObject), QStringList());
+            QCOMPARE(reopened.count(), 0);
+        }
+    }
+
     void aBoardsNameKeepsLettersBeyondTheBasicPlane() {
         QTemporaryDir home;
         QVERIFY(home.isValid());
@@ -14412,10 +14588,13 @@ private slots:
         const QString alias = home.filePath("alias.png");
         QVERIFY(QFile::link(file, alias));
         QVERIFY(QFileInfo(alias).isSymLink());
+        const QString sameInode = home.filePath("same-board.png");
+        QCOMPARE(::link(QFile::encodeName(file).constData(), QFile::encodeName(sameInode).constData()), 0);
         const QString relative = QDir::current().relativeFilePath(file);
-        for (const QString &path : {file, relative, alias}) {
+        for (const QString &path : {file, relative, alias, sameInode}) {
             QCOMPARE(runCli({"sprawl", "export", "plan", "-o", path}), 1);
             QCOMPARE(read(file), before);
+            QCOMPARE(read(sameInode), before);
         }
         QCOMPARE(runCli({"sprawl", "export", alias, "-o", file}), 1);
         QCOMPARE(read(file), before);
@@ -14613,6 +14792,7 @@ private slots:
         desk.picker.images = picked;
         desk.hover(QPointF(400, 300));
         desk.key(Qt::Key_I);
+        QTRY_COMPARE(desk.all(Item::Kind::Image).size(), picked.size());
         QCOMPARE(desk.backend.problem(), QString());
         QVector<quint32> added;
         for (const Item *image : desk.all(Item::Kind::Image))
@@ -14908,6 +15088,53 @@ private slots:
         QCOMPARE(QJsonDocument::fromJson(json).object().value("text").toString(), text);
     }
 
+    void aPictureDiagnosticUsesPrintableText() {
+        QTemporaryDir home;
+        Library library(home.path());
+        QCOMPARE(library.create("pictures"), QString());
+        const QString path = home.filePath("paint.svg");
+        // Qt says which paint it could not find. That name can contain a
+        // control character even though the picture has no outside files.
+        write(path, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\">"
+                    "<rect width=\"20\" height=\"20\" fill=\"url(#missing\x7f)\"/></svg>");
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert("SPRAWL_HOME", home.path());
+        QProcess command;
+        command.setProcessEnvironment(environment);
+        command.start(QCoreApplication::applicationFilePath(), {"--cli", "add", "pictures", "image", "--file", path});
+        QVERIFY(command.waitForFinished(4000));
+        QCOMPARE(command.exitCode(), 0);
+        const QByteArray said = command.readAllStandardError();
+        QVERIFY2(said.contains("missing\xef\xbf\xbd"), said.constData());
+        QVERIFY(!said.contains('\x7f'));
+    }
+
+    void aDrawingIsCheckedBeforeItIsMeasured() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        const QString path = desk.home.filePath("drawing.png");
+        // The drawing names a paint Qt would warn about while measuring it.
+        // Sprawl sees that the drawing needs a second file before Qt measures it.
+        write(path, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\">"
+                    "<rect width=\"20\" height=\"20\" fill=\"url(#missing-paint)\"/>"
+                    "<image width=\"20\" height=\"20\" href=\"missing.png\"/></svg>");
+        QTest::failOnWarning(QRegularExpression(".*missing-paint.*"));
+        desk.backend.addFiles({QUrl::fromLocalFile(path)});
+        QTRY_VERIFY(desk.backend.problem().contains("is not a picture Sprawl can show"));
+        QCOMPARE(desk.board().count(), 0);
+        QVERIFY(QDir(desk.backend.assetFolder()).entryList(QDir::Files).isEmpty());
+
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert("SPRAWL_HOME", desk.home.path());
+        QProcess command;
+        command.setProcessEnvironment(environment);
+        command.start(QCoreApplication::applicationFilePath(), {"--cli", "add", "desk", "image", "--file", path});
+        QVERIFY(command.waitForFinished(4000));
+        QCOMPARE(command.exitCode(), 1);
+        const QByteArray said = command.readAllStandardError();
+        QVERIFY2(said.contains("is not a picture Sprawl can show") && !said.contains("missing-paint"), said.constData());
+    }
+
     void aBoardsNameIsNotAPath() {
         QTemporaryDir dir;
         Library library(dir.path());
@@ -14937,6 +15164,27 @@ private slots:
         QCOMPARE(Library::importFile(assets, dir.filePath("pipe.png"), &problem), QString());
         QVERIFY2(problem.contains("not a file"), qPrintable(problem));
         QVERIFY(QDir(assets).entryList(QDir::Files).isEmpty());
+    }
+
+    void anImportedPictureKeepsTheBytesThatWereChecked() {
+        QTemporaryDir home;
+        const QString source = picture(home.filePath("photo.png"), QSize(40, 30), Qt::blue);
+        const QByteArray original = read(source);
+        QString problem;
+        const Library::Picture checked = Library::preparePicture(source, &problem);
+        QCOMPARE(problem, QString());
+        QCOMPARE(checked.size, QSize(40, 30));
+        // The file was picked and checked. A new file with that name
+        // should only appear in a later import.
+        QVERIFY(QFile::rename(source, home.filePath("earlier.png")));
+        picture(source, QSize(30, 40), Qt::red);
+        const QString assets = home.filePath("assets");
+        const QString kept = Library::savePicture(assets, checked, &problem);
+        QVERIFY2(!kept.isEmpty(), qPrintable(problem));
+        QCOMPARE(read(assets + "/" + kept), original);
+        const QString later = Library::importFile(assets, source, &problem);
+        QVERIFY2(!later.isEmpty() && later != kept, qPrintable(problem));
+        QCOMPARE(read(assets + "/" + later), read(source));
     }
 
     void pastedPicturesComeAlongAndNothingElseDoes() {
@@ -14973,7 +15221,7 @@ private slots:
         const QString pipe = elsewhere.filePath("pipe.png");
         QCOMPARE(mkfifo(QFile::encodeName(pipe).constData(), 0600), 0);
         desk.backend.addFiles({QUrl::fromLocalFile(pipe)});
-        QVERIFY2(desk.backend.problem().contains("not a picture"), qPrintable(desk.backend.problem()));
+        QTRY_VERIFY(desk.backend.problem().contains("not a file"));
         QCOMPARE(desk.all(Item::Kind::Image).size(), 2);
         QCOMPARE(desk.warnings, QStringList());
     }
@@ -15368,6 +15616,158 @@ private slots:
         reopened.openInitial("desk");
         const QVariantMap replacementView{{"x", 300.0}, {"y", 400.0}, {"zoom", 3.0}};
         QCOMPARE(reopened.rememberedView(), replacementView);
+    }
+
+    void picturesGoWithTheBoardThatWasRenamed_data() {
+        QTest::addColumn<int>("from");
+        QTest::newRow("drop") << 0;
+        QTest::newRow("clipboard-picture") << 1;
+        QTest::newRow("clipboard-item") << 2;
+    }
+
+    void picturesGoWithTheBoardThatWasRenamed() {
+        QFETCH(int, from);
+        Desk desk;
+        QVERIFY(desk.ready());
+        const QString photo = picture(desk.home.filePath("photo.png"), QSize(80, 60));
+        if (from == 2) {
+            QVERIFY(desk.backend.newBoard("source"));
+            desk.backend.addFiles({QUrl::fromLocalFile(photo)});
+            QTRY_COMPARE(desk.board().count(), 1);
+            desk.canvas->selectAll();
+            desk.canvas->copy();
+            QVERIFY(desk.backend.openBoard("desk"));
+        }
+        desk.add(note(0, 0, "Original"));
+        QVERIFY(desk.backend.flush());
+        Backend other(&desk.library, nullptr, &desk.theme);
+        other.openInitial("desk");
+        QVERIFY(other.renameBoard("moved"));
+
+        Board replacement;
+        replacement.add(note(300, 0, "Replacement"));
+        const QByteArray before = Library::contentsOf(replacement.toJson());
+        QCOMPARE(Library::write(desk.library.boardFile("desk"), replacement.toJson()), QString());
+        // The old window has received no watcher event yet.
+        QCOMPARE(desk.backend.boardName(), QString("desk"));
+        if (from == 0) {
+            QVERIFY(desk.drop(QPointF(400, 300), photo));
+        } else if (from == 1) {
+            QGuiApplication::clipboard()->setImage(QImage(photo));
+            QVERIFY(desk.backend.pasteClipboard());
+        } else {
+            QVERIFY(desk.canvas->paste());
+        }
+        QVERIFY(desk.backend.flush());
+        QCOMPARE(desk.backend.boardName(), QString("moved"));
+        QCOMPARE(read(desk.library.boardFile("desk")), before);
+        QVERIFY(!QFileInfo::exists(desk.library.assetsFolder("desk")));
+        Board saved;
+        QCOMPARE(saved.fromJson(desk.onDisk()), QStringList());
+        QCOMPARE(saved.count(), 2);
+        QCOMPARE(saved.item(1)->text, QString("Original"));
+        const Item *added = saved.item(2);
+        QVERIFY(added && added->kind == Item::Kind::Image);
+        const QString asset = desk.library.assetsFolder("moved") + "/" + added->asset;
+        QCOMPARE(QImage(asset).pixelColor(0, 0), QImage(photo).pixelColor(0, 0));
+        QCOMPARE(runCli({"sprawl", "check", desk.library.boardFolder("moved")}), 0);
+        QCOMPARE(desk.warnings, QStringList());
+    }
+
+    void renameAndTrashUseTheOpenBoard_data() {
+        QTest::addColumn<bool>("trash");
+        QTest::addColumn<bool>("canFollow");
+        for (bool trash : {false, true}) {
+            const QByteArray action = trash ? "trash" : "rename";
+            QTest::addRow("%s-follow", action.constData()) << trash << true;
+            QTest::addRow("%s-mismatch", action.constData()) << trash << false;
+        }
+    }
+
+    void renameAndTrashUseTheOpenBoard() {
+        QFETCH(bool, trash);
+        QFETCH(bool, canFollow);
+        QTemporaryDir home;
+        Library library(home.path());
+        QCOMPARE(library.create("desk"), QString());
+        const QString source = library.boardFile("desk");
+        // A read-only board still has a folder of its own.
+        if (!canFollow)
+            write(source, "{");
+        const QByteArray original = read(source);
+        Theme theme(home.path());
+        Backend first(&library, nullptr, &theme);
+        first.openInitial("desk");
+        QCOMPARE(first.readOnly(), !canFollow);
+        const QString movedName = trash ? "original-to-trash" : "original-to-rename";
+        const QString moved = canFollow ? library.boardFolder(movedName) : home.filePath("elsewhere");
+        QVERIFY(QDir().rename(library.boardFolder("desk"), moved));
+        Board replacement;
+        replacement.add(note(0, 0, "Replacement"));
+        QCOMPARE(Library::write(source, replacement.toJson()), QString());
+        const QByteArray before = read(source);
+
+        QCOMPARE(trash ? first.deleteBoard() : first.renameBoard("third"), canFollow);
+        QCOMPARE(read(source), before);
+        if (!canFollow) {
+            QVERIFY(first.problem().contains("no longer holds the open board"));
+            QCOMPARE(read(moved + "/board.json"), original);
+            QVERIFY(!library.exists("third"));
+        } else if (trash) {
+            QVERIFY(!QFileInfo::exists(moved));
+            const QDir files(qEnvironmentVariable("XDG_DATA_HOME") + "/Trash/files");
+            QCOMPARE(read(files.filePath(movedName + "/board.json")), original);
+        } else {
+            QCOMPARE(first.boardName(), QString("third"));
+            QCOMPARE(read(library.boardFile("third")), original);
+            QVERIFY(!QFileInfo::exists(moved));
+        }
+    }
+
+    void aRenameWaitsForTheWriterAndLeavesNoLock() {
+        QTemporaryDir home;
+        Library library(home.path());
+        QCOMPARE(library.create("desk"), QString());
+        auto held = Library::lock(library.boardFile("desk"));
+        QVERIFY(held);
+        QSemaphore started;
+        QString problem;
+        std::jthread renaming([&] {
+            started.release();
+            problem = library.rename("desk", "trip");
+        });
+        started.acquire();
+        QTest::qSleep(150);
+        const bool waited = library.exists("desk") && !library.exists("trip");
+        held.reset();
+        renaming.join();
+        QVERIFY(waited);
+        QCOMPARE(problem, QString());
+        const QString file = library.boardFile("trip");
+        QVERIFY(QFileInfo::exists(file));
+        QVERIFY(!QFileInfo::exists(file + ".lock"));
+        QLockFile next(file + ".lock");
+        QVERIFY(next.tryLock(0));
+    }
+
+    void growingTypeKeepsItsWrapReadable() {
+        QTemporaryDir home;
+        Library library(home.path());
+        QCOMPARE(library.create("wide"), QString());
+        const QString file = library.boardFile("wide");
+        write(file, R"({"sprawl":1,"items":[
+            {"id":1,"type":"text","text":"wide","x":0,"y":0,"size":12,"wrap":1000000000}]})");
+        Theme theme(home.path());
+        Backend backend(&library, nullptr, &theme);
+        backend.openInitial("wide");
+        CanvasView canvas;
+        canvas.setBoard(backend.board());
+        canvas.select({1});
+        canvas.resizeText(1);
+        QCOMPARE(backend.board()->item(1)->fontSize, 13.0);
+        QCOMPARE(backend.board()->item(1)->wrap, Item::farthest);
+        QVERIFY(backend.flush());
+        QCOMPARE(runCli({"sprawl", "check", file}), 0);
     }
 
     void makingABoardWaitsUntilTheOpenBoardIsSaved() {

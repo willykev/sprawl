@@ -20,6 +20,7 @@
 class QKeySequence;
 class QQuickTextDocument;
 class QSGTexture;
+class Backend;
 class ImageStore;
 class TitleHighlighter;
 struct SceneNodes;
@@ -168,6 +169,7 @@ public:
 
     Board *board() const { return m_board; }
     void setBoard(Board *board);
+    void setBackend(Backend *backend);
     Theme *theme() const { return m_theme; }
     void setTheme(Theme *theme);
     QString assetFolder() const { return m_assetFolder; }
@@ -299,7 +301,7 @@ public:
     Q_INVOKABLE void newNote();
     // `position` counts the pictures of one batch, fanned out so that none
     // hides another.
-    Q_INVOKABLE void insertImage(const QString &asset, QSize naturalSize, int position = 0);
+    void insertImage(const QString &asset, QSize naturalSize, int position, QPointF at);
     Q_INVOKABLE QVariantList selectedIds() const;
     Q_INVOKABLE void insertText(const QString &text);
     Q_INVOKABLE void selectAll();
@@ -526,6 +528,7 @@ private:
     qreal slack() const { return 5 / m_zoom; }
 
     QPointer<Board> m_board;
+    QPointer<Backend> m_backend;
     QPointer<Theme> m_theme;
     Palette m_palette = Palette::fallback();
     int m_radius = 0;

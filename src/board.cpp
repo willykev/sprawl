@@ -204,6 +204,12 @@ QSizeF mostLabelSize(const QString &text) {
     return QSizeF(widest * TextMetrics::small * 0.7, lines * TextMetrics::small * 3);
 }
 
+QRectF strokeBounds(const Item &item, const QVector<QPointF> &curve) {
+    // The curve between the stroke's points can go beyond their box.
+    const qreal reach = item.width / 2 + 1;
+    return (item.rect | Geo::boundsOf(curve).translated(item.rect.topLeft())).adjusted(-reach, -reach, reach, reach);
+}
+
 } // namespace
 
 Board::Board(QObject *parent) : QObject(parent) {}
@@ -235,15 +241,8 @@ int Board::depth(quint32 id) const {
 
 QRectF Board::boundsFor(const Item &item, const QRectF &laidOut) {
     switch (item.kind) {
-    case Item::Kind::Stroke: {
-        // What is drawn is the curve through its points (see Geo::smooth()),
-        // which can bend out past the box around them: round a corner given
-        // only once, as a file or a stroke drawn before corners were kept
-        // has them, and between the points of a bend.
-        const qreal reach = item.width / 2 + 1;
-        const QRectF curve = Geo::boundsOf(Geo::smooth(item.points, Geo::strokeTolerance));
-        return (item.rect | curve.translated(item.rect.topLeft())).adjusted(-reach, -reach, reach, reach);
-    }
+    case Item::Kind::Stroke:
+        return strokeBounds(item, Geo::smooth(item.points, Geo::strokeTolerance));
     case Item::Kind::Connector: {
         // Room for what is at its ends, and for the label beside the middle.
         const qreal reach = 8 + 3 * item.width;
@@ -268,6 +267,15 @@ QRectF Board::boundsFor(const Item &item, const QRectF &laidOut) {
     default:
         return item.rect;
     }
+}
+
+QRectF Board::indexedBounds(const Item &item) {
+    if (item.kind != Item::Kind::Stroke) {
+        m_strokeCurves.remove(item.id);
+        return boundsFor(item);
+    }
+    const auto curve = m_strokeCurves.insert(item.id, Geo::smooth(item.points, Geo::strokeTolerance));
+    return strokeBounds(item, *curve);
 }
 
 // What each item covers was worked out as it was set (see bounds()).
@@ -334,9 +342,13 @@ bool Board::hits(const Item &item, QPointF point, qreal slack) const {
 
 bool Board::touches(const Item &item, const QRectF &area) const {
     switch (item.kind) {
-    case Item::Kind::Stroke:
+    case Item::Kind::Stroke: {
+        const auto curve = m_strokeCurves.constFind(item.id);
+        if (curve != m_strokeCurves.constEnd() && this->item(item.id) == &item)
+            return Geo::polylineIntersectsRect(*curve, area.translated(-item.rect.topLeft()), item.width / 2);
         return Geo::polylineIntersectsRect(Geo::smooth(item.points, Geo::strokeTolerance),
                                            area.translated(-item.rect.topLeft()), item.width / 2);
+    }
     case Item::Kind::Connector:
         return Geo::polylineIntersectsRect(Geo::connectorPath(item), area);
     case Item::Kind::Frame:
@@ -418,7 +430,7 @@ void Board::unlink(const Item &item) {
 
 void Board::place(const Item &item) {
     m_items.insert(item.id, item);
-    m_grid.insert(item.id, boundsFor(item));
+    m_grid.insert(item.id, indexedBounds(item));
     link(item);
     m_lastId = qMax(m_lastId, item.id);
     m_lastGroup = qMax(m_lastGroup, item.group);
@@ -430,6 +442,7 @@ void Board::erase(quint32 id) {
         return;
     unlink(*found);
     m_items.erase(found);
+    m_strokeCurves.remove(id);
     m_grid.remove(id);
 }
 
@@ -533,7 +546,7 @@ void Board::set(const Item &item) {
     // every move of a drag.
     const bool moved = movedOnly(before, item);
     m_grid.update(item.id, moved ? m_grid.bounds(item.id).translated(item.rect.topLeft() - before.rect.topLeft())
-                                 : boundsFor(item));
+                                 : indexedBounds(item));
     m_lastGroup = qMax(m_lastGroup, item.group);
     emit itemChanged(item.id, moved ? Change::Moved : Change::Edited);
     refreshConnector(item.id);
@@ -768,7 +781,7 @@ void Board::apply(const Command &command, bool forward) {
             unlink(current);
             *found = target;
             link(target);
-            m_grid.update(edit.id, boundsFor(target));
+            m_grid.update(edit.id, indexedBounds(target));
             emit itemChanged(edit.id, movedOnly(current, target) ? Change::Moved : Change::Edited);
         }
     }
@@ -800,7 +813,7 @@ void Board::setMeasuredRect(quint32 id, const QRectF &rect) {
     if (found == m_items.end() || found->rect == measured)
         return;
     found->rect = measured;
-    m_grid.update(id, boundsFor(*found));
+    m_grid.update(id, indexedBounds(*found));
     emit itemChanged(id, Change::Edited);
     refreshConnectorsOf(id);
 }
@@ -888,7 +901,8 @@ void Board::renumber(quint32 from, quint32 to) {
         item.id = to;
         m_items.insert(to, item);
         m_grid.remove(from);
-        m_grid.insert(to, boundsFor(item));
+        m_strokeCurves.remove(from);
+        m_grid.insert(to, indexedBounds(item));
         std::replace(m_order.begin(), m_order.end(), from, to);
         m_depthsStale = true;
     }
@@ -984,38 +998,59 @@ void Board::regroup(quint32 from, quint32 to) {
     revise();
 }
 
-void Board::rebaseHistory(const QSet<quint32> &gone) {
-    if (gone.isEmpty())
+void Board::rebaseHistory(const QSet<quint32> &gone, const QVector<quint32> &mergedOrder) {
+    const QVector<quint32> &original = m_orderRemembered ? m_orderBefore : m_order;
+    if (gone.isEmpty() && mergedOrder == original)
         return;
-    auto removedDepths = [&gone](const QVector<quint32> &order) {
-        QVector<int> depths;
-        for (int depth = 0; depth < order.size(); ++depth)
-            if (gone.contains(order[depth]))
-                depths.append(depth);
-        return depths;
-    };
-    auto shift = [](int depth, const QVector<int> &removed) {
-        return depth - int(std::lower_bound(removed.cbegin(), removed.cend(), depth) - removed.cbegin());
-    };
-    // A missing item may have been at a different depth on either side of
-    // a step. Walk each history as it was, shifting each saved depth by
-    // the number of items that are now gone below it.
+    // Walk the old and merged stacks together. Put each of a step's items
+    // above the surviving item that was just below it in the old stack.
+    // The items the step leaves alone keep their order from the merge.
     for (QVector<Command> *history : {&m_undo, &m_redo}) {
         const bool forward = history == &m_redo;
-        QVector<quint32> order = m_orderRemembered ? m_orderBefore : m_order;
-        QVector<int> from = removedDepths(order);
+        QVector<quint32> order = original, rebased = mergedOrder;
         for (auto it = history->rbegin(); it != history->rend(); ++it) {
             const StackChange stack = stackChange(*it, forward);
             if (stack.leaving.isEmpty() && stack.arriving.isEmpty())
                 continue;
             stack.takeFrom(order);
             stack.putInto(order);
-            QVector<int> to = removedDepths(order);
-            for (Edit &edit : *it) {
-                edit.beforeDepth = shift(edit.beforeDepth, forward ? from : to);
-                edit.afterDepth = shift(edit.afterDepth, forward ? to : from);
+
+            QHash<quint32, Edit *> edits;
+            for (Edit &edit : *it)
+                if (!gone.contains(edit.id) && (edit.beforeDepth >= 0 || edit.afterDepth >= 0))
+                    edits.insert(edit.id, &edit);
+            auto record = [&edits](const QVector<quint32> &order, bool after) {
+                for (int depth = 0; depth < order.size(); ++depth) {
+                    if (Edit *edit = edits.value(order[depth])) {
+                        int &at = after ? edit->afterDepth : edit->beforeDepth;
+                        if (at >= 0)
+                            at = depth;
+                    }
+                }
+            };
+            record(rebased, !forward);
+            stack.takeFrom(rebased);
+            QSet<quint32> arriving;
+            for (const auto &[depth, id] : stack.arriving)
+                arriving.insert(id);
+            QHash<quint32, QVector<quint32>> above;
+            quint32 below = 0;
+            for (quint32 id : std::as_const(order)) {
+                if (gone.contains(id))
+                    continue;
+                if (arriving.contains(id))
+                    above[below].append(id);
+                else
+                    below = id;
             }
-            from = std::move(to);
+            QVector<quint32> next = above.take(0);
+            for (quint32 id : std::as_const(rebased)) {
+                next.append(id);
+                if (const auto found = above.constFind(id); found != above.constEnd())
+                    next += *found;
+            }
+            rebased = std::move(next);
+            record(rebased, forward);
         }
     }
 }
@@ -1140,7 +1175,7 @@ Board::Merged Board::merge(const QVector<Item> &base, const QVector<Item> &their
         unlink(current);
         *found = target;
         link(target);
-        m_grid.update(id, boundsFor(target));
+        m_grid.update(id, indexedBounds(target));
         m_lastGroup = qMax(m_lastGroup, target.group);
         replaced.insert(id, movedOnly(current, target) ? Change::Moved : Change::Edited);
     }
@@ -1149,9 +1184,9 @@ Board::Merged Board::merge(const QVector<Item> &base, const QVector<Item> &their
     // it added on top. What all three have, the file restacked, and the
     // board did not, takes the file's order, each in a place one of them had
     // here.
-    rebaseHistory(gone);
     QVector<quint32> order = m_order;
-    order.removeIf([&gone](quint32 id) { return gone.contains(id); });
+    const auto wasRemoved = [&gone](quint32 id) { return gone.contains(id); };
+    order.removeIf(wasRemoved);
     QSet<quint32> shared;
     for (quint32 id : std::as_const(wasOrder))
         if (now.contains(id) && m_items.contains(id))
@@ -1164,12 +1199,32 @@ Board::Merged Board::merge(const QVector<Item> &base, const QVector<Item> &their
         return found;
     };
     const QVector<quint32> there = sharedOf(nowOrder);
+    auto restack = [&shared, &there](QVector<quint32> &stack) {
+        // An open step's starting stack may lack items that were made
+        // during the step. Only give the items it has their new order.
+        const QSet<quint32> present(stack.cbegin(), stack.cend());
+        auto next = there.cbegin();
+        for (quint32 &id : stack) {
+            if (!shared.contains(id))
+                continue;
+            while (!present.contains(*next))
+                ++next;
+            id = *next++;
+        }
+    };
     if (there != sharedOf(wasOrder) && sharedOf(order) == sharedOf(wasOrder)) {
-        auto next = there.constBegin();
-        for (quint32 &id : order)
-            if (shared.contains(id))
-                id = *next++;
+        restack(order);
         merged.restacked = true;
+    }
+    if (m_orderRemembered) {
+        QVector<quint32> before = m_orderBefore;
+        before.removeIf(wasRemoved);
+        if (merged.restacked)
+            restack(before);
+        rebaseHistory(gone, before);
+        m_orderBefore = before + arriving;
+    } else {
+        rebaseHistory(gone, order);
     }
     order += arriving;
     const bool restacked = order != m_order;
@@ -1177,11 +1232,6 @@ Board::Merged Board::merge(const QVector<Item> &base, const QVector<Item> &their
         m_order = order;
         m_depthsStale = true;
     }
-    if (m_orderRemembered) {
-        m_orderBefore.removeIf([&gone](quint32 id) { return gone.contains(id); });
-        m_orderBefore += arriving;
-    }
-
     // Said once the board is whole again. Connectors follow what moved under
     // them, and one whose item went is left free where it was.
     for (quint32 id : std::as_const(gone))
@@ -1648,6 +1698,7 @@ QStringList Board::fromJson(const QJsonObject &root, bool *numbered) {
         return problems;
 
     m_items.clear();
+    m_strokeCurves.clear();
     m_order.clear();
     m_grid.clear();
     m_links.clear();

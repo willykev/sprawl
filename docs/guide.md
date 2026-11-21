@@ -148,6 +148,11 @@ The `assets` folder keeps a picture taken off the board too, so that an undo
 can put it back. `sprawl copy <board> <folder>` makes a copy to give away or
 move elsewhere that holds only the pictures still on the board.
 
+Picked and dropped picture files appear as Sprawl finishes checking them.
+They land at the point where they were added. If the board is renamed in
+another window, new pictures go with it. Rename and Trash report when
+Sprawl can no longer find the folder for the open board.
+
 ```json
 {"sprawl": 1, "items": [
   {"id": 1, "type": "note", "x": 0, "y": 0, "color": "yellow", "text": "Idea\nwhat it is"},
@@ -164,7 +169,8 @@ is never written over. The window says why (a click on "read only" says it
 again), shows it read only, and opens it by itself once the file can be read.
 Which board was open, and where each was left, is in
 `~/.local/state/sprawl/state.json`. Setting `SPRAWL_HOME` keeps boards and state
-somewhere else.
+somewhere else. If the state file is busy or temporarily unreadable, Sprawl
+retries the view save while the window is open.
 
 A board from somewhere else is only ever read as a board. What it says, and
 what it and its pictures are called, is shown as written and never as markup;

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "backend.h"
 #include "imagestore.h"
 #include "library.h"
 
@@ -102,6 +103,8 @@ CanvasView::CanvasView(QQuickItem *parent) : QQuickItem(parent) {
 }
 
 CanvasView::~CanvasView() = default;
+
+void CanvasView::setBackend(Backend *backend) { m_backend = backend; }
 
 // --- What it shows --------------------------------------------------------------
 
@@ -1981,7 +1984,7 @@ void CanvasView::newNote() {
     createItem(note, true);
 }
 
-void CanvasView::insertImage(const QString &asset, QSize naturalSize, int position) {
+void CanvasView::insertImage(const QString &asset, QSize naturalSize, int position, QPointF at) {
     if (!mayChange() || asset.isEmpty() || naturalSize.isEmpty())
         return;
     // Neither a screenful nor a sliver: a size to arrange and to see.
@@ -1989,7 +1992,7 @@ void CanvasView::insertImage(const QString &asset, QSize naturalSize, int positi
     Item image;
     image.kind = Item::Kind::Image;
     image.asset = asset;
-    image.rect = QRectF(freeCorner(rounded(insertPoint() - QPointF(size.width(), size.height()) / 2 +
+    image.rect = QRectF(freeCorner(rounded(at - QPointF(size.width(), size.height()) / 2 +
                                            QPointF(24, 24) * position),
                                    Item::Kind::Image),
                         size);
@@ -2296,7 +2299,17 @@ bool CanvasView::paste() {
     // pasted as a picture that is missing, but not as this board's picture
     // of the same name, unless that name is one of what a picture holds.
     const QString from = root.value("assets").toString();
-    if (!from.isEmpty() && from != m_assetFolder && !m_assetFolder.isEmpty()) {
+    QString to = m_assetFolder;
+    std::unique_ptr<Library::Lock> held;
+    if (m_backend && !from.isEmpty() && !to.isEmpty() && std::any_of(items.cbegin(), items.cend(), [](const Item &item) {
+            return item.kind == Item::Kind::Image;
+        })) {
+        held = m_backend->lockAssets();
+        if (!held)
+            return true;
+        to = m_backend->assetFolder();
+    }
+    if (!from.isEmpty() && from != to && !to.isEmpty()) {
         static const QRegularExpression namedForContents(QStringLiteral("^[0-9a-f]{16}(\\.[0-9a-z]+)?$"));
         QHash<QString, QString> taken;
         QVector<bool> dropped(items.size(), false);
@@ -2307,10 +2320,10 @@ bool CanvasView::paste() {
                 continue;
             auto found = taken.constFind(item.asset);
             if (found == taken.constEnd())
-                found = taken.insert(item.asset, Library::importAsset(m_assetFolder, from, item.asset));
+                found = taken.insert(item.asset, Library::importAsset(to, from, item.asset, nullptr, held.get()));
             if (!found->isEmpty()) {
                 item.asset = *found;
-            } else if (QFile::exists(m_assetFolder + "/" + item.asset) &&
+            } else if (QFile::exists(to + "/" + item.asset) &&
                        !namedForContents.match(item.asset).hasMatch()) {
                 dropped[i] = true;
                 if (item.id)
@@ -2336,6 +2349,7 @@ bool CanvasView::paste() {
             return true;
         }
     }
+    held.reset();
 
     // Centered where the mouse is, as anything inserted is.
     QRectF bounds;
@@ -2502,7 +2516,7 @@ void CanvasView::resizeText(int direction) {
                     size = step;
         }
         if (item.wrap > 0)
-            item.wrap = std::round(item.wrap * size / item.fontSize);
+            item.wrap = qMin(std::round(item.wrap * size / item.fontSize), Item::farthest);
         item.fontSize = size;
         TextMetrics::fit(item);
         m_board->set(item);

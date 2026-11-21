@@ -60,6 +60,8 @@ public:
     // read()). `hint` is what its name says it is (its suffix). The device
     // is rewound for whatever reads it next.
     static bool canShow(QIODevice *device, const QByteArray &hint = {});
+    // The picture's natural size, after any rotation, if it decodes.
+    static QSize validatedSize(QIODevice *device, const QByteArray &hint);
     // A picture is never kept bigger than this on its long side: more than
     // any screen shows, and safely within what a GPU takes as one texture.
     static constexpr int longestSide = 4096;

@@ -216,6 +216,7 @@ private:
 
     void touch(quint32 id);
     void rememberOrder();
+    QRectF indexedBounds(const Item &item);
     void place(const Item &item);
     void erase(quint32 id);
     void link(const Item &item);
@@ -225,7 +226,7 @@ private:
     Command close();
     static StackChange stackChange(const Command &command, bool forward);
     void apply(const Command &command, bool forward);
-    void rebaseHistory(const QSet<quint32> &gone);
+    void rebaseHistory(const QSet<quint32> &gone, const QVector<quint32> &mergedOrder);
     void revise();
     QHash<quint32, const Item *> writtenInstead() const;
     QSet<quint32> idsInUse() const;
@@ -236,6 +237,8 @@ private:
     mutable QHash<quint32, int> m_depths;
     mutable bool m_depthsStale = true;
     SpatialGrid m_grid;
+    // The curves used for stroke bounds and marquee selection.
+    QHash<quint32, QVector<QPointF>> m_strokeCurves;
     // Item -> the connectors attached to it.
     QMultiHash<quint32, quint32> m_links;
     quint32 m_lastId = 0, m_lastGroup = 0;

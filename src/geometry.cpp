@@ -903,11 +903,26 @@ bool polylineIntersectsRect(const QVector<QPointF> &points, const QRectF &rect, 
     if (radius > 0) {
         // A line with round ends reaches the box wherever its middle meets
         // the box widened by its radius, with round corners.
-        if (polylineIntersectsRect(points, rect.adjusted(-radius, 0, radius, 0)) ||
-            polylineIntersectsRect(points, rect.adjusted(0, -radius, 0, radius)))
-            return true;
-        for (QPointF corner : {rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()})
-            if (distanceToPolyline(points, corner) <= radius)
+        const QRectF across = rect.adjusted(-radius, 0, radius, 0);
+        const QRectF down = rect.adjusted(0, -radius, 0, radius);
+        const QPointF corners[] = {rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()};
+        const auto touches = [&](QPointF a, QPointF b) {
+            // Skip segments outside even the square-cornered box before
+            // looking for intersections or measuring to the corners.
+            if (qMax(a.x(), b.x()) < across.left() || qMin(a.x(), b.x()) > across.right() ||
+                qMax(a.y(), b.y()) < down.top() || qMin(a.y(), b.y()) > down.bottom())
+                return false;
+            if (segmentIntersectsRect(a, b, across) || segmentIntersectsRect(a, b, down))
+                return true;
+            for (QPointF corner : corners)
+                if (distanceToSegment(corner, a, b) <= radius)
+                    return true;
+            return false;
+        };
+        if (points.size() == 1)
+            return touches(points.first(), points.first());
+        for (int i = 0; i + 1 < points.size(); ++i)
+            if (touches(points[i], points[i + 1]))
                 return true;
         return false;
     }

@@ -137,7 +137,10 @@ ApplicationWindow {
         }
     }
 
-    Component.onCompleted: restoreView()
+    Component.onCompleted: {
+        backend.attachCanvas(canvas)
+        restoreView()
+    }
 
     Connections {
         target: canvas
@@ -169,7 +172,6 @@ ApplicationWindow {
     Connections {
         target: backend
         function onBoardOpened() { win.restoreView() }
-        function onImageAdded(asset, size, position) { canvas.insertImage(asset, size, position) }
         function onTextPasted(text) { canvas.insertText(text) }
     }
 
