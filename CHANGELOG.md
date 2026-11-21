@@ -54,6 +54,12 @@
 - Box selection picks up a pen stroke when the box touches its ink. It
   stays responsive over many long strokes.
 
+### README tour
+
+- Two new animations show a pen stroke taking shape and a board search
+  through to the board opening. `sprawl open --show boards=tri` opens the
+  switcher with the search text filled in.
+
 ## 0.1.2 — 2026-11-16
 
 A new README and a fuller example. Sprawl itself is unchanged.

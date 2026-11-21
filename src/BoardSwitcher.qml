@@ -23,8 +23,8 @@ Card {
     cardWidth: 520
     cardHeight: column.implicitHeight + 32
 
-    function open() {
-        begin("switch", "")
+    function open(query = "") {
+        begin("switch", query)
         visible = true
         input.forceActiveFocus()
     }

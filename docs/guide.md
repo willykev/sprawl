@@ -26,13 +26,13 @@ and written from the command line.
   diamond, an open diamond, or a bar. A selected connector's four choices
   are on the bar beside it, and the connector tool's are on a bar of its own.
 - **Pen** strokes, smoothed as they are drawn but sharp at the corners the
-  hand turns, in the theme's colors and four widths. **Pictures** from a file
-  dialog, a drop, or the clipboard, kept with the board. **Frames**: a titled
-  border that carries what sits inside it.
+  hand turns, in the theme's colors and four widths. [See the finished sketch.](../screenshots/pen.png)
+- **Pictures** from a file dialog, a drop, or the clipboard, kept with the
+  board. **Frames** have a titled border and carry what sits inside.
 - **Select, move, resize, group, restack, duplicate, copy and paste**, with
   undo and redo for every step. Anything new lands under the pointer.
 - **Boards** switched by typing a few letters of a name (`Ctrl+O`), made,
-  renamed, and moved to the trash from the same place.
+  renamed, and moved to the trash from the same place. [See the board switcher.](../screenshots/boards.png)
 - **Export** to PNG, SVG, or PDF: the whole board, or what is selected.
 - **Saves as you go.** There is no save command and nothing to lose: a board
   is written a moment after every change, off to one side, so the window
@@ -135,6 +135,9 @@ With Sprawl open, `sprawl open` on its own brings its window to the front.
 Given a board, or something to start with such as `--theme nord` or
 `--zoom 0.5`, it opens a window of its own, on the last board if none is
 named.
+
+`sprawl open --show boards=tri` opens the board switcher with `tri`
+already in the search field. Press `Enter` to open the highlighted board.
 
 `sprawl help` lists the commands and `sprawl help add` a command's options.
 `sprawl skill install` installs a short skill so coding agents can lay out

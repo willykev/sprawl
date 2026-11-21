@@ -78,19 +78,19 @@ a dot, a diamond or nothing at all.
 
 ### Sketch with the pen
 
-`P` draws freehand, and `[` and `]` make the line thinner or thicker.
-Strokes are smoothed as you draw and stay sharp where your hand turns a
-corner.
+Press `P` and drag to trace a ridgeline above the lake. Sprawl smooths the
+line as you draw and keeps the corners at the peaks. Pick a color from the
+pen bar, or press `[` and `]` to change the width.
 
-![The pen tool over a sketch of mountains, a sun and a lake, with the bar of colors and widths below](screenshots/pen.png)
+![A pen stroke climbs and descends three peaks above the lake in one continuous line](screenshots/pen.gif)
 
-### Keep a board for everything
+### Switch boards by typing a name
 
-`Ctrl+O` lists your boards. Type a few letters of a name and press
-**Enter**. New boards are made, renamed and moved to the trash from the same
-place, and each one opens where you left it.
+Press `Ctrl+O`, type a few letters of a board name, and press `Enter` to
+open it where you left off. Here, `tri` finds `weekend-trip`. You can also
+make, rename and trash boards from this list.
 
-![The board switcher over a board, listing five boards with keys to make, rename and delete one](screenshots/boards.png)
+![From the reading list, typing tri narrows five board names to weekend-trip, then the trip board opens](screenshots/boards.gif)
 
 ### Change the theme, and Sprawl changes with it
 

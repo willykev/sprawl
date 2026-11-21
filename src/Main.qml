@@ -42,6 +42,11 @@ ApplicationWindow {
     property bool shapesOpen: false
 
     function openPanel(name) {
+        let query = ""
+        if (name.startsWith("boards=")) {
+            query = name.slice("boards=".length)
+            name = "boards"
+        }
         if (canvas.editing)
             canvas.commitEdit()
         closePanel()
@@ -49,7 +54,7 @@ ApplicationWindow {
         if (name === "keys")
             keys.visible = true
         else if (name === "boards")
-            boards.open()
+            boards.open(query)
         else if (name === "newboard")
             boards.openNew()
         else if (name === "export")

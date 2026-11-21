@@ -578,7 +578,8 @@ int main(int argc, char *argv[]) {
     // For looking at the app without a person at it.
     args.addOption({"screenshot", "Save a picture of the window and exit", "file"});
     args.addOption({"size", "With --screenshot or --bench: the size of the window", "WxH"});
-    args.addOption({"show", "Start with a panel open: keys, boards, export; or, with --tool connector, start, route, dash, end", "panel"});
+    args.addOption({"show", "Open keys, boards, boards=SEARCH or export. With --tool connector, open start, "
+                            "route, dash or end.", "panel"});
     args.addOption({"tool", "Start with a tool: pen, note, shape...", "tool"});
     args.addOption({"select", "Start with these items selected", "id,id"});
     args.addOption({"zoom", "Start at this zoom, like 0.5", "factor"});

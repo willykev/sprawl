@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Redraw the README's pictures into screenshots/.
 
-Every picture is drawn by Sprawl itself, off screen, from the example board
-in examples/weekend-trip. No window opens, and nothing of your own is read or
-shown: the boards, the theme and the settings all come from a scratch folder
-that goes away afterwards, and the theme is Omarchy's as it ships.
+Sprawl draws its own window off screen using examples/weekend-trip and a
+sample reading list. The boards and settings live in a scratch folder that
+goes away afterwards, and the theme is Omarchy's as it ships.
 
 Run it after changing how Sprawl looks, and before a release. A picture that
 looks the same as the one already there is left alone, so only what changed
 shows up in git. It needs a Wayland session, ImageMagick, ffmpeg, and
 Omarchy's themes for themes.png.
 """
+import filecmp
 import json
 import os
 from pathlib import Path
@@ -26,7 +26,6 @@ APP = ROOT / "build/sprawl"
 OUT = ROOT / "screenshots"
 EXAMPLE = ROOT / "examples/weekend-trip"
 BOARD = "weekend-trip"
-# Boards that only fill the list in boards.png.
 OTHER_BOARDS = ["garden-plan", "kitchen-remodel", "product-launch", "reading-list"]
 THEMES = ["tokyo-night", "catppuccin-latte", "gruvbox", "rose-pine"]
 # The window sizes, in the pixels of a screen at normal scale. Pictures are
@@ -39,6 +38,7 @@ TILE = "800x500"
 # corner, and the zoom.
 FLOWCHART = (524, -12, 1.45)
 SKETCH = (548, 345, 1.45)
+RIDGELINE = (822, 373, 2.5)
 
 
 def pixels(picture):
@@ -65,9 +65,11 @@ class Stage:
         for name in ("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY"):
             if name in os.environ:
                 self.env[name] = os.environ[name]
-        self.items = json.loads(self.board_file.read_text())
+        self.example = json.loads(self.board_file.read_text())
         for name in OTHER_BOARDS:
             self.sprawl("new", name)
+        self.sprawl("add", "reading-list", "note", "--color", "green", "--width", "216", "--height", "136",
+                    "--text", "Books for the cabin\nA field guide to birds\nWalks by the lake")
         # What this screen's scale is, so pictures come out the same on any.
         self.screen = 1
         probe = self.scratch / "probe.png"
@@ -78,22 +80,18 @@ class Stage:
         subprocess.run([str(APP), *map(str, args)], env=env or self.env, check=True,
                        stdout=subprocess.DEVNULL)
 
-    def draw(self, picture, size, *options, view=None, theme=None, moved=None, scale=2):
-        """One picture of the example board: the whole of it, or the part
-        `view` looks at; with some of its items moved to where `moved` says.
-        It is `scale` times the window's size in pixels: twice, unless said."""
-        board = json.loads(json.dumps(self.items))
-        for item in board["items"]:
-            if moved and item["id"] in moved:
-                item["x"], item["y"] = moved[item["id"]]
-        self.board_file.write_text(json.dumps(board, indent=2) + "\n")
+    def draw(self, picture, size, *options, view=None, theme=None, items=None, board=BOARD, scale=2):
+        """Draw a board, optionally staging a different set of example items for this frame."""
+        sample = self.example if items is None else dict(self.example, items=items)
+        self.board_file.write_text(json.dumps(sample) + "\n")
         views = {}
         if view:
-            views[str(self.board_file)] = dict(zip(("x", "y", "zoom"), view))
-        (self.library / "state.json").write_text(json.dumps({"last": BOARD, "views": views}))
+            opened = self.library / "boards" / board / "board.json"
+            views[str(opened)] = dict(zip(("x", "y", "zoom"), view))
+        (self.library / "state.json").write_text(json.dumps({"last": board, "views": views}))
         look = ["--theme", theme] if theme else ["--default-theme"]
         env = dict(self.env, QT_SCALE_FACTOR=f"{scale / self.screen:g}")
-        self.sprawl("open", BOARD, *look, "--size", size, "--screenshot", picture, *options, env=env)
+        self.sprawl("open", board, *look, "--size", size, "--screenshot", picture, *options, env=env)
 
 
 def eased(start, end, steps):
@@ -106,21 +104,74 @@ def eased(start, end, steps):
 
 def connectors(stage, picture):
     """A loop: one shape of the flowchart moves, and its lines follow."""
-    box = next(item for item in stage.items["items"] if item.get("text") == "Museum + coffee")
-    home, y = box["x"], box["y"]
+    items = [item.copy() for item in stage.example["items"]]
+    box = next(item for item in items if item.get("text") == "Museum + coffee")
+    home = box["x"]
     path = [home] * 10
     for start, end in ((home, home + 128), (home + 128, home)):
         path += list(eased(start, end, 20)) + [end] * 10
     frames = stage.scratch / "frames"
     frames.mkdir()
     for number, x in enumerate(path):
-        stage.draw(frames / f"{number:03}.png", CLOSE, view=FLOWCHART, moved={box["id"]: (x, y)})
+        box["x"] = x
+        stage.draw(frames / f"{number:03}.png", CLOSE, view=FLOWCHART, items=items)
     width = CLOSE.split("x")[0]
     subprocess.run(
         ["ffmpeg", "-loglevel", "error", "-y", "-framerate", "15", "-i", str(frames / "%03d.png"),
          "-vf", f"scale={width}:-1:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];"
                 "[b][p]paletteuse=dither=none:diff_mode=rectangle",
          "-loop", "0", str(picture)], check=True)
+
+
+def save_loop(picture, frames):
+    """Encode app-rendered frames with individual holds in hundredths of a second."""
+    command = ["magick"]
+    for frame, delay in frames:
+        command.extend(["-delay", str(delay), str(frame)])
+    subprocess.run([*command, "-dither", "None", "-layers", "Optimize", "-loop", "0", str(picture)],
+                   check=True)
+
+
+def pen(stage, picture):
+    """Draw the example's mountain outline in one drag with the default pen."""
+    items = stage.example["items"]
+    ridge = next(item for item in items if item["id"] == 21)
+    # Leave the sun and lake in place. The snowcap (22) goes on after the ridge.
+    background = [item for item in items if item["id"] not in (21, 22)]
+    points = ridge["points"]
+    frames = []
+    for end in [*range(0, len(points), 4), len(points)]:
+        visible = background.copy()
+        if end:
+            visible.append(dict(ridge, color="", points=points[:end]))
+        frame = stage.scratch / f"ridge-{end}.png"
+        stage.draw(frame, CLOSE, "--tool", "pen", view=RIDGELINE, items=visible, scale=1)
+        delay = 11
+        if end == 0:
+            delay = 85
+        elif end == len(points):
+            delay = 175
+        frames.append((frame, delay))
+    save_loop(picture, frames)
+
+
+def switch_boards(stage, picture):
+    """Open the switcher, narrow its real matches, and open the trip board."""
+    frames = []
+    for number, (board, panel, delay) in enumerate([
+        ("reading-list", "", 80),
+        ("reading-list", "boards", 105),
+        ("reading-list", "boards=t", 65),
+        ("reading-list", "boards=tr", 75),
+        ("reading-list", "boards=tri", 120),
+        (BOARD, "", 175),
+    ]):
+        frame = stage.scratch / f"switch-{number}.png"
+        options = ["--show", panel] if panel else []
+        view = (-103, -80, 1.6) if board == "reading-list" else None
+        stage.draw(frame, "720x500", *options, board=board, view=view, scale=1.5)
+        frames.append((frame, delay))
+    save_loop(picture, frames)
 
 
 def themes(stage, picture):
@@ -133,24 +184,41 @@ def themes(stage, picture):
                     "-background", "none", "-depth", "8", "-strip", str(picture)], check=True)
 
 
-def settle(drawn, kept, scratch):
-    """Put a newly drawn picture in place, unless the one already there looks
-    the same: the GPU does not draw a frame the same bit for bit twice, and a
-    loop's colors are picked afresh each time. Says whether it changed."""
-    if kept.exists():
-        pair = [kept, drawn]
-        tolerance = 0
-        if kept.suffix == ".gif":
-            # Every frame of each, one under the other.
-            pair = [scratch / "kept.png", scratch / "drawn.png"]
-            for loop, frames in zip((kept, drawn), pair):
-                subprocess.run(["magick", str(loop), "-coalesce", "-append", str(frames)], check=True)
-            tolerance = 5e-5
-        result = subprocess.run(["magick", "compare", "-metric", "AE", "-fuzz", "2%",
-                                 *map(str, pair), "null:"], capture_output=True, text=True)
-        differing = re.search(r"\(([^)]+)\)", result.stderr)
-        if result.returncode in (0, 1) and differing and float(differing.group(1)) <= tolerance:
+def playback(picture):
+    """The logical frame sizes, delays and repeat count of a GIF."""
+    frames = subprocess.check_output(["magick", "identify", "-ping", "-format", "%W %H %T\n", str(picture)])
+    header = subprocess.check_output(["magick", "identify", "-ping", "-verbose", f"{picture}[0]"], text=True)
+    repeats = re.search(r"^  Iterations: (\d+)$", header, re.MULTILINE)
+    return frames, int(repeats[1]) if repeats else 1
+
+
+def same_picture(kept, drawn, scratch):
+    if filecmp.cmp(kept, drawn, shallow=False):
+        return True
+    pair = [kept, drawn]
+    if kept.suffix == ".gif":
+        if playback(kept) != playback(drawn):
             return False
+        # Compare the complete displayed frames, including pixels carried over.
+        pair = [scratch / "kept.png", scratch / "drawn.png"]
+        for loop, frames in zip((kept, drawn), pair):
+            subprocess.run(["magick", str(loop), "-coalesce", "-append", str(frames)], check=True)
+    elif pixels(kept) != pixels(drawn):
+        return False
+    result = subprocess.run(["magick", "compare", "-metric", "AE", "-fuzz", "2%",
+                             *map(str, pair), "null:"], capture_output=True, text=True)
+    difference = re.search(r"([\d.eE+\-]+) \(([\d.eE+\-]+)\)", result.stderr)
+    if result.returncode not in (0, 1) or not difference:
+        return False
+    if kept.suffix == ".gif":
+        return float(difference[2]) <= 5e-5  # palettes can vary slightly between draws
+    return float(difference[1]) < 1  # antialiasing can differ by a fraction of a pixel
+
+
+def settle(drawn, kept, scratch):
+    """Keep equivalent pictures, including their playback, untouched on disk."""
+    if kept.exists() and same_picture(kept, drawn, scratch):
+        return False
     shutil.move(drawn, kept)
     return True
 
@@ -170,7 +238,9 @@ def main():
         stage.draw(drawn / "hero.png", WHOLE)
         connectors(stage, drawn / "connectors.gif")
         stage.draw(drawn / "pen.png", CLOSE, "--tool", "pen", view=SKETCH)
+        pen(stage, drawn / "pen.gif")
         stage.draw(drawn / "boards.png", CLOSE, "--show", "boards")
+        switch_boards(stage, drawn / "boards.gif")
         themes(stage, drawn / "themes.png")
         for picture in sorted(drawn.iterdir()):
             kept = OUT / picture.name

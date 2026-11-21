@@ -8942,6 +8942,22 @@ private slots:
         QCOMPARE(desk.warnings, QStringList());
     }
 
+    void theBoardSwitcherCanOpenWithASearch() {
+        Desk desk;
+        QVERIFY(desk.ready());
+        QCOMPARE(desk.library.create("weekend-trip"), QString());
+        const QString panel = "boards=tri";
+        QVERIFY(QMetaObject::invokeMethod(desk.window, "openPanel", Q_ARG(QVariant, panel)));
+        QCOMPARE(desk.panel(), QString("boards"));
+        QVERIFY(desk.shows("board-weekend-trip"));
+        QVERIFY(!desk.shows("board-desk"));
+        desk.key(Qt::Key_Return);
+        QCOMPARE(desk.backend.boardName(), QString("weekend-trip"));
+        desk.key(Qt::Key_O, Qt::ControlModifier);
+        QVERIFY(desk.shows("board-desk"));
+        QCOMPARE(desk.warnings, QStringList());
+    }
+
     void boardsAreListedOnlyToPickOne() {
         Desk desk;
         QVERIFY(desk.ready());
